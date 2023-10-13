@@ -32,6 +32,7 @@ class ORFActivityEstimator():
         self.region_activities = {}
         self.lls = []
         self.activity_changes = []
+        self.regions_total_length = 0
 
         self.regions_it = HTSeq.GenomicArrayOfSets('auto', stranded=True)
         self.regions = {}
@@ -40,6 +41,7 @@ class ORFActivityEstimator():
             self.regions_it[region.iv] += region
             self.regions[region.attr['region_id']] = region
             self.active_region_ids.add(region.attr['region_id'])
+            self.regions_total_length += region.iv.length
             
         self.bam_file = HTSeq.BAM_Reader(reads_path)
 
@@ -121,12 +123,12 @@ class ORFActivityEstimator():
 
         self.rrc = {}
         for region_id in self.regions:
-            self.regions[region_id].activity = 1/len(self.regions)
+            self.regions[region_id].activity = 1/len(self.regions) * self.total_read_count/self.regions_total_length # instead of regions lengths use locus length?
             self.region_activities[region_id] = [self.regions[region_id].activity]
             self.rrc[region_id] = []
 
         
-    def run_orf_deconvolution(self, iterations: int=0) -> None:
+    def run_orf_deconvolution(self, iterations: int=0, likelihood_cutoff: int=200) -> None:
         if iterations == 0:
             iterations = self.maxiter
         for i in range(iterations):
@@ -169,7 +171,7 @@ class ORFActivityEstimator():
                 # break if activity changes less than delta_cutoff
                 if activity_change < self.delta_cutoff:
                     #break
-                    if not self.regularize(likelihood_cutoff=200):#3
+                    if not self.regularize(likelihood_cutoff):#3
                         print('break at iteration ', i)
                         break
                     
