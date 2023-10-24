@@ -43,13 +43,13 @@ class Transcript:
 
 class Locus:
     interval: HTSeq.GenomicInterval
-    association_classes: dict[(frozenset[(str, int), int, bool]): int]
-    compatibility_classes: dict[frozenset[str]: 'CompatibilityClass']
+    association_groups: dict[(frozenset[(str, int), int, bool]): int]
+    compatibility_groups: dict[frozenset[str]: 'CompatibilityGroup']
     read_count: int
 
     def __init__(self, interval: HTSeq.GenomicInterval) -> None:
-        self.association_classes = dict()
-        self.compatibility_classes = dict()
+        self.association_groupss = dict()
+        self.compatibility_groups = dict()
         self.interval = interval
         self.read_count = 0
 
@@ -76,6 +76,6 @@ class ORF:
 
 
 @dataclass
-class CompatibilityClass:
+class CompatibilityGroup:
     read_count: int = 0
     length: int = 0

@@ -1,24 +1,27 @@
 import HTSeq
 
 from .genomic_region import GenomicRegion
-from .genomic_features import Transcript, ORF, Locus, CompatibilityClass
+from .genomic_features import Transcript, ORF, Locus, CompatibilityGroup
 
 class ORFFinder:
-    transcripts: set[Transcript]
+    transcripts: dict[str:Transcript]
     orf_set: set[ORF]
     orf_intervals: HTSeq.GenomicArrayOfSets
     region_intervals: HTSeq.GenomicArrayOfSets
     loci_set: set[Locus]
     loci_intervals: HTSeq.GenomicArray
+    compatibility_groups: dict[frozenset[ORF]: CompatibilityGroup]
         
-    def __init__(self, transcripts: set[Transcript], genome: dict) -> None:
+    def __init__(self, transcripts: dict[str:Transcript], genome: dict) -> None:
         self.orf_set = set()
         self.transcripts = transcripts
 
+        self.orf_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
         self.region_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
         loci_intervals_binary = HTSeq.GenomicArray("auto", stranded=True, storage="step", typecode='b')
+        self.compatibility_groups = dict()
 
-        for transcript in self.transcripts:
+        for transcript in self.transcripts.values():
             for exon_iv in transcript.exons.intervals:
                 self.region_intervals[exon_iv] += transcript
 
@@ -31,7 +34,7 @@ class ORFFinder:
                 if not orf in self.orf_set:
                     self.orf_set.add(orf)
                     for iv in orf.genomic_region.intervals:
-                        self.region_intervals[iv] += orf
+                        self.orf_intervals[iv] += orf
             
             loci_intervals_binary[transcript.iv] = True
 
@@ -44,11 +47,13 @@ class ORFFinder:
                 self.loci_intervals[iv] = locus
                 self.loci_set.add(locus)
 
-                for step_iv, step_set in self.region_intervals[iv].steps():
+                for step_iv, step_set in self.orf_intervals[iv].steps():
                     fr_set = frozenset(step_set)
-                    if not fr_set in locus.compatibility_classes:
-                        locus.compatibility_classes[fr_set] = CompatibilityClass()
-                    locus.compatibility_classes[fr_set].length += step_iv.length
+                    if not fr_set in locus.compatibility_groups:
+                        cc = CompatibilityGroup()
+                        locus.compatibility_groups[fr_set] = cc
+                        self.compatibility_groups[fr_set] = cc
+                    locus.compatibility_groups[fr_set].length += step_iv.length
 
 
                     
