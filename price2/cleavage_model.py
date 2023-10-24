@@ -174,87 +174,24 @@ def read_in_noise_likelihood(
 
 class CleavageEstimator:
     
-    def __init__(self, repeats: int=50, maxpos: int=12,
-    maxiter: int=100, delta_cutoff: float=.001, seed: int=42) -> None:
+    def __init__(
+            self,
+            repeats: int=1_000, 
+            maxiter: int=100,
+            delta_cutoff: float=.001,
+            seed: int=42
+            ) -> None:
 
         self.table = np.zeros(shape=(100,3,2,1), dtype=np.int32)
         self.obs_min_len = 15
         self.obs_max_len = 40
         self.seed = seed
         self.repeats = repeats
-        self.maxpos = maxpos
         self.c = 0
         self.maxiter = maxiter
         self.delta_cutoff = delta_cutoff
 
 
-    def fill_table(self, 
-                   reference_annotation: ReferenceAnnotation, 
-                   alignments: HTSeq.BAM_Reader,
-                   min_considered_length: int=15,
-                   max_considered_length: int=40,
-                   min_dist_to_start: int=30,
-                   min_dist_to_end: int=30,
-                   sufficient_counted_alns: int=100_000,
-                   ) -> None:
-        self.table = np.zeros(shape=(self.obs_max_len+10, 3, 2, 1), dtype=np.int32)
-        self.dist_starts = np.zeros(shape=(200), dtype=np.int32)
-        self.outside_cds = 0
-        counted_alns = 0
-        for aln in alignments:
-            aln = RiboSeqAlignment(aln)
-
-            if not aln.unique:
-                continue
-            #if aln.close_to_any_tis(reference_annotation):
-            #    continue
-            if not min_considered_length <= aln.matching_length < max_considered_length:
-                continue
-            transcript_candidates = reference_annotation.collect_coding_transcripts(aln.genomic_region)
-            if len(transcript_candidates) == 0:
-                self.outside_cds += 1
-                continue
-            frame = None
-            dist_to_start = None
-    
-            for tr in transcript_candidates:
-                
-                try:
-                    iv_on_tr = tr.exons.induce(aln.genomic_region)
-                except ValueError:
-                    continue
-
-                if iv_on_tr[0] - tr.annotated_cds_iv[0] > min_dist_to_start \
-                and tr.annotated_cds_iv[1] - iv_on_tr[1] > min_dist_to_end:
-                    new_frame = (iv_on_tr[0] - tr.annotated_cds_iv[0])%3
-
-                    if frame is None:
-                        frame = new_frame
-                    elif frame != new_frame:
-                        break
-                
-                try:
-                    new_dist_to_start = tr.cds.induce(aln.genomic_region)[0]
-                except ValueError:
-                    new_dist_to_start = None
-                
-                if type(new_dist_to_start) == int:
-                    if type(dist_to_start) != int:
-                        dist_to_start = new_dist_to_start
-                    elif dist_to_start != new_dist_to_start:
-                        break
-
-            else:
-                if (type(dist_to_start) == int) and (-100 < dist_to_start < 100):
-                    self.dist_starts[dist_to_start+100] += 1
-
-                if frame != None:
-                    self.table[aln.matching_length, frame, int(aln.untemplated_addition), 0] += 1
-                    counted_alns += 1
-                    if counted_alns >= sufficient_counted_alns:
-                        break
-
-    # TODO polish this
     # TODO use this in pipelines instead of count_frame_starts
     def collect_data(self, 
                    reference_annotation: ReferenceAnnotation, 
@@ -269,7 +206,7 @@ class CleavageEstimator:
         self.dist_starts = np.zeros(shape=(200), dtype=np.int32)
         self.outside_cds = 0
         self.not_countable = 0
-        counted_alns = 0
+        self.counted_alns = 0
         for aln in alignments:
             aln = RiboSeqAlignment(aln)
 
@@ -288,19 +225,20 @@ class CleavageEstimator:
                 continue
             frame = None
             dist_to_start = None
-    
+
+            # get frame
             for tr in transcript_candidates:
-                
                 try:
                     # why not do this on CDS right away?
-                    iv_on_tr = tr.exons.induce(aln.genomic_region)
+                    #iv_on_tr = tr.exons.induce(aln.genomic_region)
+                    iv_on_cds = tr.cds.induce(aln.genomic_region)
                 except ValueError:
                     self.not_countable += 1
                     continue
 
-                if iv_on_tr[0] - tr.annotated_cds_iv[0] > min_dist_to_start \
-                and tr.annotated_cds_iv[1] - iv_on_tr[1] > min_dist_to_end:
-                    new_frame = (iv_on_tr[0] - tr.annotated_cds_iv[0])%3
+                if iv_on_cds[0] > min_dist_to_start \
+                and tr.coding_length - iv_on_cds[1] > min_dist_to_end:
+                    new_frame = iv_on_cds[0]%3
 
                     if frame is None:
                         frame = new_frame
@@ -308,27 +246,29 @@ class CleavageEstimator:
                         self.not_countable += 1
                         break
                 
+            else:
+                if not frame is None:
+                    self.table[aln.matching_length, frame, int(aln.untemplated_addition), 0] += 1
+                    self.counted_alns += 1
+                    if self.counted_alns >= sufficient_counted_alns:
+                        break
+
+
+            # get dist_to_start
+            for tr in transcript_candidates:
                 try:
                     new_dist_to_start = tr.cds.induce(aln.genomic_region)[0]
                 except ValueError:
                     new_dist_to_start = None
                 
                 if type(new_dist_to_start) == int:
-                    if type(dist_to_start) != int:
+                    if dist_to_start is None:
                         dist_to_start = new_dist_to_start
                     elif dist_to_start != new_dist_to_start:
-                        self.not_countable += 1
                         break
-
             else:
                 if (type(dist_to_start) == int) and (-100 < dist_to_start < 100):
                     self.dist_starts[dist_to_start+100] += 1
-
-                if frame != None:
-                    self.table[aln.matching_length, frame, int(aln.untemplated_addition), 0] += 1
-                    counted_alns += 1
-                    if counted_alns >= sufficient_counted_alns:
-                        break
 
 
     def correct_table(self) -> None:
