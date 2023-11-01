@@ -8,7 +8,7 @@ from .reference_annotation import ReferenceAnnotation
 class RiboSeqAlignment():
 
     alignment: HTSeq._HTSeq.SAM_Alignment
-    untemplated_addition: bool
+    untemplated_addition: bool # untemplated addition is in the intervals/genomic region of the alignment
     matching_length: int
     unique: bool
     genomic_region: GenomicRegion
@@ -17,8 +17,7 @@ class RiboSeqAlignment():
         self.alignment = sa
         self.unique = self.alignment.optional_field('NH') == 1
         self.untemplated_addition = self.has_untemplated_addition()
-        self.matching_length = sum([x.size for x in self.alignment.cigar if x.type=='M'])\
-            - self.untemplated_addition
+        self.matching_length = sum([x.size for x in self.alignment.cigar if x.type=='M'])
         
         intervals = []
         for cigar_op in self.alignment.cigar:
@@ -27,6 +26,12 @@ class RiboSeqAlignment():
         
         if self.alignment.iv.strand == '-':
             intervals = intervals[::-1]
+        
+        if self.untemplated_addition:
+            if self.alignment.iv.strand == '+':
+                intervals[0].start -= 1
+            elif self.alignment.iv.strand == '-':
+                intervals[0].end += 1
 
         self.genomic_region = GenomicRegion(intervals)
 
@@ -112,10 +117,15 @@ class RiboSeqAlignment():
 
     def has_untemplated_addition(self) -> bool:
         if self.alignment.iv.strand == '+':
-            return self.alignment.optional_field('MD')[0] == '0'
+            return (self.alignment.cigar[0].type == 'S') and (self.alignment.cigar[0].size == 1)
         elif self.alignment.iv.strand == '-':
-            return self.alignment.optional_field('MD')[-1] == '0'\
-                and self.alignment.optional_field('MD')[-2] in 'ACGT'
+            return (self.alignment.cigar[-1].type == 'S') and (self.alignment.cigar[-1].size == 1)
+        #if self.alignment.iv.strand == '+':
+        #    return self.alignment.optional_field('MD')[0] == '0'
+        #elif self.alignment.iv.strand == '-':
+        #    return self.alignment.optional_field('MD')[-1] == '0'\
+        #        and self.alignment.optional_field('MD')[-2] in 'ACGT'
+        
         
         
     def is_spliced(self) -> bool:

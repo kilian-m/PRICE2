@@ -192,7 +192,6 @@ class CleavageEstimator:
         self.delta_cutoff = delta_cutoff
 
 
-    # TODO use this in pipelines instead of count_frame_starts
     def collect_data(self, 
                    reference_annotation: ReferenceAnnotation, 
                    alignments: HTSeq.BAM_Reader,
@@ -229,8 +228,6 @@ class CleavageEstimator:
             # get frame
             for tr in transcript_candidates:
                 try:
-                    # why not do this on CDS right away?
-                    #iv_on_tr = tr.exons.induce(aln.genomic_region)
                     iv_on_cds = tr.cds.induce(aln.genomic_region)
                 except ValueError:
                     self.not_countable += 1
