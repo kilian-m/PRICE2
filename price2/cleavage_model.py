@@ -89,6 +89,13 @@ class CleavageModel:
             region_start,
             region_end,
         )
+
+    
+    def rvs(self, size: int=1):
+        pl = np.random.choice(np.arange(len(self.pl)), size=size, p=self.pl)
+        pr = np.random.choice(np.arange(len(self.pr)), size=size, p=self.pr)
+        u = np.random.choice([True, False], size=size, p=[self.pu, 1-self.pu])
+        return (pl, pr, u)
         
 
 @njit   

@@ -1,7 +1,7 @@
 import HTSeq
 
 from .genomic_region import GenomicRegion
-from .genomic_features import Transcript
+from .genomic_features import Transcript, ReadGeneratingRegion
 from .reference_annotation import ReferenceAnnotation
 
 
@@ -77,6 +77,7 @@ class RiboSeqAlignment():
             pass
         return False
     
+    
     def overlaps_ti(self, reference_annotation: ReferenceAnnotation) -> bool:
         try:
             if len(l:=list(reference_annotation.ti_sites_new[self.alignment.iv].steps()))>1:
@@ -84,14 +85,7 @@ class RiboSeqAlignment():
         except IndexError:
             pass
         return False
-
-    #def ti_site_position(self, reference_annotation: ReferenceAnnotation) -> int:
-    #    #try:
-    #    for step in reference_annotation.ti_sites[self.alignment.iv].steps():
-    #        if step[1]:
-    #            return step[0].start - self.alignment.iv.start
-    #    #except IndexError:
-    #    #    pass
+    
 
     def get_frames(self, reference_annotation) -> tuple:
         transcript_candidates = reference_annotation.collect_coding_transcripts(self.genomic_region)
@@ -113,19 +107,18 @@ class RiboSeqAlignment():
         if not frames[0] and not frames[1] and frames[2]:
             return 2
         return None
+    
+
+    def get_reading_frame_in_ORF(self, orf: ReadGeneratingRegion) -> int:
+        start, end = orf.genomic_region.induce(self.genomic_region)
+        return start%3
 
 
     def has_untemplated_addition(self) -> bool:
         if self.alignment.iv.strand == '+':
             return (self.alignment.cigar[0].type == 'S') and (self.alignment.cigar[0].size == 1)
         elif self.alignment.iv.strand == '-':
-            return (self.alignment.cigar[-1].type == 'S') and (self.alignment.cigar[-1].size == 1)
-        #if self.alignment.iv.strand == '+':
-        #    return self.alignment.optional_field('MD')[0] == '0'
-        #elif self.alignment.iv.strand == '-':
-        #    return self.alignment.optional_field('MD')[-1] == '0'\
-        #        and self.alignment.optional_field('MD')[-2] in 'ACGT'
-        
+            return (self.alignment.cigar[-1].type == 'S') and (self.alignment.cigar[-1].size == 1)        
         
         
     def is_spliced(self) -> bool:

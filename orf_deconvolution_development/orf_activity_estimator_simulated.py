@@ -117,7 +117,7 @@ class ORFActivityEstimator:
                 # this exception can happen because reads on the borders of ORFs can be assigned to region combinations that are not in the compatibility groups
                 pass
             
-        self.total_read_count = sum([ac.read_count for ac in self.association_groups.values()])
+        self.total_read_count = sum([ag.read_count for ag in self.association_groups.values()])
        
         #df = pd.DataFrame.from_dict(self.association_groups, orient='index').rename(columns={0:'count'})
 

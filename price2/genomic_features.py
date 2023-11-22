@@ -1,7 +1,7 @@
 import HTSeq
 
 from .genomic_region import GenomicRegion
-from dataclasses import dataclass
+
 
 
 class Transcript:
@@ -40,42 +40,31 @@ class Transcript:
             self.annotated_cds_iv = None
 
 
-
-class Locus:
-    interval: HTSeq.GenomicInterval
-    association_groups: dict[(frozenset[(str, int), int, bool]): int]
-    compatibility_groups: dict[frozenset[str]: 'CompatibilityGroup']
-    read_count: int
-
-    def __init__(self, interval: HTSeq.GenomicInterval) -> None:
-        self.association_groupss = dict()
-        self.compatibility_groups = dict()
-        self.interval = interval
-        self.read_count = 0
-
-
-class ORF:
-    type: str = 'ORF'
+class ReadGeneratingRegion:
+    type: str
     genomic_region: GenomicRegion
     transcript: Transcript
     iv_on_transcript: tuple[int, int]
-    id: str
 
-    def __init__(self, transcript: Transcript, iv_on_transcript: tuple[int, int]):
+    def __init__(self, type: str, transcript: Transcript, iv_on_transcript: tuple[int, int],):
+        self.type = type
         self.transcript = transcript
         self.iv_on_transcript = iv_on_transcript
         self.genomic_region = transcript.exons.map(iv_on_transcript)
 
     
-    def __eq__(self, other: 'ORF') -> bool:
-        return self.genomic_region == other.genomic_region
+    def __eq__(self, other: 'ReadGeneratingRegion') -> bool:
+        return (self.type == other.type) and (self.genomic_region == other.genomic_region)
     
     
     def __hash__(self) -> int:
         return hash(self.genomic_region)
 
 
-@dataclass
-class CompatibilityGroup:
-    read_count: int = 0
-    length: int = 0
+    def __len__(self) -> int:
+        return len(self.genomic_region)
+    
+    
+    def __repr__(self) -> str:
+        return f'{self.type} on region {self.genomic_region}'
+
