@@ -45,6 +45,7 @@ class ReadGeneratingRegion:
     genomic_region: GenomicRegion
     transcript: Transcript
     iv_on_transcript: tuple[int, int]
+    average_activity: float
 
     def __init__(self, type: str, transcript: Transcript, iv_on_transcript: tuple[int, int],):
         self.type = type

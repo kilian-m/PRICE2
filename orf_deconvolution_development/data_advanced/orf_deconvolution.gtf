@@ -17,3 +17,6 @@ chr2	source1	exon	1000	2100	.	+	.	region_id "exon10"; transcript_id "transcript6
 chr2	source1	exon	3000	5000	.	+	.	region_id "exon11"; transcript_id "transcript6";
 chr2	source1	transcript	2000	6000	.	-	.	transcript_id "transcript7"; activity 5
 chr2	source1	exon	2000	6000	.	-	.	region_id "exon12"; transcript_id "transcript7";
+chr2	source1	transcript	7000	9500	.	+	.	transcript_id "transcript8"; activity 50
+chr2	source1	exon	7100	9400	.	+	.	region_id "exon13"; transcript_id "transcript8";
+chr2	source1	CDS	7201	9300	.	+	.	region_id "CDS1"; transcript_id "transcript8";

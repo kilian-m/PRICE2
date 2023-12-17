@@ -20,3 +20,4 @@ chr2	source1	ORF	3000	3400	.	+	0	ID "ORF13"; transcript_id "transcript3"; activi
 chr2	source1	ORF	3701	4600	.	+	0	ID "ORF14"; transcript_id "transcript3"; activity 5
 chr2	source1	ORF	2600	5800	.	-	0	ID "ORF15"; transcript_id "transcript4"; activity 50
 chr2	source1	ORF	2400	5900	.	-	0	ID "ORF16"; transcript_id "transcript4"; activity 3
+chr2	source1	ORF	7201	9300	.	+	0	ID "ORF17"; transcript_id "transcript5"; activity 1000
