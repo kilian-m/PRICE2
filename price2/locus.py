@@ -31,11 +31,11 @@ class Locus:
     overlap_likelihood_ratio_threshold: float = .99
 
     # temporary properties
-    cg: dict[frozenset[ReadGeneratingRegion]: CompatibilityGroup] # compatibility groups
-    eg: dict[(frozenset[(ReadGeneratingRegion, int)], int, bool): EquivalenceGroup] # association groups
+    #cg: dict[frozenset[ReadGeneratingRegion]: CompatibilityGroup] # compatibility groups
+    #eg: dict[(frozenset[(ReadGeneratingRegion, int)], int, bool): EquivalenceGroup] # association groups
 
-    new_cgs: dict[RiboSeqRun:dict[frozenset[ReadGeneratingRegion]: CompatibilityGroup]]
-    new_egs: dict[RiboSeqRun:dict[(frozenset[(ReadGeneratingRegion, int)], int, bool): EquivalenceGroup]]
+    cgs: dict[RiboSeqRun:dict[frozenset[ReadGeneratingRegion]: CompatibilityGroup]]
+    egs: dict[RiboSeqRun:dict[(frozenset[(ReadGeneratingRegion, int)], int, bool): EquivalenceGroup]]
 
     def __init__(self, iv: HTSeq.GenomicInterval, transcript_intervals: HTSeq.GenomicArrayOfSets) -> None:
         self.status = 'inactive'
@@ -82,19 +82,19 @@ class Locus:
 
     
     def make_compatibility_groups(self, runs: list[RiboSeqRun]) -> None:
-        self.new_cgs = dict()
+        self.cgs = dict()
         for run in runs:
-            self.new_cgs[run] = dict()
+            self.cgs[run] = dict()
         for step_iv, step_set in self.rgr_intervals.steps():
             fr_set = frozenset(step_set)
             if not fr_set:
                 continue # skip empty sets
-            if not fr_set in self.new_cgs[runs[0]]:
+            if not fr_set in self.cgs[runs[0]]:
                 for run in runs:
                     cg = CompatibilityGroup()
-                    self.new_cgs[run][fr_set] = cg
+                    self.cgs[run][fr_set] = cg
             for run in runs:
-                self.new_cgs[run][fr_set].length += step_iv.length
+                self.cgs[run][fr_set].length += step_iv.length
 
     
     def activate(self, genome: dict[str: HTSeq._HTSeq.Sequence], runs: list[RiboSeqRun]) -> None:
@@ -103,9 +103,9 @@ class Locus:
         else:
             raise ValueError('Locus is not inactive')
         self.eg = dict()
-        self.new_egs = dict()
+        self.egs = dict()
         for run in runs:
-            self.new_egs[run] = dict()
+            self.egs[run] = dict()
         self.make_rgrs(genome)
         self.make_compatibility_groups(runs)
 
@@ -171,10 +171,10 @@ class Locus:
         
         rgr_frame = frozenset(rgr_frame)
 
-        if not (rgr_frame, length, oua) in self.new_egs[run]:
+        if not (rgr_frame, length, oua) in self.egs[run]:
             eg = EquivalenceGroup()
-            self.new_egs[run][(rgr_frame, length, oua)] = eg
-        self.new_egs[run][(rgr_frame, length, oua)].read_count += 1
+            self.egs[run][(rgr_frame, length, oua)] = eg
+        self.egs[run][(rgr_frame, length, oua)].read_count += 1
 
         self.read_count += 1
         try:
@@ -182,17 +182,32 @@ class Locus:
         except KeyError:
             self.read_counts[run] = 1
 
+    
+    def fill_compatibility_groups(self, runs: list[RiboSeqRun]) -> None:
+        for run in runs:
+            for (eg_rgrs_frame, _, _), eg in self.egs[run].items():
+                rgrs = frozenset({rgr_frame[0] for rgr_frame in eg_rgrs_frame})
+                if not rgrs in self.cgs[run]:
+                    cg = CompatibilityGroup(length=1)
+                    self.cgs[run][rgrs] = cg
+                self.cgs[run][rgrs].read_count += eg.read_count
+
 
     def run_orf_deconvolution(self,
                               runs: list[RiboSeqRun],
                               iterations: int=100,
                               activity_change_cutoff: float=.005,
                               )-> None:
+        
+        self.fill_compatibility_groups(runs)
 
         for rgr in self.rgr_set:
             rgr.activity = {}
             for run in runs:
                 rgr.activity[run] = 1/len(self.rgr_set)
+        
+        for rgr in self.rgr_set:
+            rgr.unscaled_activity = {}
 
         for rgr in self.rgr_set:
             rgr.average_activity = 1/len(self.rgr_set)
@@ -214,7 +229,7 @@ class Locus:
             # E-step (assign reads to RGRs)
             for run in runs:
                 con = False
-                for (rgr_frame, length, oua), eg in self.new_egs[run].items():
+                for (rgr_frame, length, oua), eg in self.egs[run].items():
                     count = eg.read_count
                     likelihoods = {}
 
@@ -243,20 +258,15 @@ class Locus:
                 for rgr in self.active_rgrs:
                     if activity_sum != 0:
                         rgr.activity[run] = unscaled_activities[rgr] / activity_sum
+                        rgr.unscaled_activity[run] = unscaled_activities[rgr]
                     else:
                         rgr.activity[run] = unscaled_activities[rgr]
-                #for rgr in self.active_rgrs:
-                #    activity_sum += rgr.read_count[run] / len(rgr)
-                #print(activity_sum)
-                #for rgr in self.active_rgrs:
-                #    #rgr.activity[run] = (rgr.read_count[run] / len(rgr)) / activity_sum
-                #    rgr.activity[run] = (rgr.read_count[run]/self.read_counts[run]) / len(rgr)
             
             for rgr in self.active_rgrs:
                 rgr.average_activity = sum([rgr.activity[run] for run in runs]) / len(runs)
                 self.average_activities[rgr].append(rgr.average_activity)
 
-            #self.lls.append(self.incomplete_data_likelihood()) # TODO implement this
+            self.lls.append(self.incomplete_data_likelihood(runs))
 
             for rgr in self.rgr_set:
                 for run in runs:
@@ -283,91 +293,18 @@ class Locus:
         else:
             raise ValueError('Locus is not active')
         
-        #del self.new_egs
-        #del self.new_cgs 
-        
-
-    def run_orf_deconvolution_old(self,
-                              iterations: int=1000,
-                              activity_change_cutoff: float=.005,
-                              ) -> None:
-
-        for rgr in self.rgr_set:
-            rgr.activity = self.read_count / self.iv.length
-        
-        self.active_rgrs = self.rgr_set.copy()
-
-        self.rgr_activities = {rgr:[] for rgr in self.active_rgrs}
-        self.rrc = {rgr:[] for rgr in self.active_rgrs}
-
-        self.activity_changes = []
+        #del self.egs
+        #del self.cgs 
 
 
-        for i in range(iterations):
-            for rgr in self.active_rgrs:
-                rgr.read_count = 0
-
-            # E-step (assign reads to RGRs)
-            con = False
-            for (rgr_frame, length, oua), eg in self.eg.items():
-                count = eg.read_count
-                likelihoods = {}
-
-                # compute the likelihood for a read in this association group to be generated by each overlapping RGR
-                for rgr, frame in rgr_frame:
-                    likelihoods[rgr] = self.cm.pmf(length, oua, frame) * rgr.activity
-
-                likelihood_sum = sum(likelihoods.values())
-                if likelihood_sum == 0:
-                    con = True
-                    break
-                p = {rgr: likelihoods[rgr]/likelihood_sum for rgr in likelihoods}
-                for rgr, frame in rgr_frame:
-                    rgr.read_count += count * p[rgr]
-            
-            if con:
-                continue
-
-            # M-step (update RGR activities)
-            for rgr in self.active_rgrs:
-                rgr.activity = rgr.read_count / len(rgr)
-
-            self.lls.append(self.incomplete_data_likelihood())
-
-            for rgr in self.rgr_set:
-                self.rgr_activities[rgr].append(rgr.activity)
-            for rgr in self.active_rgrs:
-                self.rrc[rgr].append(rgr.read_count)
-
-            # sum differences in region activities
-            if i>1:
-                activity_change = 0
-                for rgr in self.rgr_set:
-                    activity_change += abs(self.rgr_activities[rgr][-1] - self.rgr_activities[rgr][-2])
-                self.activity_changes.append(activity_change)
-                # regularize if activity changes less than delta_cutoff, if this does not work break
-                if activity_change < activity_change_cutoff:
-                    if not self.regularize():
-                        break
-
-        self.break_iteration = i
-
-        if self.status == 'active':
-            self.status = 'complete'
-        else:
-            raise ValueError('Locus is not active')
-        
-        del self.eg
-        del self.cg
-
-
-    def incomplete_data_likelihood(self) -> float:
+    def incomplete_data_likelihood(self, runs) -> float:
         ll = 0
-        for cg_rgrs, cg in self.cg.items():
-            activity = sum([rgr.activity for rgr in cg_rgrs])
-            expected_reads_in_cg = activity * cg.length
-            actual_reads_in_cg = cg.read_count
-            ll += poisson.logpmf(actual_reads_in_cg, expected_reads_in_cg)
+        for run in runs:
+            for cg_rgrs, cg in self.cgs[run].items():
+                activity = sum([rgr.unscaled_activity[run] for rgr in cg_rgrs])
+                expected_reads_in_cg = activity * cg.length
+                actual_reads_in_cg = cg.read_count
+                ll += poisson.logpmf(actual_reads_in_cg, expected_reads_in_cg)
         return ll
             
 
