@@ -17,7 +17,6 @@ class RiboSeqRun:
     def __init__(self, id: str, directory: str, ra: ReferenceAnnotation, cleavage_model: CleavageModel=None) -> None:
         self.id = id
         bam_file_path = f'{directory}/{id}.bam'
-        print(bam_file_path)
         self.bam_reader = HTSeq.BAM_Reader(bam_file_path)
 
         self.read_count = pysam.AlignmentFile(bam_file_path, 'rb').count()
