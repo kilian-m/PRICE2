@@ -29,7 +29,7 @@ class Transcript:
         self.exon_length += exon.iv.length
 
     def add_region(self, region: HTSeq.features.GenomicFeature) -> None:
-        if region.type == 'five_prime_UTR':
+        if region.type == 'five_prime_utr':
             if not hasattr(self, 'five_prime_utr'):
                 self.five_prime_utr = GenomicRegion([], chrom=region.iv.chrom, strand=region.iv.strand)
             self.five_prime_utr.add_interval(region.iv)
@@ -38,7 +38,7 @@ class Transcript:
                 self.cds = GenomicRegion([], chrom=region.iv.chrom, strand=region.iv.strand)
             self.cds.add_interval(region.iv)
             self.coding_length += region.iv.length
-        elif region.type == 'three_prime_UTR':
+        elif region.type == 'three_prime_utr':
             if not hasattr(self, 'three_prime_utr'):
                 self.three_prime_utr = GenomicRegion([], chrom=region.iv.chrom, strand=region.iv.strand)
             self.three_prime_utr.add_interval(region.iv)
