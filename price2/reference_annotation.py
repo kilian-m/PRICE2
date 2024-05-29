@@ -29,7 +29,7 @@ class ReferenceAnnotation:
             if feature.type == 'exon':
                 self.transcripts[feature.attr['transcript_id']].add_exon(feature)
                 self.transcript_intervals[feature.iv] += self.transcripts[feature.attr['transcript_id']]
-            elif feature.type in ['CDS', 'five_prime_UTR', 'three_prime_UTR']:
+            elif feature.type in ['CDS', 'five_prime_utr', 'three_prime_utr']:
                 self.transcripts[feature.attr['transcript_id']].add_region(feature)
                 if feature.type == 'CDS':
                     self.cds_intervals[feature.iv] += self.transcripts[feature.attr['transcript_id']]
