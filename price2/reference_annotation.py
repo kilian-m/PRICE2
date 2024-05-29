@@ -9,10 +9,9 @@ class ReferenceAnnotation:
     transcripts: dict[str: Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
 
-    def __init__(self, gtf_path: str):
+    def __init__(self, gtf_path: str):#, canonical: bool = False
         self.cds_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
-        #self.ti_sites = HTSeq.GenomicArray("auto", stranded=True, storage="step", typecode='b')
-        self.ti_sites_new = HTSeq.GenomicArrayOfSets("auto", stranded=True)
+        self.ti_sites = HTSeq.GenomicArrayOfSets("auto", stranded=True)
         self.transcripts = {}
         self.transcript_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
 
@@ -20,19 +19,22 @@ class ReferenceAnnotation:
         
         for feature in gtf_file:
             if feature.type == 'transcript':
+                #if canonical and (not 'tag' in feature.attr or not feature.attr['tag'] == 'Ensembl_canonical'):
+                #    continue
                 if not feature.attr['transcript_id'] in self.transcripts:
                     self.transcripts[feature.attr['transcript_id']] = Transcript(feature)
-            elif feature.type == 'exon':
+                continue
+            if not feature.attr['transcript_id'] in self.transcripts:
+                continue
+            if feature.type == 'exon':
                 self.transcripts[feature.attr['transcript_id']].add_exon(feature)
                 self.transcript_intervals[feature.iv] += self.transcripts[feature.attr['transcript_id']]
-            elif feature.type =='CDS':
-                self.transcripts[feature.attr['transcript_id']].add_cds_region(feature)
-                self.cds_intervals[feature.iv] += self.transcripts[feature.attr['transcript_id']]
-                #self.ti_sites[feature.iv.start_as_pos] = True
-                iv = HTSeq.GenomicInterval(feature.iv.chrom, feature.iv.start, feature.iv.start+1, feature.iv.strand)
-                gr = GenomicRegion([iv], chrom=feature.iv.chrom, strand=feature.iv.strand)
-                #self.ti_sites_new[iv] += self.transcripts[feature.attr['transcript_id']]
-                self.ti_sites_new[iv] += gr
+            elif feature.type in ['CDS', 'five_prime_UTR', 'three_prime_UTR']:
+                self.transcripts[feature.attr['transcript_id']].add_region(feature)
+                if feature.type == 'CDS':
+                    self.cds_intervals[feature.iv] += self.transcripts[feature.attr['transcript_id']]
+                    iv = HTSeq.GenomicInterval(feature.iv.chrom, feature.iv.start, feature.iv.start+1, feature.iv.strand)
+                    self.ti_sites[iv] += GenomicRegion([iv], chrom=feature.iv.chrom, strand=feature.iv.strand)
 
         for transcript in self.transcripts.values():
             transcript.cds_regions_to_cds_intervals()
