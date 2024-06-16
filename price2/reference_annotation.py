@@ -18,6 +18,8 @@ class ReferenceAnnotation:
         gtf_file = HTSeq.GFF_Reader(gtf_path)
         
         for feature in gtf_file:
+            if not 'transcript_id' in feature.attr:
+                continue
             if feature.type == 'transcript':
                 #if canonical and (not 'tag' in feature.attr or not feature.attr['tag'] == 'Ensembl_canonical'):
                 #    continue

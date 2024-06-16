@@ -14,34 +14,48 @@ class RiboSeqRun:
     read_count: int
 
 
-    def __init__(self, id: str, directory: str, ra: ReferenceAnnotation, cleavage_model: CleavageModel=None) -> None:
+    def __init__(self, id: str, directory: str, cleavage_model: CleavageModel) -> None:
         self.id = id
         bam_file_path = f'{directory}/{id}.bam'
-        self.bam_reader = HTSeq.BAM_Reader(bam_file_path)
-
-        self.read_count = pysam.AlignmentFile(bam_file_path, 'rb').count()
-
-        if cleavage_model:
-            self.cleavage_model = cleavage_model
-            return
-
-        # make sample bam file with 100_000 reads
-        sample_bam_file = f'{directory}/{id}_sample.bam'
-        open(sample_bam_file, 'w').close()
-        fraction_of_reads = 100_000 / self.read_count
-        pysam.view('-s', str(fraction_of_reads), '-o', sample_bam_file, bam_file_path, save_stdout=sample_bam_file)
-
-        ce = CleavageEstimator()
-
-        ce.collect_data(ra, HTSeq.BAM_Reader(sample_bam_file))
-        ce.correct_table()
-        self.cleavage_model = ce.run()
-
-        os.remove(sample_bam_file)
+        self.cleavage_model = cleavage_model
+        self.read_count = 0
 
     
     def __hash__(self) -> int:
         return hash(self.id)
         
 
+def ribo_seq_runs_from_bams(bam_dir: str,
+                            wdir: str,
+                            ref_annotation: ReferenceAnnotation,
+                            ) -> list[RiboSeqRun]:
+    
+    ribo_seq_runs = []
+    os.makedirs(f'{wdir}/sample_bam', exist_ok=True)
+
+    for bam_file in os.listdir(bam_dir):
+        if not bam_file.endswith('.bam'):
+            continue
+        id = bam_file.split('.')[0]
+        bam_file_path = f'{bam_dir}/{bam_file}'
+        read_count = pysam.AlignmentFile(bam_file_path, 'rb').count()
+        sample_bam_file = f'{wdir}/sample_bam/{bam_file}'
+        open(sample_bam_file, 'w').close()
+        fraction_of_reads = 100_000 / read_count
+        pysam.view('-s', str(fraction_of_reads), '-o', sample_bam_file, bam_file_path, save_stdout=sample_bam_file)
+
+        ce = CleavageEstimator()
+
+        ce.collect_data(ref_annotation, HTSeq.BAM_Reader(sample_bam_file))
+        ce.correct_table()
+        
+        cleavage_model = ce.run()
+
+        ribo_seq_runs.append(RiboSeqRun(id, bam_dir, cleavage_model))
+
+        os.remove(sample_bam_file)
+
+    os.rmdir(f'{wdir}/sample_bam')
+
+    return ribo_seq_runs
         

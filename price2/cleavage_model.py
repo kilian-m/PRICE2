@@ -1,9 +1,16 @@
 import numpy as np
 from numba import njit
 import HTSeq
+import pysam
+import pickle
+
+import os
 
 from .reference_annotation import ReferenceAnnotation
 from .ribo_seq_alignment import RiboSeqAlignment
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 class CleavageModel:
 
@@ -38,6 +45,8 @@ class CleavageModel:
                     region_end = 10**10,        
                 )
 
+        self.non_zero_lengths = np.nonzero(self.noise_lut.sum(axis=1))[0]
+
 
     def pmf(
         self,
@@ -49,6 +58,7 @@ class CleavageModel:
         ) -> float:
         # region_start relative to read start
         # region_end relative to read start
+        # length is the matching length of the alignment
         if length > len(self.pl) + len(self.pr) + 3 + int(oua):
             return 0
 
@@ -69,7 +79,6 @@ class CleavageModel:
         else: # CDS
             if region_start == 0 and region_end == 10**10:
                 return self.cds_lut[length, frame, int(oua)]
-
             f0 = (-frame)%3
             f1 = (f0-1)%3
 
@@ -96,9 +105,39 @@ class CleavageModel:
         pr = np.random.choice(np.arange(len(self.pr)), size=size, p=self.pr)
         u = np.random.choice([True, False], size=size, p=[self.pu, 1-self.pu])
         return (pl, pr, u)
-        
+    
 
-@njit   
+    #def regularize(self, keep_n_pos: int=10) -> 'CleavageModel':
+    #    new_pl = np.zeros(len(self.pl))
+    #    keep_pos = self.pl.argsort()[-keep_n_pos:]
+    #    new_pl[keep_pos] = self.pl[keep_pos]
+    #    new_pl = new_pl/new_pl.sum()
+    #    
+    #    new_pr = np.zeros(len(self.pr))
+    #    keep_pos = self.pr.argsort()[-keep_n_pos:]
+    #    new_pr[keep_pos] = self.pr[keep_pos]
+    #    new_pr = new_pr/new_pr.sum()
+#
+    #    return CleavageModel(new_pl, new_pr, self.pu)
+    
+
+    def plot(self, ax=None) -> None:
+        if not ax:
+            fig, ax = plt.subplots(1,1,figsize=(6,6))
+        ax.bar(range(-len(self.pl)+1,1),self.pl[::-1])
+        ax.bar(range(len(self.pr)),self.pr)
+        ax.set_xlim(-30,25)
+        ax.set_ylim(0, .8)
+        fill = Rectangle((-5, .7), self.pu*25, .05, fill=True, facecolor='tab:red')
+        frame = Rectangle((-5, .7), 25, .05, fill=False, edgecolor='black', linewidth=2)
+        ax.add_patch(fill)
+        ax.add_patch(frame)
+        ax.set_xlabel('position relative to p-site')
+        ax.set_ylabel('cleavage probability')
+
+
+
+@njit
 def read_in_cds_likelihood(
     pl: np.ndarray, 
     pr: np.ndarray, 
@@ -106,32 +145,43 @@ def read_in_cds_likelihood(
     length: int, 
     frame: int, 
     oua: bool, 
-    region_start: int, 
-    region_end: int
+    region_start: int=0, 
+    region_end: int=10*10,
     ) -> float:
     
     f0 = (-frame)%3
-    f1 = (f0-1)%3
-    
-    start_index = max(f1, region_start-1, length-len(pr)-3)
-    if start_index%3 == f1%3:
+
+    start_index = max(f0, region_start, length-len(pr)-2)# -3
+    if start_index%3 == f0%3:
         pass
-    elif start_index%3 == (f1+1)%3:
+    elif start_index%3 == (f0+1)%3:
         start_index += 2
-    elif start_index%3 == (f1+2)%3:
+    elif start_index%3 == (f0+2)%3:
         start_index += 1
 
     i = np.arange(
-            start_index,
-            min(len(pl), length-3, region_end-3),
-            3)
-    l = (pl[i]*pr[length-i-3-1]).sum()
+    start_index,
+    min(len(pl), length-2, region_end-2),
+    3)
+    
+    l = (pl[i]*pr[length-i-3]).sum()
+
+
     if oua:
-        l = l * pu * 1/4
+        l *= pu * 3/4
+
     else:
-        l = l * pu * 3/4
-        
-        start_index = max(f0, region_start, length-len(pr)-3+1)
+        # assume there is no ua
+        l *= (1 - pu)
+        # assume there is an ua
+        length -= 1
+        region_start -= 1
+        region_end -= 1
+        frame = (frame+1)%3
+
+        f0 = (-frame)%3
+
+        start_index = max(f0, region_start, length-len(pr)-3)
         if start_index%3 == f0%3:
             pass
         elif start_index%3 == (f0+1)%3:
@@ -139,14 +189,15 @@ def read_in_cds_likelihood(
         elif start_index%3 == (f0+2)%3:
             start_index += 1
 
-            
         i = np.arange(
-            start_index,
-            min(len(pl),length-2, region_end-2),
-            3)
-        l += (pl[i]*pr[length-i-3]).sum() * (1-pu)
+        start_index,
+        min(len(pl), length-2, region_end-2),
+        3)
+        
+        l += (pl[i]*pr[length-i-3]).sum() * pu * 1/4
 
     return l
+
 
 @njit
 def read_in_noise_likelihood(
@@ -155,27 +206,33 @@ def read_in_noise_likelihood(
     pu: float,
     length: int,
     oua: bool,
-    region_start: int,
-    region_end: int
+    region_start: int=0,
+    region_end: int=10*10,
     ) -> float:
 
     i = np.arange(
-        max(0, region_start-1, length-3-len(pr)), 
-        min(len(pl), length-3, region_end-3)
+        max(0, region_start, length-len(pr)-2), 
+        min(len(pl), length-2, region_end-2)
         )
-    l = (pl[i] * pr[length-i-3-1]).sum()
-
+    l = (pl[i] * pr[length-i-3]).sum()
+    
     if oua:
-        l = l * pu * 1/4
+        l *= pu * 3/4
+        
     else:
-        l = l * pu * 3/4
+        # assume there is no ua
+        l *= (1-pu)
 
+        # assume there is an ua
+        length -= 1
+        region_start -= 1
+        region_end -= 1
+        
         i = np.arange(
-            max(0, region_start, length-2-len(pr)), 
+            max(0, region_start, length-3-len(pr)),
             min(len(pl), length-2, region_end-2)
             )
-        l += (pl[i] * pr[length-i-3]).sum() * (1-pu)
-
+        l += (pl[i] * pr[length-i-3]).sum() * pu * 1/4
     return l
 
 
@@ -216,13 +273,13 @@ class CleavageEstimator:
         for aln in alignments:
             aln = RiboSeqAlignment(aln)
 
-            if not aln.unique:
+            if not aln.unique():
                 self.not_countable += 1
                 continue
             #if aln.close_to_any_tis(reference_annotation):
             #    self.not_countable += 1
             #    continue
-            if not min_considered_length <= aln.matching_length < max_considered_length:
+            if not min_considered_length <= len(aln) < max_considered_length:
                 self.not_countable += 1
                 continue
             transcript_candidates = reference_annotation.collect_coding_transcripts(aln.genomic_region)
@@ -252,7 +309,7 @@ class CleavageEstimator:
                 
             else:
                 if not frame is None:
-                    self.table[aln.matching_length, frame, int(aln.untemplated_addition), 0] += 1
+                    self.table[len(aln), frame, int(aln.untemplated_addition), 0] += 1
                     self.counted_alns += 1
                     if self.counted_alns >= sufficient_counted_alns:
                         break
@@ -294,12 +351,20 @@ class CleavageEstimator:
         )
         shift = self.compute_shift()
         self.correct_max_pos(shift)
+        self.regularize()
         return CleavageModel(
             self.best_pl,
             self.best_pr,
             self.best_u
             )
 
+
+    def regularize(self, keep_prob: float=.9):
+        pl = self.best_pl.copy()
+        self.best_pl = select_and_scale(pl, keep_prob)
+        pr = self.best_pr.copy()
+        self.best_pr = select_and_scale(pr, keep_prob)
+        
 
     def compute_shift(self, range_start:int=-25, range_end:int=-5) -> int:
         pl_rev = self.best_pl[::-1]
@@ -485,3 +550,79 @@ def repeat(
             best_pr = pr
 
     return best_ll, best_u, best_pl, best_pr
+
+
+def to_file(file_path: str, d:dict[str, CleavageModel])->None:
+    # convert dict to pickleable list
+    l = []
+    for k, v in d.items():
+        l.append((k, v.pl, v.pr, v.pu))
+    with open(file_path, 'wb') as f:
+        pickle.dump(l, f)
+
+
+def from_file(file_path: str) -> dict[str, CleavageModel]:
+    with open(file_path, 'rb') as f:
+        l = pickle.load(f)
+    d = {}
+    for k, pl, pr, pu in l:
+        d[k] = CleavageModel(pl, pr, pu)
+    return d
+        
+
+def cleavage_models_from_bams(bam_dir, wdir, ref_annotation, cm_pickle:str)->dict[str, CleavageModel]:
+    os.makedirs(f'{wdir}/sample_bam', exist_ok=True)
+    if not os.path.exists(cm_pickle):
+        d = {}
+    else:
+        d = from_file(cm_pickle)
+    for bam_file in os.listdir(bam_dir):
+        if bam_file.endswith('.bam'):
+            id = bam_file.split('.')[0]
+            if id in d:
+                continue
+            bam_file_path = f'{bam_dir}/{bam_file}'
+            read_count = pysam.AlignmentFile(bam_file_path, 'rb').count()
+            sample_bam_file = f'{wdir}/sample_bam/{bam_file}'
+            open(sample_bam_file, 'w').close()
+            fraction_of_reads = 100_000 / read_count
+            pysam.view('-s', str(fraction_of_reads), '-o', sample_bam_file, bam_file_path, save_stdout=sample_bam_file)
+
+            ce = CleavageEstimator()
+
+            ce.collect_data(ref_annotation, HTSeq.BAM_Reader(sample_bam_file))
+            ce.correct_table()
+            cleavage_model = ce.run()
+            d[id] = cleavage_model
+            os.remove(sample_bam_file)
+
+    to_file(cm_pickle, d)
+    os.rmdir(f'{wdir}/sample_bam')
+    return d
+
+
+def select_and_scale(arr, k):
+    # Step 1: Sort the array in descending order while keeping track of original indices
+    sorted_indices = np.argsort(arr)[::-1]
+    sorted_arr = arr[sorted_indices]
+
+    # Step 2: Select elements until their sum is at least k
+    cumulative_sum = 0
+    selected_indices = []
+    for i, elem in enumerate(sorted_arr):
+        if cumulative_sum >= k:
+            break
+        selected_indices.append(sorted_indices[i])
+        cumulative_sum += elem
+
+    # Step 3: Reconstruct the array with zeros and place selected elements in their original positions
+    result = np.zeros_like(arr)
+    for idx in selected_indices:
+        result[idx] = arr[idx]
+    # Step 4: Normalize the selected elements
+    selected_sum = result.sum()
+    if selected_sum > 0:
+        result = result / selected_sum
+
+    return result
+

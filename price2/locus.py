@@ -1,22 +1,81 @@
 import HTSeq
 
-from scipy.stats import poisson
-
 from .genomic_features import ReadGeneratingRegion, Transcript
 from .ribo_seq_alignment import RiboSeqAlignment
 from .ribo_seq_run import RiboSeqRun
 
+  
 
 class CompatibilityGroup:
     def __init__(self, length: int=0) -> None:
         self.length = length
         self.read_count = 0
 
+    
+    def __repr__(self) -> str:
+        return f'CG:length:{self.length}, read_count:{self.read_count}'
+    
+
+    def add_length_to_cgs(cgs_dict: dict[(frozenset, frozenset, frozenset, frozenset):'CompatibilityGroup'],
+                   rgr_length: list[(ReadGeneratingRegion, int)],
+                   step_length: int) -> None:
+        nones, zeros, ones, twos = set(), set(), set(), set()
+        for rgr, length in rgr_length:
+            if rgr.type=='NOISE':
+                nones.add(rgr)
+                continue
+            l = length%3
+            if l == 0:
+                zeros.add(rgr)
+            elif l == 1:
+                ones.add(rgr)
+            elif l == 2:
+                twos.add(rgr)
+
+        nones, zeros, ones, twos = frozenset(nones), frozenset(zeros), frozenset(ones), frozenset(twos)
+        if (nones, zeros, ones, twos) in cgs_dict:
+            cgs_dict[(nones, zeros, ones, twos)].length += step_length
+        elif (nones, ones, twos, zeros) in cgs_dict:
+            cgs_dict[(nones, ones, twos, zeros)].length += step_length
+        elif (nones, twos, zeros, ones) in cgs_dict:
+            cgs_dict[(nones, twos, zeros, ones)].length += step_length
+        else:
+            cgs_dict[(nones, zeros, ones, twos)] = CompatibilityGroup(length=step_length)
+
+
+    #def get_cgs_length(cgs_dict: dict[(frozenset, frozenset, frozenset, frozenset):'CompatibilityGroup'],
+    #                   rgr_length: list[(ReadGeneratingRegion, int)]) -> int:
+    #    nones, zeros, ones, twos = set(), set(), set(), set()
+    #    for rgr, length in rgr_length:
+    #        if rgr.type == 'NOISE':
+    #            nones.add(rgr)
+    #            continue
+    #        l = -length%3
+    #        if l == 0:
+    #            zeros.add(rgr)
+    #        elif l == 1:
+    #            ones.add(rgr)
+    #        elif l == 2:
+    #            twos.add(rgr)
+    #    nones, zeros, ones, twos = frozenset(nones), frozenset(zeros), frozenset(ones), frozenset(twos)
+    #    if (nones, zeros, ones, twos) in cgs_dict:
+    #        return cgs_dict[(nones, zeros, ones, twos)].length
+    #    elif (nones, ones, twos, zeros) in cgs_dict:
+    #        return cgs_dict[(nones, ones, twos, zeros)].length
+    #    elif (nones, twos, zeros, ones) in cgs_dict:
+    #        return cgs_dict[(nones, twos, zeros, ones)].length
+    #    else:
+    #        return 1
+
 
 class EquivalenceGroup:
-    def __init__(self) -> None:
-        self.read_count = 0
+    length: int
+    read_count: int
 
+    def __init__(self, 
+                 ) -> None:
+        self.length = 0
+        self.read_count = 0
 
 class Locus:
     # permanent properties
@@ -26,23 +85,20 @@ class Locus:
     rgr_set = set[ReadGeneratingRegion]
     rgr_intervals: HTSeq.GenomicArrayOfSets
     transcripts: set[Transcript]
-    status: str # inactive, active, complete
     overlap_likelihood_ratio_threshold: float = .99
 
-    # temporary properties
-    #cg: dict[frozenset[ReadGeneratingRegion]: CompatibilityGroup] # compatibility groups
-    #eg: dict[(frozenset[(ReadGeneratingRegion, int)], int, bool): EquivalenceGroup] # association groups
-
     cgs: dict[RiboSeqRun:dict[frozenset[ReadGeneratingRegion]: CompatibilityGroup]]
-    egs: dict[RiboSeqRun:dict[(frozenset[(ReadGeneratingRegion, int)], int, bool): EquivalenceGroup]]
+    egs: dict[EquivalenceGroup: EquivalenceGroup]
 
-    def __init__(self, iv: HTSeq.GenomicInterval, transcript_intervals: HTSeq.GenomicArrayOfSets) -> None:
-        self.status = 'inactive'
+    def __init__(self, iv: HTSeq.GenomicInterval, transcript_intervals: HTSeq.GenomicArrayOfSets, loci_number: int) -> None:
         self.iv = iv
         self.read_count = 0
         self.read_counts = dict()
         self.rgr_set = set()
         self.rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
+        self.uncounted_reads = 0
+        self.times = dict()
+        self.id = f'loc_{loci_number}'
 
         self.transcripts = set()
         for iv, value in transcript_intervals[self.iv].steps():
@@ -78,41 +134,97 @@ class Locus:
                     self.rgr_set.add(orf)
                     for iv in orf.genomic_region.intervals:
                         self.rgr_intervals[iv] += orf
+        
+        l = list(self.rgr_set)
+        for rgr in self.rgr_set:
+            rgr.index = l.index(rgr)
 
     
-    def make_compatibility_groups(self, runs: list[RiboSeqRun]) -> None:
+    def make_compatibility_groups(self, l: int=20, upstream_cleavage: int=12, downstream_cleavage: int=17) -> None:
         self.cgs = dict()
-        for run in runs:
-            self.cgs[run] = dict()
-        for step_iv, step_set in self.rgr_intervals.steps():
-            fr_set = frozenset(step_set)
-            if not fr_set:
-                continue # skip empty sets
-            if not fr_set in self.cgs[runs[0]]:
-                for run in runs:
-                    cg = CompatibilityGroup()
-                    self.cgs[run][fr_set] = cg
-            for run in runs:
-                self.cgs[run][fr_set].length += step_iv.length
+        lengths = dict()
 
-    
-    def activate(self, genome: dict[str: HTSeq._HTSeq.Sequence], runs: list[RiboSeqRun]) -> None:
-        if self.status == 'inactive':
-            self.status = 'active'
-        else:
-            raise ValueError('Locus is not inactive')
-        self.eg = dict()
+        for step_iv, step_set in self.rgr_intervals.steps():
+            if not step_set:
+                continue
+            for i in range(step_iv.length):
+                gr_dict = dict()
+                for rgr in step_set:
+                    if not rgr in lengths:
+                        lengths[rgr] = 0
+                    if rgr.genomic_region.strand == '+':
+                        read_gr = rgr.genomic_region.map((lengths[rgr]-upstream_cleavage, lengths[rgr]+downstream_cleavage))
+                    else:
+                        rgr_len = len(rgr.genomic_region)
+                        read_gr = rgr.genomic_region.map((rgr_len-lengths[rgr]-upstream_cleavage, rgr_len-lengths[rgr]+downstream_cleavage))
+                    if not read_gr in gr_dict:
+                        gr_dict[read_gr] = set()
+                    gr_dict[read_gr].add(rgr)
+                for rgr_set in gr_dict.values():
+                    CompatibilityGroup.add_length_to_cgs(self.cgs, [(rgr, lengths[rgr]) for rgr in rgr_set], 1)
+                for rgr in step_set:
+                    lengths[rgr] += 1
+                    
+
+    def make_equivalence_groups(self, runs: list[RiboSeqRun]) -> None:
         self.egs = dict()
         for run in runs:
             self.egs[run] = dict()
-        self.make_rgrs(genome)
-        self.make_compatibility_groups(runs)
+            for cg in self.cgs:
+                #for length in range(3,len(run.cleavage_model.pl)+len(run.cleavage_model.pr)-1+3):
+                for length in run.cleavage_model.non_zero_lengths:
+                    for frame in range(3):
+                        for oua in [True, False]:
+                            rgr_frame = set()
+
+                            fr = None
+                            if run.cleavage_model.pmf(length, oua, fr) > 0:
+                                for none in cg[0]:
+                                    rgr_frame.add((none, None))
+
+                            if self.iv.strand == '+':
+                                fr = (frame+0)%3
+                            else:
+                                fr = (frame-0)%3
+                            if run.cleavage_model.pmf(length, oua, fr) > 0:
+                                for zero in cg[1]:
+                                    rgr_frame.add((zero, fr))
+
+                            if self.iv.strand == '+':
+                                fr = (frame+1)%3
+                            else:
+                                fr = (frame-1)%3
+                            if run.cleavage_model.pmf(length, oua, fr) > 0:
+                                for one in cg[2]:
+                                    rgr_frame.add((one, fr))
+
+                            if self.iv.strand == '+':
+                                fr = (frame+2)%3
+                            else:
+                                fr = (frame-2)%3
+                            if run.cleavage_model.pmf(length, oua, fr) > 0:
+                                for two in cg[3]:
+                                    rgr_frame.add((two, fr))
+                            
+                            rgr_frame = frozenset(rgr_frame)
+
+                            if not rgr_frame:
+                                continue
+
+                            eg_length = self.cgs[cg].length/3
+                            if not (rgr_frame, length, oua) in self.egs[run]:
+                                self.egs[run][(rgr_frame, length, oua)] = EquivalenceGroup()
+                            
+                            self.egs[run][(rgr_frame, length, oua)].length += eg_length
+                            
 
 
-    def add_ribo_seq_alignment(self, rsa: RiboSeqAlignment, run: RiboSeqRun, overlap_likelihood_ratio_threshold: float=.01) -> None:
-        if rsa.matching_length < 15 or rsa.matching_length > 40:
-            return
-        length = rsa.matching_length
+    # TODO: optim
+    def add_ribo_seq_alignment(self, rsa: RiboSeqAlignment, run: RiboSeqRun, overlap_likelihood_ratio_threshold: float=.99) -> None:
+        
+        #if rsa.matching_length < 15 or rsa.matching_length > 40:
+        #    return
+        length = len(rsa)
         oua = rsa.untemplated_addition
         rgr_frame = set()
 
@@ -148,6 +260,8 @@ class Locus:
                     oua,
                     frame,
                 )
+                if complete_likelihood == 0:
+                    continue
                 if iv_on_rgr[0] < 0 or iv_on_rgr[1] > len(rgr.genomic_region):
                     overlap_likelihood = run.cleavage_model.pmf(
                         length,
@@ -156,11 +270,11 @@ class Locus:
                         region_start = -iv_on_rgr[0],
                         region_end= -iv_on_rgr[0] + len(rgr.genomic_region),
                     )
-                    try:
-                        if overlap_likelihood/complete_likelihood >= overlap_likelihood_ratio_threshold:
-                            rgr_frame.add((rgr, frame))
-                    except ZeroDivisionError:
-                        return
+                    #try:
+                    if overlap_likelihood/complete_likelihood >= overlap_likelihood_ratio_threshold:
+                        rgr_frame.add((rgr, frame))
+                    #except ZeroDivisionError:
+                    #    return
                 else:
                     rgr_frame.add((rgr, frame))
         
@@ -172,210 +286,19 @@ class Locus:
         if len(rgr_frame) == 1:
             pass
 
-        if not (rgr_frame, length, oua) in self.egs[run]:
-            eg = EquivalenceGroup()
-            self.egs[run][(rgr_frame, length, oua)] = eg
-        self.egs[run][(rgr_frame, length, oua)].read_count += 1
+        try:
+            self.egs[run][(rgr_frame, length, oua)].read_count += 1
+            run.read_count += 1
+        except KeyError:
+            pass
+            self.uncounted_reads += 1
 
-        self.read_count += 1
         try:
             self.read_counts[run] += 1
         except KeyError:
             self.read_counts[run] = 1
-
-    
-    def fill_compatibility_groups(self, runs: list[RiboSeqRun]) -> None:
-        for run in runs:
-            for (eg_rgrs_frame, _, _), eg in self.egs[run].items():
-                rgrs = frozenset({rgr_frame[0] for rgr_frame in eg_rgrs_frame})
-                if not rgrs in self.cgs[run]:
-                    cg = CompatibilityGroup(length=1)
-                    self.cgs[run][rgrs] = cg
-                self.cgs[run][rgrs].read_count += eg.read_count
-
-
-    def run_orf_deconvolution(self,
-                              runs: list[RiboSeqRun],
-                              iterations: int=100,
-                              activity_change_cutoff: float=.00005,
-                              )-> None:
-        
-        self.fill_compatibility_groups(runs)
-
-        for rgr in self.rgr_set:
-            rgr.activity = {}
-            for run in runs:
-                rgr.activity[run] = 1/len(self.rgr_set)
-        
-        for rgr in self.rgr_set:
-            rgr.unscaled_activity = {}
-
-        for rgr in self.rgr_set:
-            rgr.average_activity = 1/len(self.rgr_set)
-
-        self.active_rgrs = self.rgr_set.copy()
-
-        self.rgr_activities = {(rgr, run):[] for rgr in self.active_rgrs for run in runs}
-        self.rrc = {(rgr, run):[] for rgr in self.active_rgrs for run in runs}
-        self.average_activities = {rgr:[rgr.average_activity] for rgr in self.active_rgrs}
-
-        self.activity_changes = []
-
-        for i in range(iterations):
-            for rgr in self.active_rgrs:
-                rgr.read_count = {}
-                for run in runs:
-                    rgr.read_count[run] = 0
-
-            # E-step (assign reads to RGRs)
-            for run in runs:
-                con = False
-                for (rgr_frame, length, oua), eg in self.egs[run].items():
-                    count = eg.read_count
-                    likelihoods = {}
-
-                    # compute the likelihood for a read in this equivalence group to be generated by each overlapping RGR
-                    for rgr, frame in rgr_frame:
-                        likelihoods[rgr] = run.cleavage_model.pmf(length, oua, frame) * rgr.average_activity
-
-                    likelihood_sum = sum(likelihoods.values())
-                    if likelihood_sum == 0:
-                        con = True
-                        break
-                    p = {rgr: likelihoods[rgr]/likelihood_sum for rgr in likelihoods}
-                    for rgr, frame in rgr_frame:
-                        rgr.read_count[run] += count * p[rgr]
-                    if con:
-                        continue
-
-            # M-step (update RGR activities)
-            for run in runs:
-                activity_sum = 0
-                unscaled_activities = {}
-                for rgr in self.active_rgrs:
-                    unscaled_activities[rgr] = rgr.read_count[run] / len(rgr)
-                    activity_sum += unscaled_activities[rgr]
-                for rgr in self.active_rgrs:
-                    if activity_sum != 0:
-                        rgr.activity[run] = unscaled_activities[rgr] / activity_sum
-                        rgr.unscaled_activity[run] = unscaled_activities[rgr]
-                    else:
-                        rgr.activity[run] = unscaled_activities[rgr]
-                        rgr.unscaled_activity[run] = unscaled_activities[rgr]
-            
-            for rgr in self.active_rgrs:
-                rgr.average_activity = sum([rgr.activity[run] for run in runs]) / len(runs)
-                self.average_activities[rgr].append(rgr.average_activity)
-
-            self.lls.append(self.incomplete_data_likelihood(runs))
-
-            for rgr in self.rgr_set:
-                for run in runs:
-                    self.rgr_activities[(rgr, run)].append(rgr.activity[run])
-            for rgr in self.active_rgrs:
-                for run in runs:
-                    self.rrc[(rgr, run)].append(rgr.read_count[run])
-
-            # sum differences in region activities
-            if i>1:
-                activity_change = 0
-                for rgr in self.active_rgrs:
-                    activity_change += abs(self.average_activities[rgr][-1] - self.average_activities[rgr][-2])
-                self.activity_changes.append(activity_change)
-                # regularize if activity changes less than delta_cutoff, if this does not work break
-                if activity_change < activity_change_cutoff:
-                    if not self.regularize(runs):
-                        break
-
-        self.break_iteration = i
-
-        if self.status == 'active':
-            self.status = 'complete'
-        else:
-            raise ValueError('Locus is not active')
-        
-        #del self.egs
-        #del self.cgs 
-
-
-    def incomplete_data_likelihood(self, runs) -> float:
-        ll = 0
-        for run in runs:
-            for cg_rgrs, cg in self.cgs[run].items():
-                activity = sum([rgr.unscaled_activity[run] for rgr in cg_rgrs])
-                expected_reads_in_cg = activity * cg.length
-                actual_reads_in_cg = cg.read_count
-                ll += poisson.logpmf(actual_reads_in_cg, expected_reads_in_cg)
-        return ll
-            
-
-    
-
-    def regularize(self, runs: list[RiboSeqRun], likelihood_cutoff: float=2,) -> bool:
-        success = False
-        ll = self.incomplete_data_likelihood(runs)
-        regularized_rgrs = []
-        original_unscaled_activities = {}
-        for run in runs:
-            for rgr in self.active_rgrs:
-                if not run in original_unscaled_activities:
-                    original_unscaled_activities[run] = {}
-                original_unscaled_activities[run][rgr] = rgr.unscaled_activity[run]
-        
-        # experimentally remove region, reassign reads and compute new likelihood
-        for removed_rgr in self.active_rgrs:
-            for run in runs:
-                for rgr in self.active_rgrs:
-                    rgr.read_count[run] = 0
-            
-            # E-step
-            for run in runs:
-                con = False
-                for (rgr_frame, length, oua), eg in self.egs[run].items():
-                    count = eg.read_count
-                    likelihoods = {}
-
-                    for rgr, frame in rgr_frame:
-                        if rgr == removed_rgr:
-                            likelihoods[rgr] = 0
-                        else:
-                            likelihoods[rgr] = run.cleavage_model.pmf(length, oua, frame) * rgr.average_activity
-                    
-                    likelihood_sum = sum(likelihoods.values())
-                    if likelihood_sum == 0:
-                        con = True
-                        break
-                    p = {rgr: likelihoods[rgr]/likelihood_sum for rgr in likelihoods}
-                    for rgr, frame in rgr_frame:
-                        rgr.read_count[run] += count * p[rgr]
-                        
-                    if con:
-                        continue
-
-            # M-step
-            for run in runs:
-                for rgr in self.active_rgrs:
-                    rgr.unscaled_activity[run] = rgr.read_count[run] / len(rgr)
-            
-            if self.incomplete_data_likelihood(runs) + likelihood_cutoff > ll:
-                success = True
-                regularized_rgrs.append(removed_rgr)
-
-            for run in runs:
-                for rgr in self.active_rgrs:
-                    rgr.unscaled_activity[run] = original_unscaled_activities[run][rgr]
-        
-        for rgr in regularized_rgrs:
-            self.deactivate_rgr(rgr)
-
-        return success
-    
-
-    def deactivate_rgr(self, rem_rgr: ReadGeneratingRegion) -> None:
-        self.active_rgrs = set([rgr for rgr in self.active_rgrs if rgr != rem_rgr])
-        rem_rgr.average_activity = 0
-                
-
+       
+       
 
 # find ORFs based on transcript sequence
 # return list of intervals of all ORFs with min length
@@ -396,3 +319,4 @@ def find_orfs(
                         orf_iv_on_transcript.append((start,j+3))
                 starts = []
     return orf_iv_on_transcript
+

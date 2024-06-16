@@ -1,12 +1,13 @@
 import HTSeq
+from HTSeq import GenomicInterval
 
 
 class GenomicRegion:
     strand: str
     chrom: str
-    intervals: list[HTSeq.GenomicInterval] # in order of the strand (like in GTF file)
+    intervals: list[GenomicInterval] # in order of the strand (like in GTF file)
 
-    def __init__(self, intervals: list, chrom: str=None, strand: str=None) -> None:
+    def __init__(self, intervals: list[GenomicInterval], chrom: str=None, strand: str=None) -> None:
         if chrom: 
             self.chrom = chrom
         else:
@@ -41,6 +42,7 @@ class GenomicRegion:
     def __repr__(self):
         return str(self)
 
+
     def __len__(self):
         return sum([x.end-x.start for x in self.intervals])
     
@@ -48,167 +50,6 @@ class GenomicRegion:
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
         self.intervals.append(interval)
 
-
-
-    # self is the reference region (e.g. the transcript)
-    # other is the query region (e.g. the read)
-    # return the interval of the query relative to the reference
-    # if the query is not compatible with the reference, return False
-    # not compatible means that the query spans intronic regions of the reference or skips exons of the reference
-    # if the query overlaps the start or end of the reference the coordinates are returned
-#    def induce(self, other: 'GenomicRegion') -> tuple[int, int]:
-#        if self.chrom != other.chrom or self.strand != other.strand:
-#            return False
-#        ref_intervals = self.intervals
-#        query_intervals = other.intervals
-#
-#        if self.strand == '-':
-#            exons_end = ref_intervals[0].end
-#            ref_intervals = [HTSeq.GenomicInterval(ri.chrom, exons_end-ri.end, exons_end-ri.start, ri.strand) for ri in ref_intervals]
-#            query_intervals = [HTSeq.GenomicInterval(qi.chrom, exons_end-qi.end, exons_end-qi.start, qi.strand) for qi in query_intervals]
-#
-#        # !!! change this
-#        #if ref_intervals[0].start > query_intervals[0].start\
-#        #    or ref_intervals[-1].end < query_intervals[-1].end:
-#        #    raise ValueError('Query region is not compatible with reference region.')
-#
-#        ref_index = 0
-#        query_index = 0
-#        current_length = 0
-#
-#        # increase ref_index until we reach query
-#        while ref_intervals[ref_index].end < query_intervals[query_index].start:
-#            current_length += ref_intervals[ref_index].length 
-#            ref_index += 1
-#            #TODO?
-#            if ref_index == len(ref_intervals):
-#                raise ValueError('Query region is not compatible with reference region.')
-#
-#        # case the query starts in the middle of an intron
-#        if ref_intervals[ref_index].start > query_intervals[query_index].start\
-#            and not ref_index == 0:
-#            raise ValueError('Query region is not compatible with reference region.')
-#        induced_start = current_length + query_intervals[query_index].start - ref_intervals[ref_index].start
-#
-#        # case query starts in exon and continues
-#        if query_index < len(query_intervals)-1\
-#            and ref_intervals[ref_index].end == query_intervals[query_index].end:
-#            current_length += ref_intervals[ref_index].length
-#            ref_index += 1
-#            query_index += 1
-#
-#        # while reference and index span whole exons
-#        while query_index < len(query_intervals)-1\
-#            and ref_intervals[ref_index].end == query_intervals[query_index].end\
-#            and ref_intervals[ref_index].start == query_intervals[query_index].start:
-#            current_length += ref_intervals[ref_index].length
-#            ref_index += 1
-#            query_index += 1
-#
-#        # case query continues somewhere else than the reference
-#        if ref_intervals[ref_index].start != query_intervals[query_index].start\
-#            and query_index > 0:
-#            raise ValueError('Query region is not compatible with reference region.')
-#        
-#        # case query ends somewhere else than the reference (and is not the last part)
-#        if not ref_index == len(ref_intervals) - 1\
-#            and ref_intervals[ref_index].end < query_intervals[query_index].end:
-#            raise ValueError('Query region is not compatible with reference region.')
-#            
-#        induced_end = current_length + query_intervals[query_index].end - ref_intervals[ref_index].start
-#        return (induced_start, induced_end)
-    
-
-#    def induce_old(self, other: 'GenomicRegion') -> tuple[int, int]:
-#        if self.chrom != other.chrom or self.strand != other.strand:
-#            raise ValueError('Query region is not compatible with reference region.')
-#        ref_intervals = self.intervals
-#        query_intervals = other.intervals
-#
-#        if self.strand == '-':
-#            exons_end = ref_intervals[0].end
-#            ref_intervals = [HTSeq.GenomicInterval(ri.chrom, exons_end-ri.end, exons_end-ri.start, ri.strand) for ri in ref_intervals]
-#            query_intervals = [HTSeq.GenomicInterval(qi.chrom, exons_end-qi.end, exons_end-qi.start, qi.strand) for qi in query_intervals]
-#
-#        #c1
-#        if query_intervals[0].start < query_intervals[-1].end < ref_intervals[0].start < ref_intervals[-1].end:
-#            if len(query_intervals)>1:
-#                raise ValueError('Query region is not compatible with reference region.')
-#            else:
-#                return (query_intervals[0].start - ref_intervals[0].start,
-#                        query_intervals[0].end - ref_intervals[0].start)
-#        
-#        #c2
-#        elif ref_intervals[0].start < ref_intervals[-1].end < query_intervals[0].start < query_intervals[-1].end:
-#            if len(query_intervals)>1:
-#                raise ValueError('Query region is not compatible with reference region.')
-#            else:
-#                ref_len = sum([ri.length for ri in ref_intervals])
-#                return (query_intervals[0].start - ref_intervals[-1].end + ref_len,
-#                        query_intervals[0].end - ref_intervals[-1].end + ref_len)
-#
-#        #c3
-#        elif ref_intervals[0].start <= query_intervals[0].start <= query_intervals[-1].end <= ref_intervals[-1].end:
-#            cut_ref_intervals = cut_intervals(ref_intervals,
-#                    query_intervals[0].start, query_intervals[-1].end)
-#            cut_query_intervals = cut_intervals(query_intervals,
-#                    query_intervals[0].start, query_intervals[-1].end)
-#            if cut_ref_intervals == cut_query_intervals:
-#                return (interval_sum(ref_intervals, query_intervals[0].start),
-#                        interval_sum(ref_intervals, query_intervals[-1].end))
-#            else:
-#                raise ValueError('Query region is not compatible with reference region.')
-#            
-#        #c4
-#        elif query_intervals[0].start < ref_intervals[0].start < query_intervals[-1].end < ref_intervals[-1].end:
-#            cut_ref_intervals = cut_intervals(ref_intervals,
-#                    ref_intervals[0].start, query_intervals[-1].end)
-#            cut_query_intervals = cut_intervals(query_intervals,
-#                    ref_intervals[0].start, query_intervals[-1].end)
-#            out_intervals = cut_intervals(query_intervals,
-#                    query_intervals[0].start, ref_intervals[0].start)
-#            if cut_ref_intervals == cut_query_intervals\
-#                and len(out_intervals) == 1:
-#                return (query_intervals[0].start - ref_intervals[0].start,
-#                        interval_sum(ref_intervals, query_intervals[-1].end))
-#            else:
-#                raise ValueError('Query region is not compatible with reference region.')
-#
-#        #c5
-#        elif ref_intervals[0].start < query_intervals[0].start < ref_intervals[-1].end < query_intervals[-1].end:
-#            cut_ref_intervals = cut_intervals(ref_intervals,
-#                    query_intervals[0].start, ref_intervals[-1].end)
-#            cut_query_intervals = cut_intervals(query_intervals,
-#                    query_intervals[0].start, ref_intervals[-1].end)
-#            out_intervals = cut_intervals(query_intervals,
-#                    ref_intervals[-1].end, query_intervals[-1].end)
-#            if cut_ref_intervals == cut_query_intervals\
-#                and len(out_intervals) == 1:
-#                out_ref_intervals = cut_intervals(ref_intervals,
-#                    ref_intervals[0].start, query_intervals[0].start)
-#                s = sum([x[1]-x[0] for x in out_ref_intervals])
-#                return (s, s + sum([x.end-x.start for x in query_intervals]))
-#            else:
-#                raise ValueError('Query region is not compatible with reference region.')
-#
-#        #c6
-#        elif query_intervals[0].start < ref_intervals[0].start < ref_intervals[-1].end < query_intervals[-1].end:
-#            cut_ref_intervals = cut_intervals(ref_intervals,
-#                    ref_intervals[0].start, ref_intervals[-1].end)
-#            cut_query_intervals = cut_intervals(query_intervals,
-#                    ref_intervals[0].start, ref_intervals[-1].end)
-#            out_intervals_start = cut_intervals(query_intervals,
-#                    query_intervals[0].start, ref_intervals[0].start)
-#            out_intervals_end = cut_intervals(query_intervals,
-#                    ref_intervals[-1].end, query_intervals[-1].end)
-#            if cut_ref_intervals == cut_query_intervals\
-#                and len(out_intervals_start) == 1\
-#                and len(out_intervals_end) == 1:
-#                s = sum([x[1]-x[0] for x in out_intervals_start])
-#                return (query_intervals[0].start - ref_intervals[0].start,
-#                        s + query_intervals[-1].end - ref_intervals[-1].end)
-#            else:
-#                raise ValueError('Query region is not compatible with reference region.')
         
 
     def induce(self, other: 'GenomicRegion') -> tuple[int, int]:
@@ -254,10 +95,6 @@ class GenomicRegion:
         return (start, end)
             
         
-        
-
-
-
 
     def map(self, transcript_interval: tuple[int, int]) -> 'GenomicRegion':
         transcript_start, transcript_end = transcript_interval
@@ -319,6 +156,7 @@ class GenomicRegion:
             for interval in self.intervals:
                 sequence += str(genome[self.chrom][interval.start:interval.end].get_reverse_complement())
         return sequence
+    
 
 def cut_intervals(interval_list, start, end)->list:
     l = []
@@ -338,14 +176,3 @@ def cut_intervals(interval_list, start, end)->list:
     return l
 
 
-#def interval_sum(interval_list, end)->int:
-#    s = 0
-#    for iv in interval_list:
-#        if iv.end < end:
-#            s += iv.length
-#        elif iv.start < end:
-#            s += end - iv.start
-#            break
-#        else:
-#            break
-#    return s

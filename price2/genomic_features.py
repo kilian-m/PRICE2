@@ -65,6 +65,7 @@ class ReadGeneratingRegion:
         if iv_on_transcript is None and genomic_region is None:
             raise ValueError('Either iv_on_transcript or genomic_region must be provided.')
         self.type = type
+        self.read_count = 0
         #self.transcript = transcript
 
         if genomic_region is None:
@@ -91,15 +92,15 @@ class ReadGeneratingRegion:
         return f'{self.type} on region {self.genomic_region}'
     
 
-    def to_serializable(self) -> tuple:
-        t = (self.type, self.transcript_id, self.genomic_region.strand, self.genomic_region.chrom, 
-             [(x.start, x.end) for x in self.genomic_region.intervals])
-        return t
-    
-
-    def from_serializable(t: tuple) -> 'ReadGeneratingRegion':
-        type, transcript_id, strand, chrom, intervals = t
-        genomic_region = GenomicRegion([HTSeq.GenomicInterval(chrom, x[0], x[1], strand) for x in intervals], chrom, strand)
-        return ReadGeneratingRegion(type, transcript_id, genomic_region=genomic_region)
+    #def to_serializable(self) -> tuple:
+    #    t = (self.type, self.transcript_id, self.genomic_region.strand, self.genomic_region.chrom, 
+    #         [(x.start, x.end) for x in self.genomic_region.intervals])
+    #    return t
+    #
+#
+    #def from_serializable(t: tuple) -> 'ReadGeneratingRegion':
+    #    type, transcript_id, strand, chrom, intervals = t
+    #    genomic_region = GenomicRegion([HTSeq.GenomicInterval(chrom, x[0], x[1], strand) for x in intervals], chrom, strand)
+    #    return ReadGeneratingRegion(type, transcript_id, genomic_region=genomic_region)
 
 
