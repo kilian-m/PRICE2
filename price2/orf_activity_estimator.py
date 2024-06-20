@@ -1,8 +1,10 @@
 import os
 import sqlite3
 import numpy as np
+import pandas as pd
 
 from pickle import loads, dumps
+import zlib
 
 from multiprocessing import Pool
 
@@ -42,21 +44,28 @@ class ORFActivityEstimator:
     
     def run_orf_deconvolution_parallel(self, processes: int=32):
         loci_ids = [loc.id for loc in self.loci.values()]
-
+        
         db_paths = (self.reads_db_path, self.loci_db_path, self.runs_db_path)
 
+        performance_measurements = []
+
         with Pool(processes) as pool:
+            loci_ids = loci_ids[100:300]
             map_iterator = pool.imap_unordered(process_loc, [(li, db_paths) for li in loci_ids])
             for result in notebook.tqdm(map_iterator, total=len(loci_ids)):
                 self.loci[result[0]].opt_result = result[1]
                 self.loci[result[0]].norm_result = result[2]
+                performance_measurements.append(result[3])
+        
+        self.performance_df = pd.DataFrame(performance_measurements, columns=['loc_id', 'overall_time', 'num_reads', 'cg_time', 'eg_time', 'rsa_time', 'opt_time', 'num_cgs', 'num_egs', 'num_orfs', 'num_transcripts', 'num_iterations'])
 
 
 
 def process_loc(locid_dbpath, λ=0):
 
+    t_start = time.time() # performance measurement
+
     loc_id, db_paths = locid_dbpath
-    #start_time = time.time()
     reads_db_path, loci_db_path, runs_db_path = db_paths
     
     ###############################
@@ -95,19 +104,31 @@ def process_loc(locid_dbpath, λ=0):
     ################################
     ### generate data structures ###
     ################################
-
+    t1 = time.time() # performance measurement
     loc.make_compatibility_groups()
+    t2 = time.time() # performance measurement
+    cg_time = t2-t1 # performance measurement
+
+    t1 = time.time() # performance measurement
     loc.make_equivalence_groups(runs)
+    t2 = time.time() # performance measurement
+    eg_time = t2-t1 # performance measurement
 
     ################################
     ### process read information ###
     ################################
 
+    num_reads = 0 # performance measurement
+    t1 = time.time() # performance measurement
     for loc_id, run_id, blob in reads_dfs:
-        reads_dfs = loads(blob)
-        for _, read_df in reads_dfs.groupby('read_id'):
+        reads_df = loads(zlib.decompress(blob))
+        for _, read_df in reads_df.groupby('read_id'):
             rsa = RiboSeqAlignment(read_df)
             loc.add_ribo_seq_alignment(rsa, runs_dict[run_id])
+            num_reads += 1 # performance measurement
+    t2 = time.time() # performance measurement
+    rsa_time = t2-t1 # performance measurement
+
     ##############################################################################
     ##### prepare data to be used efficiently by the numba objective function ####
     ##############################################################################
@@ -136,6 +157,21 @@ def process_loc(locid_dbpath, λ=0):
     
     num_rgrs = len(rgrs)
 
+    num_cgs = len(loc.cgs) # performance measurement
+    num_egs = len(egs[0]) # performance measurement
+    
+
+    num_orfs = 0 # performance measurement
+    num_transcripts = 0 # performance measurement
+    for rgr in rgrs: # performance measurement
+        if rgr.type == 'ORF': # performance measurement
+            num_orfs += 1 # performance measurement
+        elif rgr.type == 'NOISE': # performance measurement
+            num_transcripts += 1 # performance measurement
+        else: # performance measurement
+            raise ValueError(f'unknown rgr type: {rgr.type}') # performance measurement
+
+
     initial_guess = np.full((num_rgrs, len(runs)), 1)
     initial_guess = initial_guess.flatten()
 
@@ -156,6 +192,7 @@ def process_loc(locid_dbpath, λ=0):
     ############################
     ### run the optimization ###
     ############################
+    t1 = time.time() # performance measurement
     try:
         optimization_result = minimize(
             objective_function_grad,
@@ -169,12 +206,20 @@ def process_loc(locid_dbpath, λ=0):
     except ZeroDivisionError:
         pass
 
+    t2 = time.time() # performance measurement
+    opt_time = t2-t1 # performance measurement
+
     tmp = np.exp(optimization_result.x).reshape(num_rgrs, len(run_read_counts))
     normalized_result = tmp/tmp.sum(axis=0)
 
-    #end_time = time.time()
-    #print(f'finished processing locus {loc_id} in {end_time-start_time:.2f} seconds')
-    return (loc_id, optimization_result, normalized_result)
+    t_end = time.time() # performance measurement
+    overall_time = t_end-t_start # performance measurement
+
+    num_iterations = optimization_result.nit # performance measurement
+
+    performance_measurements = [loc_id, overall_time, num_reads, cg_time, eg_time, rsa_time, opt_time, num_cgs, num_egs, num_orfs, num_transcripts, num_iterations]
+
+    return (loc_id, optimization_result, normalized_result, performance_measurements)
 
 
 @jit(nopython=True, parallel=True, cache=True)
