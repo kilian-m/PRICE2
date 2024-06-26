@@ -42,7 +42,7 @@ class ORFActivityEstimator:
         self.loci = {id: loads(blob) for id, blob in cur.fetchall()}
 
     
-    def run_orf_deconvolution_parallel(self, processes: int=32):
+    def run_orf_deconvolution(self, processes: int=32):
         loci_ids = [loc.id for loc in self.loci.values()]
         
         db_paths = (self.reads_db_path, self.loci_db_path, self.runs_db_path)
@@ -122,10 +122,13 @@ def process_loc(locid_dbpath, λ=0):
     t1 = time.time() # performance measurement
     for loc_id, run_id, blob in reads_dfs:
         reads_df = loads(zlib.decompress(blob))
+        reads_df['chrom'] = loc.iv.chrom
+        reads_df['strand'] = loc.iv.strand
+        reads_df['read_id'] = reads_df['is_first_iv'].cumsum()
         for _, read_df in reads_df.groupby('read_id'):
             rsa = RiboSeqAlignment(read_df)
-            loc.add_ribo_seq_alignment(rsa, runs_dict[run_id])
-            num_reads += 1 # performance measurement
+            loc.add_ribo_seq_alignments(rsa, runs_dict[run_id], read_df.iloc[0]['count'])
+            num_reads += read_df.iloc[0]['count'] # performance measurement
     t2 = time.time() # performance measurement
     rsa_time = t2-t1 # performance measurement
 
@@ -199,9 +202,9 @@ def process_loc(locid_dbpath, λ=0):
             initial_guess,
             args=(run_read_counts, cm_lut, egs, num_rgrs, λ),
             method='L-BFGS-B', 
-            tol=1e-10,
+            #tol=1e-10,
             jac=True,
-            options={'maxiter': 10_000, 'maxfun': 1e6}
+            options={'maxiter': 10_000, 'maxfun': 1e6, 'gtol': 1e-1}
         )
     except ZeroDivisionError:
         pass

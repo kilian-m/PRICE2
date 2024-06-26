@@ -43,31 +43,6 @@ class CompatibilityGroup:
             cgs_dict[(nones, zeros, ones, twos)] = CompatibilityGroup(length=step_length)
 
 
-    #def get_cgs_length(cgs_dict: dict[(frozenset, frozenset, frozenset, frozenset):'CompatibilityGroup'],
-    #                   rgr_length: list[(ReadGeneratingRegion, int)]) -> int:
-    #    nones, zeros, ones, twos = set(), set(), set(), set()
-    #    for rgr, length in rgr_length:
-    #        if rgr.type == 'NOISE':
-    #            nones.add(rgr)
-    #            continue
-    #        l = -length%3
-    #        if l == 0:
-    #            zeros.add(rgr)
-    #        elif l == 1:
-    #            ones.add(rgr)
-    #        elif l == 2:
-    #            twos.add(rgr)
-    #    nones, zeros, ones, twos = frozenset(nones), frozenset(zeros), frozenset(ones), frozenset(twos)
-    #    if (nones, zeros, ones, twos) in cgs_dict:
-    #        return cgs_dict[(nones, zeros, ones, twos)].length
-    #    elif (nones, ones, twos, zeros) in cgs_dict:
-    #        return cgs_dict[(nones, ones, twos, zeros)].length
-    #    elif (nones, twos, zeros, ones) in cgs_dict:
-    #        return cgs_dict[(nones, twos, zeros, ones)].length
-    #    else:
-    #        return 1
-
-
 class EquivalenceGroup:
     length: int
     read_count: int
@@ -100,8 +75,15 @@ class Locus:
         self.times = dict()
         self.id = f'loc_{loci_number}'
 
+        self.transcript_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
+
+        for iv, val in transcript_intervals[self.iv].steps():
+            self.transcript_intervals[iv] = val
+
         self.transcripts = set()
-        for iv, value in transcript_intervals[self.iv].steps():
+
+        #for iv, value in transcript_intervals[self.iv].steps():
+        for iv, value in self.transcript_intervals.steps():
             self.transcripts |= value
 
         self.lls = [] # for plotting
@@ -171,7 +153,6 @@ class Locus:
         for run in runs:
             self.egs[run] = dict()
             for cg in self.cgs:
-                #for length in range(3,len(run.cleavage_model.pl)+len(run.cleavage_model.pr)-1+3):
                 for length in run.cleavage_model.non_zero_lengths:
                     for frame in range(3):
                         for oua in [True, False]:
@@ -220,7 +201,12 @@ class Locus:
 
 
     # TODO: optim
-    def add_ribo_seq_alignment(self, rsa: RiboSeqAlignment, run: RiboSeqRun, overlap_likelihood_ratio_threshold: float=.99) -> None:
+    def add_ribo_seq_alignments(self,
+                                rsa: RiboSeqAlignment,
+                                run: RiboSeqRun,
+                                read_count: int,
+                                overlap_likelihood_ratio_threshold: float=.99
+                                ) -> None:
         
         #if rsa.matching_length < 15 or rsa.matching_length > 40:
         #    return
@@ -283,20 +269,19 @@ class Locus:
         
         rgr_frame = frozenset(rgr_frame)
 
-        if len(rgr_frame) == 1:
-            pass
+        #if len(rgr_frame) == 1:
+        #    pass
 
         try:
-            self.egs[run][(rgr_frame, length, oua)].read_count += 1
-            run.read_count += 1
+            self.egs[run][(rgr_frame, length, oua)].read_count += read_count
+            run.read_count += read_count
         except KeyError:
-            pass
-            self.uncounted_reads += 1
+            self.uncounted_reads += read_count
 
         try:
-            self.read_counts[run] += 1
+            self.read_counts[run] += read_count
         except KeyError:
-            self.read_counts[run] = 1
+            self.read_counts[run] = read_count
        
        
 

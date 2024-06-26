@@ -23,6 +23,15 @@ class Transcript:
         self.exons = GenomicRegion([], chrom=feature.iv.chrom, strand=feature.iv.strand)
         self.coding_length = 0
         self.exon_length = 0
+    
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+    
+
+    def __eq__(self, other: 'Transcript') -> bool:
+        return self.id == other.id
+
 
     def add_exon(self, exon: HTSeq.features.GenomicFeature) -> None:
         self.exons.add_interval(exon.iv)
