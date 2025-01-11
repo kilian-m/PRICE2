@@ -19,91 +19,6 @@ from .ribo_seq_alignment import RiboSeqAlignment
 from .ribo_seq_run import RiboSeqRun
 
 
-# depracated
-class CompatibilityGroup:
-    def __init__(self, length: int = 0) -> None:
-        warnings.warn("CompatibilityGroup is deprecated", DeprecationWarning)
-        self.length = length
-        self.read_count = 0
-
-    def __repr__(self) -> str:
-        return f"CG:length:{self.length}, read_count:{self.read_count}"
-
-    # def add_length_to_cgs(
-    #    cgs_dict: dict[
-    #        (frozenset, frozenset, frozenset, frozenset):"CompatibilityGroup"
-    #    ],
-    #    rgr_length: list[(ReadGeneratingRegion, int)],
-    #    step_length: int,
-    # ) -> None:
-    #    nones, zeros, ones, twos = set(), set(), set(), set()
-    #    for rgr, length in rgr_length:
-    #        if rgr.type == "NOISE":
-    #            nones.add(rgr)
-    #        else:
-    #            l = length % 3
-    #            if l == 0:
-    #                zeros.add(rgr)
-    #            elif l == 1:
-    #                ones.add(rgr)
-    #            elif l == 2:
-    #                twos.add(rgr)
-
-
-#
-#    nones, zeros, ones, twos = (
-#        frozenset(nones),
-#        frozenset(zeros),
-#        frozenset(ones),
-#        frozenset(twos),
-#    )
-#    if (nones, zeros, ones, twos) in cgs_dict:
-#        cgs_dict[(nones, zeros, ones, twos)].length += step_length
-#    elif (nones, ones, twos, zeros) in cgs_dict:
-#        cgs_dict[(nones, ones, twos, zeros)].length += step_length
-#    elif (nones, twos, zeros, ones) in cgs_dict:
-#        cgs_dict[(nones, twos, zeros, ones)].length += step_length
-#    else:
-#        cgs_dict[(nones, zeros, ones, twos)] = CompatibilityGroup(
-#            length=step_length
-#        )
-
-# def add_length_to_cgs_new(
-#    cgs_dict: dict[
-#        (frozenset, frozenset, frozenset, frozenset):"CompatibilityGroup"
-#    ],
-#    rgr_length: list[(ReadGeneratingRegion, int)],
-#    step_length: int,
-# ) -> None:
-#    nones, zeros, ones, twos = set(), set(), set(), set()
-#    for rgr, length in rgr_length:
-#        if rgr.type == "NOISE":
-#            nones.add(rgr)
-#        else:
-#            l = length % 3
-#            if l == 0:
-#                zeros.add(rgr)
-#            elif l == 1:
-#                ones.add(rgr)
-#            elif l == 2:
-#                twos.add(rgr)
-
-
-#
-#    nones, zeros, ones, twos = (
-#        frozenset(nones),
-#        frozenset(zeros),
-#        frozenset(ones),
-#        frozenset(twos),
-#    )
-#    if (nones, zeros, ones, twos) in cgs_dict:
-#        cgs_dict[(nones, zeros, ones, twos)].length += step_length
-#    else:
-#        cgs_dict[(nones, zeros, ones, twos)] = CompatibilityGroup(
-#            length=step_length
-#        )
-
-
 class EquivalenceGroup:
     length: int
     read_count: int
@@ -125,9 +40,7 @@ class Locus:
     rgr_set = set[ReadGeneratingRegion]
     # rgr_intervals: HTSeq.GenomicArrayOfSets
     transcripts: set[Transcript]
-    # overlap_likelihood_ratio_threshold: float = 0.99
 
-    cgs: dict[RiboSeqRun, dict[frozenset[ReadGeneratingRegion], CompatibilityGroup]]
     egs: dict[EquivalenceGroup, EquivalenceGroup]
 
     def __init__(
@@ -221,211 +134,6 @@ class Locus:
 
         self.rgr_set_complete = self.rgr_set
 
-    # depracated
-    def make_compatibility_groups_old(
-        self, l: int = 20, upstream_cleavage: int = 12, downstream_cleavage: int = 17
-    ) -> None:
-        self.cgs = dict()
-        lengths = dict()
-
-        self.rgr_intervals = HTSeq.GenomicArrayOfSets(
-            "auto", stranded=True, storage="step"
-        )
-
-        for rgr in self.rgr_set:
-            for iv in rgr.genomic_region.intervals:
-                self.rgr_intervals[iv] += rgr
-
-        for step_iv, step_set in self.rgr_intervals.steps():
-            if not step_set:
-                continue
-            for i in range(step_iv.length):
-                gr_dict = dict()
-                for rgr in step_set:
-                    if not rgr in lengths:
-                        lengths[rgr] = 0
-                    if rgr.genomic_region.strand == "+":
-                        read_gr = rgr.genomic_region.map(
-                            (
-                                lengths[rgr] - upstream_cleavage,
-                                lengths[rgr] + downstream_cleavage,
-                            )
-                        )
-                    else:
-                        rgr_len = len(rgr.genomic_region)
-                        read_gr = rgr.genomic_region.map(
-                            (
-                                rgr_len - lengths[rgr] - upstream_cleavage,
-                                rgr_len - lengths[rgr] + downstream_cleavage,
-                            )
-                        )
-                    if not read_gr in gr_dict:
-                        gr_dict[read_gr] = set()
-                    gr_dict[read_gr].add(rgr)
-                for rgr_set in gr_dict.values():
-                    CompatibilityGroup.add_length_to_cgs(
-                        self.cgs, [(rgr, lengths[rgr]) for rgr in rgr_set], 1
-                    )
-                for rgr in step_set:
-                    lengths[rgr] += 1
-
-    # depracated
-    def make_compatibility_groups(
-        self, upstream_cleavage: int = 18, downstream_cleavage: int = 23
-    ) -> None:  # 14, 19
-        self.cgs = dict()
-        lengths = dict()
-
-        self.rgr_intervals = HTSeq.GenomicArrayOfSets(
-            "auto", stranded=True, storage="step"
-        )
-
-        for rgr in self.rgr_set:
-            for iv in rgr.genomic_region.intervals:
-                self.rgr_intervals[iv] += rgr
-
-        for step_iv, step_set in self.rgr_intervals.steps():
-            if not step_set:
-                continue
-            for i in range(step_iv.length):
-                gr_dict = dict()
-                for rgr in step_set:
-                    if not rgr in lengths:
-                        lengths[rgr] = 0
-                    if rgr.genomic_region.strand == "+":
-                        read_gr = rgr.genomic_region.map(
-                            (
-                                lengths[rgr] - upstream_cleavage,
-                                lengths[rgr] + downstream_cleavage,
-                            )
-                        )
-                        ###
-                        if (
-                            rgr.transcript.iv.start > read_gr.intervals[0].start
-                            or rgr.transcript.iv.end < read_gr.intervals[-1].end
-                        ):
-                            continue
-                        ###
-                    else:
-                        rgr_len = len(rgr.genomic_region)
-                        read_gr = rgr.genomic_region.map(
-                            (
-                                rgr_len - lengths[rgr] - upstream_cleavage,
-                                rgr_len - lengths[rgr] + downstream_cleavage,
-                            )
-                        )
-                        ###
-                        if (
-                            rgr.transcript.iv.start > read_gr.intervals[-1].start
-                            or rgr.transcript.iv.end < read_gr.intervals[0].end
-                        ):
-                            continue
-                        ###
-                    if not read_gr in gr_dict:
-                        gr_dict[read_gr] = set()
-                    gr_dict[read_gr].add(rgr)
-                for rgr_set in gr_dict.values():
-                    CompatibilityGroup.add_length_to_cgs_new(
-                        self.cgs, [(rgr, lengths[rgr]) for rgr in rgr_set], 1
-                    )
-                for rgr in step_set:
-                    lengths[rgr] += 1
-
-    # depracated
-    def make_equivalence_groups_old(self, runs: list[RiboSeqRun]) -> None:
-        self.egs = dict()
-        for run in runs:
-            self.egs[run] = dict()
-            for cg in self.cgs:
-                for length in run.cleavage_model.non_zero_lengths:
-                    for frame in range(3):
-                        for oua in [True, False]:
-                            rgr_frame = set()
-
-                            fr = None
-                            if run.cleavage_model.pmf(length, oua, fr) > 0:
-                                for none in cg[0]:
-                                    rgr_frame.add((none, None))
-
-                            if self.iv.strand == "+":
-                                fr = (frame + 0) % 3
-                            else:
-                                fr = (frame - 0) % 3
-                            if run.cleavage_model.pmf(length, oua, fr) > 0:
-                                for zero in cg[1]:
-                                    rgr_frame.add((zero, fr))
-
-                            if self.iv.strand == "+":
-                                fr = (frame + 1) % 3
-                            else:
-                                fr = (frame - 1) % 3
-                            if run.cleavage_model.pmf(length, oua, fr) > 0:
-                                for one in cg[2]:
-                                    rgr_frame.add((one, fr))
-
-                            if self.iv.strand == "+":
-                                fr = (frame + 2) % 3
-                            else:
-                                fr = (frame - 2) % 3
-                            if run.cleavage_model.pmf(length, oua, fr) > 0:
-                                for two in cg[3]:
-                                    rgr_frame.add((two, fr))
-
-                            rgr_frame = frozenset(rgr_frame)
-
-                            if not rgr_frame:
-                                continue
-
-                            eg_length = self.cgs[cg].length / 3
-                            if not (rgr_frame, length, oua) in self.egs[run]:
-                                self.egs[run][
-                                    (rgr_frame, length, oua)
-                                ] = EquivalenceGroup()
-
-                            self.egs[run][(rgr_frame, length, oua)].length += eg_length
-
-    # depracated
-    def make_equivalence_groups(self, runs: list[RiboSeqRun]) -> None:
-        warnings.warn(
-            "make_equivalence_groups is deprecated, use make_equivalence_groups_precise instead",
-            DeprecationWarning,
-        )
-        self.egs = dict()
-        for run in runs:
-            self.egs[run] = dict()
-            for cg in self.cgs:
-                for length in run.cleavage_model.non_zero_lengths:
-                    # for frame in range(3):
-                    for oua in [True, False]:
-                        nones, zeros, ones, twos = cg
-                        rgr_frame = set()
-
-                        fr = None
-                        if run.cleavage_model.pmf(length, oua, fr) > 0:
-                            for none in nones:
-                                rgr_frame.add((none, None))
-
-                        for rgr_set, f in zip([zeros, ones, twos], [0, 1, 2]):
-
-                            if self.iv.strand == "+":
-                                fr = f
-                            else:
-                                fr = -f % 3
-                            if run.cleavage_model.pmf(length, oua, fr) > 0:
-                                for rgr in rgr_set:
-                                    rgr_frame.add((rgr, fr))
-
-                        rgr_frame = frozenset(rgr_frame)
-
-                        if not rgr_frame:
-                            continue
-
-                        eg_length = self.cgs[cg].length
-                        if not (rgr_frame, length, oua) in self.egs[run]:
-                            self.egs[run][(rgr_frame, length, oua)] = EquivalenceGroup()
-
-                        self.egs[run][(rgr_frame, length, oua)].length += eg_length
-
     def make_equivalence_groups_precise(self, runs: list[RiboSeqRun]) -> None:
         self.egs = dict()
 
@@ -467,145 +175,6 @@ class Locus:
 
                     for rsa in reads:
                         rgr_frame = self.get_rgr_frames(rsa, run)
-                        if not rgr_frame:
-                            continue
-                        if (
-                            not (rgr_frame, len(rsa), rsa.untemplated_addition)
-                            in self.egs[run]
-                        ):
-                            self.egs[run][
-                                (rgr_frame, len(rsa), rsa.untemplated_addition)
-                            ] = EquivalenceGroup()
-                        self.egs[run][
-                            (rgr_frame, len(rsa), rsa.untemplated_addition)
-                        ].length += 1
-
-    def make_equivalence_groups_profiling(self, runs: list[RiboSeqRun]) -> None:
-        self.egs = dict()
-
-        for run in runs:
-            self.egs[run] = dict()
-            lengths = dict()
-            # for step_iv, transcripts in self.transcript_intervals.steps():
-            steps = list(self.transcript_intervals.steps())
-            if self.iv.strand == "-":
-                steps = steps[::-1]
-            for step_iv, transcripts in steps:
-                if not transcripts:
-                    continue
-                for i in range(step_iv.length):
-                    reads = set()
-                    for transcript in transcripts:
-                        if not transcript in lengths:
-                            lengths[transcript] = 0
-                        for read_length in run.cleavage_model.non_zero_lengths:
-                            for oua in [True, False]:
-                                iv_on_transcript = (
-                                    lengths[transcript],
-                                    lengths[transcript] + read_length,
-                                )
-                                if iv_on_transcript[0] < 0 or iv_on_transcript[1] > len(
-                                    transcript
-                                ):
-                                    continue
-                                read_gr = transcript.exons.map(iv_on_transcript)
-                                rsa = RiboSeqAlignment(
-                                    {
-                                        "mapping_positions": 1,
-                                        "genomic_region": read_gr,
-                                        "untemplated_addition": oua,
-                                    }
-                                )
-                                reads.add(rsa)
-                        lengths[transcript] += 1
-
-                    for rsa in reads:
-                        ###############################
-                        # rgr_frame = self.get_rgr_frames(rsa, run)
-                        overlap_likelihood_ratio_threshold = 0.5
-                        overlap_transcripts = set(self.transcripts)
-
-                        rgr_frame = set()
-
-                        for query_iv in rsa.genomic_region.intervals:
-                            for subject_iv, tr_set in self.transcript_intervals[
-                                query_iv
-                            ].steps():
-                                overlap_transcripts &= tr_set
-
-                        for tr in overlap_transcripts:
-                            try:
-                                rsa_iv_on_tr = tr.exons.induce(rsa.genomic_region)
-                            except ValueError:
-                                continue
-                            rgr_frame.add((tr.noise, None))
-                            for orf in tr.orf_set:
-                                # full overlap with orf
-                                if (
-                                    orf.iv_on_transcript[0] <= rsa_iv_on_tr[0]
-                                    and orf.iv_on_transcript[1] >= rsa_iv_on_tr[1]
-                                ):
-                                    frame = (
-                                        rsa_iv_on_tr[0] - orf.iv_on_transcript[0]
-                                    ) % 3
-                                    if (
-                                        run.cleavage_model.pmf(
-                                            len(rsa.genomic_region),
-                                            rsa.untemplated_addition,
-                                            frame,
-                                        )
-                                        > 0
-                                    ):
-                                        rgr_frame.add((orf, frame))
-                                # part overlap with orf
-                                elif (
-                                    rsa_iv_on_tr[0]
-                                    <= orf.iv_on_transcript[0]
-                                    <= rsa_iv_on_tr[1]
-                                ) or (
-                                    rsa_iv_on_tr[0]
-                                    <= orf.iv_on_transcript[1]
-                                    <= rsa_iv_on_tr[1]
-                                ):
-                                    frame = (
-                                        rsa_iv_on_tr[0] - orf.iv_on_transcript[0]
-                                    ) % 3
-                                    # compute at which position in the read the orf starts
-                                    region_start = (
-                                        orf.iv_on_transcript[0] - rsa_iv_on_tr[0]
-                                    )
-                                    # compute at which position in the read the orf ends
-                                    region_end = (
-                                        orf.iv_on_transcript[1] - rsa_iv_on_tr[0]
-                                    )
-                                    if (
-                                        ol := run.cleavage_model.pmf(
-                                            len(rsa),
-                                            rsa.untemplated_addition,
-                                            frame,
-                                            region_start=region_start,
-                                            region_end=region_end,
-                                        )
-                                        > 0
-                                    ):
-                                        cl = run.cleavage_model.pmf(
-                                            len(rsa), rsa.untemplated_addition, frame
-                                        )
-                                        if ol / cl > overlap_likelihood_ratio_threshold:
-                                            rgr_frame.add(
-                                                (
-                                                    orf,
-                                                    (
-                                                        rsa_iv_on_tr[0]
-                                                        - orf.iv_on_transcript[0]
-                                                    )
-                                                    % 3,
-                                                )
-                                            )
-                        if rgr_frame:
-                            rgr_frame = frozenset(rgr_frame)
-
-                        ###############################
                         if not rgr_frame:
                             continue
                         if (
@@ -766,27 +335,6 @@ class Locus:
 
         rgr_frame = frozenset(rgr_frame)
         return rgr_frame
-
-    # def add_ribo_seq_alignments(self,
-    #                            rsa: RiboSeqAlignment,
-    #                            run: RiboSeqRun,
-    #                            read_count: int,
-    #                            overlap_likelihood_ratio_threshold: float=.99
-    #                            ) -> None:
-    #    rgr_frame = self.get_rgr_frames(rsa, run, overlap_likelihood_ratio_threshold)
-    #    if not rgr_frame:
-    #        return
-    #
-    #    try:
-    #        self.egs[run][(rgr_frame, len(rsa), rsa.untemplated_addition)].read_count += read_count
-    #        run.read_count += read_count
-    #    except KeyError:
-    #        self.uncounted_reads += read_count
-    #
-    #    try:
-    #        self.read_counts[run] += read_count
-    #    except KeyError:
-    #        self.read_counts[run] = int(read_count)
 
     def to_gtf(self, rgrs=None) -> str:
         seq_id = self.iv.chrom
@@ -1124,7 +672,7 @@ class Locus:
             self.cb.args = (run_read_counts, cm_lut, egs, num_rgrs, rgr_lengths, λ)
 
             optimization_result = minimize(
-                objective_function_grad_normal,  # _new # _constraint # _normal
+                objective_function,  # _new # _constraint # _normal
                 initial_guess,
                 args=(
                     run_read_counts,
@@ -1149,7 +697,7 @@ class Locus:
             # dof = |non-zero activities|
             # BIC = -2 * log(likelihood) + log(observations) * dof
 
-            log_likelihood = -objective_function_grad_normal(
+            log_likelihood = -objective_function(
                 optimization_result.x, run_read_counts, cm_lut, egs, num_rgrs, 0
             )[0]
             # dof = sum(optimization_result.x > 2 * 1e-14)
@@ -1181,67 +729,6 @@ class Locus:
 
         self.best_λ = min(self.regularization_dict, key=self.regularization_dict.get)
         self.best_result = self.λ_2_result[self.best_λ]
-
-    def deconvolve_unregularized(
-        self,
-        run_read_counts,
-        cm_lut,
-        egs,
-        num_rgrs,
-        rgr_lengths,
-        initial_guess,
-        tolerance,
-    ):
-
-        λ = 0
-
-        self.initial_guesses = []
-        self.cb_dict = {}
-        self.optimization_results = {}
-        self.regularization_dict = {}
-
-        bounds = [(1e-10, None)] * len(initial_guess)
-
-        self.initial_guesses.append(initial_guess)
-        self.cb = Callback(num_rgrs, len(run_read_counts), initial_guess=initial_guess)
-        self.cb_dict[λ] = self.cb
-        self.cb.args = (run_read_counts, cm_lut, egs, num_rgrs, rgr_lengths, λ)
-
-        optimization_result = minimize(
-            objective_function_grad_constraint,
-            initial_guess,
-            args=(run_read_counts, cm_lut, egs, num_rgrs, rgr_lengths, λ),
-            method="L-BFGS-B",
-            jac=False,
-            callback=self.cb,
-            bounds=bounds,
-            options={"maxiter": 10_000, "ftol": tolerance},
-        )
-
-        self.optimization_results[λ] = optimization_result
-        initial_guess = optimization_result.x
-
-        log_likelihood = -objective_function_grad_normal(
-            optimization_result.x, run_read_counts, cm_lut, egs, num_rgrs, 0
-        )[0]
-        dof = sum(optimization_result.x > 2 * 1e-10)
-        number_observations = sum(run_read_counts)
-        bic = -2 * log_likelihood + np.log(number_observations) * dof
-
-        self.regularization_dict[λ] = (
-            bic,
-            -2 * log_likelihood,
-            np.log(number_observations) * dof,
-        )
-
-        del self.cb.args
-
-        tmp = optimization_result.x.reshape(num_rgrs, len(run_read_counts))
-        tmp[tmp <= 1e-10] = 0
-        with np.errstate(invalid="ignore"):
-            tmp = tmp / tmp.sum(axis=0)
-            tmp[np.isnan(tmp)] = 0
-        self.normalized_result = tmp
 
 
 @jit(nopython=True, cache=True)
@@ -1309,7 +796,7 @@ class Callback:
 
     def __call__(self, x):
         tmp = x.reshape(self.num_rgrs, self.num_runs)
-        self.ll.append(objective_function_grad_normal_new(x, *self.args)[0])
+        self.ll.append(objective_function(x, *self.args)[0])
 
         tmp[tmp <= 1e-10] = 0
         with np.errstate(invalid="ignore"):
@@ -1347,7 +834,7 @@ def cb_stop(x):
 # compute the negative log likelihood + a penalty term
 # and the gradient regarding each activity parameter
 @jit(nopython=True, parallel=True, cache=True)
-def objective_function_grad_normal(
+def objective_function(
     x,
     run_read_counts,
     cm_lut,
@@ -1400,161 +887,9 @@ def objective_function_grad_normal(
     return loss + λ * penalty, grads
 
 
+# objective function where the penalty for each RGR scales with the length
 @jit(nopython=True, parallel=True, cache=True)
-def objective_function_grad_constraint(
-    x,
-    run_read_counts,
-    cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
-    num_rgrs,
-    rgr_lengths,
-    λ: float,
-) -> float:
-
-    num_runs = len(run_read_counts)
-
-    loss = 0
-    grads = np.zeros_like(x)
-
-    ###
-    # scale the activities such that for each run the sum of the activities times the corresponding rgr length
-    # is equal to 1
-
-    s = np.zeros(num_runs)
-    for run_index in range(num_runs):
-        for rgr_index in range(num_rgrs):
-            s[run_index] += x[rgr_index * num_runs + run_index] * rgr_lengths[rgr_index]
-
-    for run_index in range(num_runs):
-        for rgr_index in range(num_rgrs):
-            x[rgr_index * num_runs + run_index] = (
-                x[rgr_index * num_runs + run_index] / s[run_index]
-            )
-
-    ###
-
-    for run_index in prange(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-            δ_derived = np.zeros_like(x)
-            for rgr_index, frame in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                )
-                δ_derived[rgr_index * num_runs + run_index] += cm_lut[
-                    run_index, eg[2], frame, eg[3]
-                ]
-
-            δ = run_read_counts[run_index] * eg[0] * activity
-            δ_derived *= run_read_counts[run_index] * eg[0]
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-            grads += -y * δ_derived / δ + δ_derived
-
-    penalty = 0
-    for rgr_index in prange(num_rgrs):
-        s = 0
-        for run_index in range(num_runs):
-            s += x[rgr_index * num_runs + run_index] ** 2
-        s_sqrt = s**0.5
-        penalty += s_sqrt  # * rgr_lengths[rgr_index]
-        for run_index in range(num_runs):
-            grads[rgr_index * num_runs + run_index] += (
-                λ * x[rgr_index * num_runs + run_index] / s_sqrt
-            )
-
-    return loss + λ * penalty  # , grads
-
-
-@jit(nopython=True, parallel=True, cache=True)
-def objective_function_likelihood(
-    x,
-    run_read_counts,
-    cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
-    num_rgrs,
-    rgr_lengths,
-    λ: float,
-) -> float:
-
-    num_runs = len(run_read_counts)
-
-    loss = 0
-
-    s = np.zeros(num_runs)
-    for run_index in range(num_runs):
-        for rgr_index in range(num_rgrs):
-            s[run_index] += x[rgr_index * num_runs + run_index] * rgr_lengths[rgr_index]
-
-    for run_index in range(num_runs):
-        for rgr_index in range(num_rgrs):
-            x[rgr_index * num_runs + run_index] = (
-                x[rgr_index * num_runs + run_index] / s[run_index]
-            )
-
-    for run_index in prange(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-            for rgr_index, frame in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                )
-
-            δ = run_read_counts[run_index] * eg[0] * activity
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-    return loss
-
-
-@jit(nopython=True, parallel=True, cache=True)
-def objective_function_penalty(
-    x,
-    run_read_counts,
-    cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
-    num_rgrs,
-    rgr_lengths,
-    λ: float,
-) -> float:
-
-    num_runs = len(run_read_counts)
-
-    s = np.zeros(num_runs)
-    for run_index in range(num_runs):
-        for rgr_index in range(num_rgrs):
-            s[run_index] += x[rgr_index * num_runs + run_index] * rgr_lengths[rgr_index]
-
-    for run_index in range(num_runs):
-        for rgr_index in range(num_rgrs):
-            x[rgr_index * num_runs + run_index] = (
-                x[rgr_index * num_runs + run_index] / s[run_index]
-            )
-
-    penalty = 0
-    for rgr_index in prange(num_rgrs):
-        s = 0
-        for run_index in range(num_runs):
-            s += x[rgr_index * num_runs + run_index] ** 2
-        s_sqrt = s**0.5
-        penalty += s_sqrt * rgr_lengths[rgr_index]
-
-    return λ * penalty
-
-
-@jit(nopython=True, parallel=True, cache=True)
-def objective_function_grad_normal_new(
+def objective_function_length_penalty(
     x,
     run_read_counts,
     cm_lut,
@@ -1606,64 +941,6 @@ def objective_function_grad_normal_new(
                 * rgr_lengths[rgr_index]
                 * x[rgr_index * num_runs + run_index]
                 / s_sqrt
-            )
-
-    return loss + λ * penalty, grads
-
-
-@jit(nopython=True, parallel=True, cache=True)
-def objective_function_grad(
-    x,
-    run_read_counts,
-    cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
-    num_rgrs,
-    λ: float,
-) -> float:
-    x = np.exp(x)
-
-    grads = np.zeros_like(x)
-
-    num_runs = len(run_read_counts)
-
-    loss = 0
-
-    for run_index in prange(num_runs):
-        for eg in egs[run_index]:
-            δ_derived = np.zeros_like(x)
-            activity = 0
-            for rgr_index, frame in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                )
-                δ_derived[rgr_index * num_runs + run_index] += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                )
-
-            δ = run_read_counts[run_index] * eg[0] * activity
-            δ_derived *= run_read_counts[run_index] * eg[0]
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-
-            grads += δ_derived - y * δ_derived / δ
-
-    penalty = 0
-    for rgr_index in prange(num_rgrs):
-        s = 0
-        for run_index in range(num_runs):
-            s += x[rgr_index * num_runs + run_index] ** 2
-        s_sqrt = s**0.5
-        penalty += s_sqrt
-        for run_index in range(num_runs):
-            grads[rgr_index * num_runs + run_index] += (
-                λ * x[rgr_index * num_runs + run_index] ** 2 / s_sqrt
             )
 
     return loss + λ * penalty, grads

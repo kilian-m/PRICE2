@@ -166,16 +166,3 @@ class ReadGeneratingRegion:
                 s += f"{seq_id}\t{source}\tCDS\t{interval.start}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
 
         return s
-
-    # def to_serializable(self) -> tuple:
-    #    t = (self.type, self.transcript_id, self.genomic_region.strand, self.genomic_region.chrom,
-    #         [(x.start, x.end) for x in self.genomic_region.intervals])
-    #    return t
-    #
-
-
-#
-# def from_serializable(t: tuple) -> 'ReadGeneratingRegion':
-#    type, transcript_id, strand, chrom, intervals = t
-#    genomic_region = GenomicRegion([HTSeq.GenomicInterval(chrom, x[0], x[1], strand) for x in intervals], chrom, strand)
-#    return ReadGeneratingRegion(type, transcript_id, genomic_region=genomic_region)
