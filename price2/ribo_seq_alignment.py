@@ -29,6 +29,7 @@ class RiboSeqAlignment():
             for _, row in df.iterrows():
                 intervals.append(HTSeq.GenomicInterval(row['chrom'], row['start'], row['end'], row['strand']))
             self.genomic_region = GenomicRegion(intervals)
+            self.read_count = df.iloc[0]['count']
 
         elif isinstance(data, HTSeq._HTSeq.SAM_Alignment):
             sa = data
@@ -54,6 +55,11 @@ class RiboSeqAlignment():
                 intervals = intervals[::-1]
 
             self.genomic_region = GenomicRegion(intervals)
+        
+        elif isinstance(data, dict):
+            self.genomic_region = data['genomic_region']
+            self.untemplated_addition = data['untemplated_addition']
+            self.mapping_positions = data['mapping_positions']
 
 
     def __repr__(self) -> str:
@@ -62,6 +68,18 @@ class RiboSeqAlignment():
 
     def __len__(self) -> int:
         return len(self.genomic_region)
+    
+
+    def __hash__(self) -> int:
+        return hash(self.genomic_region) + self.untemplated_addition
+
+    
+    def __eq__(self, other: 'RiboSeqAlignment') -> bool:
+        if self.genomic_region == other.genomic_region\
+            and self.untemplated_addition == other.untemplated_addition\
+            and self.mapping_positions == other.mapping_positions:
+            return True
+        return False
     
 
     def unique(self) -> bool:
@@ -106,33 +124,6 @@ class RiboSeqAlignment():
         if not interval:
             return None
         return transcript.cds.length - interval[1]
-
-
-    # depracated
-    #def close_to_any_tis(self, reference_annotation: ReferenceAnnotation, distance: int=30) -> bool:
-    #    
-    #    gi = HTSeq.GenomicInterval(
-    #        self.alignment.iv.chrom,
-    #        self.alignment.iv.start - distance,
-    #        self.alignment.iv.start + distance,
-    #        self.alignment.iv.strand,
-    #    )
-    #    try:
-    #        if len(list(reference_annotation.ti_sites[gi].steps()))>1:
-    #            return True
-    #    except IndexError:
-    #        pass
-    #    return False
-    
-    
-    # depracated
-    #def overlaps_ti(self, reference_annotation: ReferenceAnnotation) -> bool:
-    #    try:
-    #        if len(l:=list(reference_annotation.ti_sites[self.alignment.iv].steps()))>1:
-    #            return l
-    #    except IndexError:
-    #        pass
-    #    return False
     
 
     def get_frames(self, reference_annotation) -> tuple:
@@ -160,20 +151,4 @@ class RiboSeqAlignment():
     def get_reading_frame_in_ORF(self, orf: ReadGeneratingRegion) -> int:
         start, end = orf.genomic_region.induce(self.genomic_region)
         return start%3
-
-
-    #def has_untemplated_addition(self) -> bool:
-    #    if self.alignment.iv.strand == '+':
-    #        return (self.alignment.cigar[0].type == 'S') and (self.alignment.cigar[0].size == 1)
-    #    elif self.alignment.iv.strand == '-':
-    #        return (self.alignment.cigar[-1].type == 'S') and (self.alignment.cigar[-1].size == 1)        
-
-
-    # depracated
-    #def is_spliced(self) -> bool:
-    #    if len(self.alignment.cigar) >= 3:
-    #        for cigar_op in self.alignment.cigar:
-    #            if cigar_op.type == 'N':
-    #                return True
-    #    return False
             
