@@ -36,6 +36,8 @@ class GenomicRegion:
 
         self.length = sum([x.end - x.start for x in self.intervals])
 
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
+
     def __eq__(self, other):
         if not isinstance(other, GenomicRegion):
             return False
@@ -47,7 +49,8 @@ class GenomicRegion:
 
     def __hash__(self):
         # hash changes when intervals are added!!!
-        return hash((self.strand, self.chrom, tuple(self.intervals)))
+        return self.hash
+        # return hash((self.strand, self.chrom, tuple(self.intervals)))
 
     def __str__(self):
         s = f"{self.chrom}:{self.strand}"
@@ -68,6 +71,7 @@ class GenomicRegion:
 
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
         self.intervals.append(interval)
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
     # other is a region that lies within the query region
     # return the coordinates relative to the query

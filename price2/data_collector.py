@@ -1,6 +1,6 @@
 import os
 import HTSeq
-import sqlite3
+import sqlite3 as sql
 from pickle import dumps, loads
 import zlib
 import pandas as pd
@@ -8,7 +8,7 @@ import numpy as np
 from multiprocessing import Pool
 
 from price2.reference_annotation import ReferenceAnnotation
-from price2.ribo_seq_run import RiboSeqRun
+from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
 from price2.locus import Locus
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
@@ -17,36 +17,70 @@ class DataCollector:
     loci_intervals: HTSeq.GenomicArray
     loci_set: set[Locus]
     chr_order: list[str]
-    read_db: sqlite3.Connection
+    read_db: sql.Connection
 
     def __init__(
         self,
-        bam_dir: str,
         reference_annotation: ReferenceAnnotation,
         genome: dict[str : HTSeq.Sequence],
-        runs: list[RiboSeqRun],
+        config: dict,
     ):
 
-        self.runs = runs
-
-        self.bam_dir = bam_dir
+        self.bam_dir = config["bam_dir"]
         self.get_chromosome_order()
 
-        self.make_loci(reference_annotation)
+        self.reference_annotation = reference_annotation
+        self.db_path = f"{config['w_dir']}/price.db"
+        self.make_loci(self.reference_annotation)
+        self.config = config
+        self.genome = genome
+
+    def collect_runs(self):
+
+        bam_ids = {
+            f.split(".")[0] for f in os.listdir(self.bam_dir) if f.endswith(".bam")
+        }
+
+        if os.path.exists(self.db_path):
+            db = sql.connect(self.db_path)
+            cur = db.cursor()
+            cur.execute("SELECT * FROM runs")
+            tmp = [(run_id, run) for run_id, run in cur.fetchall()]
+            run_ids = {run_id for run_id, _ in tmp}
+            self.runs = [loads(run) for _, run in tmp]
+            bam_ids = bam_ids - run_ids
+        else:
+            self.runs = []
+            db = sql.connect(self.db_path)
+            cur = db.cursor()
+
+            cur.execute(
+                """CREATE TABLE runs (
+                        run_id text PRIMARY KEY,
+                        run_blob blob
+                        )"""
+            )
+
+        new_runs = ribo_seq_runs_from_bams(
+            self.bam_dir,
+            bam_ids,
+            self.config["w_dir"],
+            self.reference_annotation,
+            self.config["processes"],
+        )
+        self.runs += new_runs
+
+        for run in new_runs:
+            cur.execute("INSERT INTO runs VALUES (?, ?)", (run.id, dumps(run)))
+
+        db.commit()
+        db.close()
 
     def collect_mappings(
         self,
-        reads_db_path: str,
-        transcript_read_counts_db_path: str,
-        processes: int = 32,
     ):
-        if os.path.exists(reads_db_path):
-            os.remove(reads_db_path)
-
-        read_db = sqlite3.connect(reads_db_path)
-
-        cur = read_db.cursor()
-
+        db = sql.connect(self.db_path)
+        cur = db.cursor()
         cur.execute(
             """CREATE TABLE IF NOT EXISTS reads (
                     locus_id text NOT NULL,
@@ -54,14 +88,6 @@ class DataCollector:
                     reads_blob blob NOT NULL
                     )"""
         )
-        read_db.commit()
-        read_db.close()
-
-        if os.path.exists(transcript_read_counts_db_path):
-            os.remove(transcript_read_counts_db_path)
-
-        self.transcript_read_counts_db = sqlite3.connect(transcript_read_counts_db_path)
-        cur = self.transcript_read_counts_db.cursor()
 
         cur.execute(
             """CREATE TABLE IF NOT EXISTS transcript_read_counts (
@@ -70,79 +96,23 @@ class DataCollector:
                          transcript_read_counts_blob blob NOT NULL
                          )"""
         )
-        self.transcript_read_counts_db.commit()
-        self.transcript_read_counts_db.close()
 
-        with Pool(processes) as p:
+        db.commit()
+        db.close()
+
+        with Pool(self.config["processes"]) as p:
             p.map(
                 collect_mappings_run,
                 [
                     (
-                        run,
+                        run.id,
                         self.bam_dir,
-                        reads_db_path,
-                        transcript_read_counts_db_path,
+                        self.db_path,
                         self.loci_set,
                     )
                     for run in self.runs
                 ],
             )
-
-    def make_rgrs(
-        self,
-        transcript_read_counts_db_path: str,
-        genome: dict[str : HTSeq.Sequence],
-        min_explained_reads: int = 50,
-    ):
-        conn = sqlite3.connect(transcript_read_counts_db_path)
-        cur = conn.cursor()
-
-        self.loci_with_transcripts = set()
-
-        for locus in self.loci_set:
-            cur.execute(
-                """SELECT * FROM transcript_read_counts
-                        WHERE locus_id = ?""",
-                (locus.id,),
-            )
-            d = {}
-            for entry in cur.fetchall():
-                for k, v in loads(zlib.decompress(entry[2])).items():
-                    try:
-                        d[k] += v
-                    except KeyError:
-                        d[k] = v
-
-            tr_ids = [t.id for t in locus.transcripts]
-
-            l = []
-            for k, v in d.items():
-                l1 = [True if tr.id in k else False for tr in locus.transcripts]
-                l1.append(v)
-                l.append(l1)
-
-            df = pd.DataFrame(l, columns=tr_ids + ["count"])
-
-            explaining_transcripts_reads_list = []
-
-            while df["count"].sum() > 0:
-                t = df.drop(columns="count").multiply(df["count"], axis=0).sum()
-                explaining_transcripts_reads_list.append((t.idxmax(), t.max()))
-                df.loc[df[t.idxmax()], "count"] = 0
-
-            transcripts_dict = {tr.id: tr for tr in locus.transcripts}
-
-            locus.keep_transcripts = [
-                transcripts_dict[tr_id]
-                for tr_id, count in explaining_transcripts_reads_list
-                if count > min_explained_reads
-            ]
-
-            locus.transcripts = locus.keep_transcripts
-
-            if locus.transcripts:
-                self.loci_with_transcripts.add(locus)
-                locus.make_rgrs(genome)
 
     def get_chromosome_order(self):
         self.chr_order = None
@@ -155,7 +125,7 @@ class DataCollector:
                     ]
                 return
 
-    def make_loci(self, reference_annotation: ReferenceAnnotation):
+    def make_loci(self, reference_annotation: ReferenceAnnotation, distance: int = 50):
         loci_intervals_binary = HTSeq.GenomicArray(
             "auto", stranded=True, storage="step", typecode="b"
         )
@@ -175,7 +145,7 @@ class DataCollector:
                     continue
                 if (
                     connected_loci[iv.strand][-1].chrom == iv.chrom
-                    and connected_loci[iv.strand][-1].end + 50 > iv.start
+                    and connected_loci[iv.strand][-1].end + distance > iv.start
                 ):
                     connected_loci[iv.strand].append(iv)
                 else:
@@ -213,58 +183,91 @@ class DataCollector:
             except IndexError:
                 pass
 
-    def collect_loci(self, loci_db_path: str):
-        if os.path.exists(loci_db_path):
-            os.remove(
-                loci_db_path,
-            )
-        loci_db = sqlite3.connect(loci_db_path)
-        cur = loci_db.cursor()
+    def collect_loci(self):
+
+        db = sql.connect(self.db_path)
+        cur = db.cursor()
+        r = cur.execute("""SELECT * FROM runs""")
+        num_runs = len([x for x in r.fetchall()])
+        min_explained_reads = self.config["min_explained_reads_per_run"] * num_runs
+
+        loc_dict = {loc.id: loc for loc in self.loci_set}
 
         cur.execute(
-            """CREATE TABLE loci (
+            """CREATE TABLE IF NOT EXISTS loci (
                     locus_id text PRIMARY KEY,
                     loc_blob blob
                     )"""
         )
+        processed_loci_ids = {
+            loc_id for loc_id, in cur.execute("SELECT locus_id FROM loci").fetchall()
+        }
+        loci_ids_to_process = {loc.id for loc in self.loci_set} - processed_loci_ids
 
-        for loc in self.loci_with_transcripts:
-            cur.execute("INSERT INTO loci VALUES (?, ?)", (loc.id, dumps(loc)))
+        for loc_id in loci_ids_to_process:
+            locus = loc_dict[loc_id]
+            cur.execute(
+                """SELECT * FROM transcript_read_counts
+                        WHERE locus_id = ?""",
+                (locus.id,),
+            )
 
-        loci_db.commit()
-        loci_db.close()
+            d = {}
+            for entry in cur.fetchall():
+                for k, v in loads(zlib.decompress(entry[2])).items():
+                    try:
+                        d[k] += v
+                    except KeyError:
+                        d[k] = v
 
-    def collect_runs(self, run_db_path: str):
-        if os.path.exists(run_db_path):
-            os.remove(run_db_path)
-        run_db = sqlite3.connect(run_db_path)
-        cur = run_db.cursor()
+            tr_ids = [t.id for t in locus.transcripts]
 
-        cur.execute(
-            """CREATE TABLE runs (
-                    run_id text PRIMARY KEY,
-                    run_blob blob
-                    )"""
-        )
+            l = []
+            for k, v in d.items():
+                l1 = [True if tr.id in k else False for tr in locus.transcripts]
+                l1.append(v)
+                l.append(l1)
 
-        for run in self.runs:
-            cur.execute("INSERT INTO runs VALUES (?, ?)", (run.id, dumps(run)))
+            df = pd.DataFrame(l, columns=tr_ids + ["count"])
 
-        run_db.commit()
-        run_db.close()
+            explaining_transcripts_reads_list = []
+
+            while df["count"].sum() > 0:
+                t = df.drop(columns="count").multiply(df["count"], axis=0).sum()
+                explaining_transcripts_reads_list.append((t.idxmax(), t.max()))
+                df.loc[df[t.idxmax()], "count"] = 0
+
+            transcripts_dict = {tr.id: tr for tr in locus.transcripts}
+
+            locus.keep_transcripts = [
+                transcripts_dict[tr_id]
+                for tr_id, count in explaining_transcripts_reads_list
+                if count > min_explained_reads
+            ]
+
+            locus.transcripts_number = len(locus.transcripts)
+            locus.transcripts = locus.keep_transcripts
+
+            if locus.transcripts:
+                locus.make_rgrs(self.genome)
+                cur.execute("INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus)))
+
+        db.commit()
+        db.close()
 
 
 def collect_mappings_run(data):
 
-    run, bam_dir, reads_db_path, transcript_read_counts_db_path, loci_set = data
+    run_id, bam_dir, db_path, loci_set = data
 
-    br = HTSeq.BAM_Reader(f"{bam_dir}/{run.id}.bam")
+    br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
 
-    read_db = sqlite3.connect(reads_db_path)
-    cur = read_db.cursor()
+    db = sql.connect(db_path)
+    cur = db.cursor()
 
-    transcript_read_counts_db = sqlite3.connect(transcript_read_counts_db_path)
-    cur_tr = transcript_read_counts_db.cursor()
+    cur.execute("SELECT locus_id FROM reads WHERE run_id = ?", (run_id,))
+    processed_loc_ids = {loc_id for loc_id, in cur.fetchall()}
+    loci_set = {loc for loc in loci_set if loc.id not in processed_loc_ids}
 
     for locus in loci_set:
         transcripts_counts = {}
@@ -343,20 +346,17 @@ def collect_mappings_run(data):
                          run_id,
                          reads_blob
                          ) VALUES (?, ?, ?)""",
-            (locus.id, run.id, zlib.compress(dumps(df))),
+            (locus.id, run_id, zlib.compress(dumps(df))),
         )
 
-        read_db.commit()
-
-        cur_tr.execute(
+        cur.execute(
             """INSERT INTO transcript_read_counts (
                          locus_id,
                          run_id,
                          transcript_read_counts_blob
                          ) VALUES (?, ?, ?)""",
-            (locus.id, run.id, zlib.compress(dumps(transcripts_counts))),
+            (locus.id, run_id, zlib.compress(dumps(transcripts_counts))),
         )
-        transcript_read_counts_db.commit()
+        db.commit()
 
-    read_db.close()
-    transcript_read_counts_db.close()
+    db.close()

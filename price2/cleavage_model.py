@@ -6,8 +6,8 @@ import pickle
 
 import os
 
-from .reference_annotation import ReferenceAnnotation
-from .ribo_seq_alignment import RiboSeqAlignment
+from price2.reference_annotation import ReferenceAnnotation
+from price2.ribo_seq_alignment import RiboSeqAlignment
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -123,7 +123,7 @@ class CleavageModel:
         lut = self.cds_lut.copy()
         s = 0
         max_prob_positions = []
-        while s < 0.3:
+        while s < prob_sum:
             index = np.unravel_index(lut.argmax(), lut.shape)
             s += lut[index]
             max_prob_positions.append(index)
@@ -346,7 +346,7 @@ class CleavageEstimator:
             temp_table[:, 1, :, :],
         )
 
-    def run(self) -> CleavageModel:
+    def run(self, regularize: bool = True) -> CleavageModel:
 
         self.best_ll, self.best_u, self.best_pl, self.best_pr = repeat(
             self.repeats,
@@ -360,7 +360,8 @@ class CleavageEstimator:
         )
         shift = self.compute_shift()
         self.correct_max_pos(shift)
-        self.regularize()
+        if regularize:
+            self.regularize()
         return CleavageModel(self.best_pl, self.best_pr, self.best_u)
 
     def regularize(self, keep_prob: float = 0.9):

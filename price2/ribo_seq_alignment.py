@@ -1,9 +1,10 @@
 import HTSeq
 import pandas as pd
 
-from .genomic_region import GenomicRegion
-from .genomic_features import Transcript, ReadGeneratingRegion
-from .reference_annotation import ReferenceAnnotation
+
+from price2.genomic_region import GenomicRegion
+from price2.genomic_features import Transcript, ReadGeneratingRegion
+from price2.reference_annotation import ReferenceAnnotation
 
 
 class RiboSeqAlignment:

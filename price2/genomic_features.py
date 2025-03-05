@@ -1,7 +1,7 @@
 import HTSeq
 from HTSeq import GenomicInterval
 
-from .genomic_region import GenomicRegion
+from price2.genomic_region import GenomicRegion
 
 
 class Transcript:
@@ -143,7 +143,28 @@ class ReadGeneratingRegion:
             - max(0, downstream_cleavage - self.dist_to_transcript_end)
         )
 
-    def to_gtf(self, gene_id: str) -> str:
+    # def to_gtf(self) -> str:
+    #     seq_id = self.genomic_region.chrom
+    #     source = "PRICE2"
+    #     if self.type == "ORF":
+    #         typ = "CDS"
+    #     else:
+    #         typ = "exon"
+    #
+    #     score = "."
+    #     strand = self.genomic_region.strand
+    #     phase = "."
+    #     # orf_id = f"{gene_id}_{number:03d}"
+    #     # orf_id = self.id
+    #     attributes = f'gene_id "{self.transcript.gene_id}"; transcript_id "{self.transcript.id}"; orf_id "{self.id}";'
+    #
+    #     s = ""
+    #     for interval in self.genomic_region.intervals:
+    #         s += f"{seq_id}\t{source}\t{typ}\t{interval.start}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
+    #
+    #     return s
+
+    def to_gtf(self, loc_id: str) -> str:
         seq_id = self.genomic_region.chrom
         source = "PRICE2"
         if self.type == "ORF":
@@ -156,7 +177,7 @@ class ReadGeneratingRegion:
         score = "."
         strand = self.genomic_region.strand
         phase = "."
-        attributes = f'gene_id "{gene_id}"; transcript_id "{self.id}";'
+        attributes = f'gene_id "{self.transcript.gene_id}"; transcript_id "{self.id}"; loc_id "{loc_id}";'
 
         # s = f'{seq_id}\t{source}\t{typ}\t{self.genomic_region.intervals[0].start}\t{self.genomic_region.intervals[-1].end}\t{score}\t{strand}\t{phase}\t{attributes}\n'
         s = ""

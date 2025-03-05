@@ -4,8 +4,8 @@ import os
 
 from multiprocessing import Pool
 
-from .cleavage_model import CleavageModel, CleavageEstimator
-from .reference_annotation import ReferenceAnnotation
+from price2.cleavage_model import CleavageModel, CleavageEstimator
+from price2.reference_annotation import ReferenceAnnotation
 
 # assumes sorted and indexed bam file
 
@@ -16,11 +16,17 @@ class RiboSeqRun:
     cleavage_model: CleavageModel
     read_count: int
 
-    def __init__(self, id: str, directory: str, cleavage_model: CleavageModel) -> None:
+    def __init__(
+        self,
+        id: str,
+        directory: str,
+        cleavage_model: CleavageModel,
+        read_count: int = 0,
+    ) -> None:
         self.id = id
         # bam_file_path = f'{directory}/{id}.bam'
         self.cleavage_model = cleavage_model
-        self.read_count = 0
+        self.read_count = read_count
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -33,13 +39,14 @@ class RiboSeqRun:
 
 def ribo_seq_runs_from_bams(
     bam_dir: str,
+    bam_ids: set[str],
     wdir: str,
     ref_annotation: ReferenceAnnotation,
     processes: int = 32,
 ) -> list[RiboSeqRun]:
 
     os.makedirs(f"{wdir}/sample_bam", exist_ok=True)
-    bam_files = [f for f in os.listdir(bam_dir) if f.endswith(".bam")]
+    bam_files = [f"{bam_id}.bam" for bam_id in bam_ids]
 
     with Pool(processes) as pool:
         ribo_seq_runs = pool.starmap(
@@ -82,4 +89,4 @@ def ribo_seq_run_from_bam(
 
     os.remove(sample_bam_file)
 
-    return RiboSeqRun(id, bam_dir, cleavage_model)
+    return RiboSeqRun(id, bam_dir, cleavage_model, read_count=read_count)
