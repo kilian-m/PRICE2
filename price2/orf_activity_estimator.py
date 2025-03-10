@@ -181,6 +181,9 @@ def process_loc(arguments):
 
     lower_λ, upper_λ, number_λs = config["λs"]
 
+    if not "base_o_dir" in config:
+        config["base_o_dir"] = f"{config['o_dir']}"
+
     ###############################
     ### get data from databases ###
     ###############################
@@ -198,7 +201,7 @@ def process_loc(arguments):
     open_databases_t = t2 - t1  # performance measurement
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['o_dir']}/ORFs_all.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/ORFs_all.gtf")
 
     ##########################
     ### load reads to list ###
@@ -234,7 +237,7 @@ def process_loc(arguments):
     process_reads_1_t = t2 - t1  # performance measurement
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['o_dir']}/ORFs_coverage_filtered.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/ORFs_coverage_filtered.gtf")
 
     ################################################
     ### filter ORF candidates ending in one stop ###
@@ -254,7 +257,7 @@ def process_loc(arguments):
     filter_2_t = t2 - t1  # performance measurement
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['o_dir']}/ORFs_deconvolution_filtered.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/ORFs_deconvolution_filtered.gtf")
 
     ###################################
     ### generate equivalence groups ###
@@ -328,7 +331,7 @@ def process_loc(arguments):
     objective_args = loc.to_objective_args(runs)
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['o_dir']}/ORFs_deconvoluted.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/ORFs_deconvoluted.gtf")
 
     t1 = time.time()  # performance measurement
     try:
@@ -394,9 +397,9 @@ def process_loc(arguments):
 
     if config["o_dir"]:
         if not loc.result_df.empty:
-            lock = FileLock(f"{config['o_dir']}/results.tsv.lock")
+            lock = FileLock(f"{config['base_o_dir']}/results.tsv.lock")
             with lock:
-                with open(f"{config['o_dir']}/results.tsv", "a") as f:
+                with open(f"{config['base_o_dir']}/results.tsv", "a") as f:
                     f.write(
                         loc.result_df.to_csv(
                             header=False,
@@ -405,9 +408,9 @@ def process_loc(arguments):
                             sep="\t",
                         )
                     )
-            lock = FileLock(f"{config['o_dir']}/rpkm.tsv.lock")
+            lock = FileLock(f"{config['base_o_dir']}/rpkm.tsv.lock")
             with lock:
-                with open(f"{config['o_dir']}/rpkm.tsv", "a") as f:
+                with open(f"{config['base_o_dir']}/rpkm.tsv", "a") as f:
                     f.write(
                         loc.result_df.to_csv(
                             header=False,
@@ -416,10 +419,10 @@ def process_loc(arguments):
                             sep="\t",
                         )
                     )
-        loc.to_gtf(f"{config['o_dir']}/ORFs.gtf")
-        lock = FileLock(f"{config['o_dir']}/performance_measurements.tsv.lock")
+        loc.to_gtf(f"{config['base_o_dir']}/ORFs.gtf")
+        lock = FileLock(f"{config['base_o_dir']}/performance_measurements.tsv.lock")
         with lock:
-            with open(f"{config['o_dir']}/performance_measurements.tsv", "a") as f:
+            with open(f"{config['base_o_dir']}/performance_measurements.tsv", "a") as f:
                 f.write(
                     pd.DataFrame([performance_measurements]).to_csv(
                         header=False,

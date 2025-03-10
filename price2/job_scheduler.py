@@ -2,40 +2,47 @@ import sqlite3 as sql
 
 
 class JobScheduler:
-    def __init__(self, db_path):
+    def __init__(self, db_path, job_list=None):
         self.db_path = db_path
         self.conn = sql.connect(self.db_path)
-        self._create_table(self)
+
+        if job_list is not None:
+            self._create_table()
+            self.fill_jobs(job_list)
 
     def _create_table(self):
         with self.conn:
-            self.conn.execute(
+            cursor = self.conn.cursor()
+            cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
                   job TEXT NOT NULL,
-                  status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'complete', 'failed')),
+                  status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'complete', 'failed'))
+                )
                 """
             )
 
     def fill_jobs(self, jobs):
         with self.conn:
-            self.conn.executemany(
+            cursor = self.conn.cursor()
+            cursor.executemany(
                 "INSERT INTO jobs VALUES (?, 'pending')", ((str(job),) for job in jobs)
             )
+        self.conn.commit()
 
     def claim_job(self):
         cursor = self.conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE;")
             cursor.execute("SELECT job FROM jobs WHERE status='pending'")
-            job = cursor.fetchone()
+            job = cursor.fetchone()[0]
             if job is None:
                 self.conn.commit()
                 return None
-            cursor.execute("UPDATE jobs SET status='in_progress WHERE job=?;", (job,))
+            cursor.execute("UPDATE jobs SET status='in_progress' WHERE job=?;", (job,))
             self.conn.commit()
             return job
-        except sql.OperationalError:
+        except (sql.OperationalError, TypeError):
             self.conn.rollback()
             return None
 
