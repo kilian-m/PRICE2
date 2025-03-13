@@ -1,9 +1,12 @@
 import sqlite3 as sql
+import os
 
 
 class JobScheduler:
     def __init__(self, db_path, job_list=None):
         self.db_path = db_path
+        if os.path.exists(db_path):
+            os.remove(db_path)
         self.conn = sql.connect(self.db_path)
 
         if job_list is not None:
