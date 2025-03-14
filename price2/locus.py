@@ -113,7 +113,6 @@ class Locus:
             c = 0
             for orf_iv_on_transcript in find_orfs(seq):
                 c += 1
-                # orf_iv_on_transcript[1] -= 3
                 orf = ReadGeneratingRegion(
                     "ORF",
                     transcript,
@@ -137,7 +136,6 @@ class Locus:
                     if tmp2 > tmp1:
                         orf_dict[orf] = orf
         for orf in orf_dict.values():
-            # orf.transcript.orf_set.add(orf)
             orf.transcript.add_orf(orf)
         self.rgr_set |= set(orf_dict.values())
 
@@ -391,13 +389,33 @@ class Locus:
 
         return f"{seq_id}\t{source}\t{typ}\t{start}\t{end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
 
-    def to_gtf(self, path):
-        lock = FileLock(path + ".lock")
-        with lock:
-            with open(path, "a") as f:
-                f.write(self.gtf_line())
-                for rgr in self.rgr_set:
-                    f.write(rgr.to_gtf(self.id))
+    def to_gtf(
+        self, prefix, write_loci=False, write_transcripts=False, write_orfs=True
+    ):
+        if write_loci:
+            path = f"{prefix}_loci.gtf"
+            lock = FileLock(path + ".lock")
+            with lock:
+                with open(path, "a") as f:
+                    f.write(self.gtf_line())
+
+        if write_transcripts:
+            path = f"{prefix}_transcripts.gtf"
+            lock = FileLock(path + ".lock")
+            with lock:
+                with open(path, "a") as f:
+                    for rgr in self.rgr_set:
+                        if rgr.type == "NOISE":
+                            f.write(rgr.to_gtf(self.id))
+
+        if write_orfs:
+            path = f"{prefix}_orfs.gtf"
+            lock = FileLock(path + ".lock")
+            with lock:
+                with open(path, "a") as f:
+                    for rgr in self.rgr_set:
+                        if rgr.type == "ORF":
+                            f.write(rgr.to_gtf(self.id))
 
     #############################################
     ### functions for orf activity estimation ###
@@ -1019,6 +1037,8 @@ class Locus:
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
         keep_rgr_indices = noise_rgr_indices | test_rgr_indices
 
+        self.rgr_dict = {rgr.index: rgr for rgr in self.rgr_set}
+
         shape = initial_guess.reshape(num_rgrs, -1).shape
 
         t = np.empty((), dtype=object)
@@ -1095,12 +1115,13 @@ class Locus:
                 egs,
             )
 
-            if not wilks_test(
+            log_p = wilks_test_p(
                 log_likelihood_all,
                 log_likelihood_int,
                 df_diff=len(run_read_counts),  # number of datasets
-                α=α,
-            ):
+            )
+            self.rgr_dict[rgr_ind].log_p_value = log_p
+            if log_p > np.log(α):
                 # remove rgr
                 keep_rgr_indices.remove(rgr_ind)
                 initial_guess = optimization_result_int.x
@@ -1177,6 +1198,11 @@ class Locus:
                 rpkm_dict[rgr.id][run.id] = (
                     read_counts[rgr.id][run.id] / (run.read_count / 1e6)
                 ) / rgr.effective_length()
+        for rgr in self.rgr_dict.values():
+            d = rpkm_dict[rgr.id]
+            s = sum(d.values())
+            m = s / len(d)
+            rgr.mean_rpkm = m
         self.rpkm_df = pd.DataFrame(rpkm_dict).T
 
 
@@ -1184,6 +1210,12 @@ class Locus:
 def wilks_test(log_likelihood_full, log_likelihood_reduced, df_diff=1, α=1e-5) -> bool:
     # reject null hypothesis if the test statistic is greater than the critical value
     return 2 * (log_likelihood_full - log_likelihood_reduced) > chi2.ppf(1 - α, df_diff)
+
+
+def wilks_test_p(log_likelihood_full, log_likelihood_reduced, df_diff=1) -> float:
+    λ = -2 * (log_likelihood_reduced - log_likelihood_full)
+    log_p_value = chi2.logsf(λ, df_diff)
+    return log_p_value
 
 
 @jit(nopython=True, cache=True, parallel=False)
@@ -1229,7 +1261,9 @@ def find_orfs(
             if seq[j : j + 3] in stop_codons:
                 for start in starts:
                     if j - start >= min_length:
-                        orf_iv_on_transcript.append((start, j))  # j + 3
+                        orf_iv_on_transcript.append(
+                            (start, j + 3)
+                        )  # with +3 including stop codon
                 starts = []
     return orf_iv_on_transcript
 

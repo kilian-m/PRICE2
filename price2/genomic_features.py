@@ -110,7 +110,13 @@ class ReadGeneratingRegion:
         self.transcript = transcript
 
         if genomic_region is None:
-            self.genomic_region = transcript.exons.map(iv_on_transcript)
+            self.genomic_region = transcript.exons.map(
+                (iv_on_transcript[0], iv_on_transcript[1] - 3)
+            )
+            if self.type == "ORF":
+                self.full_genomic_region = transcript.exons.map(iv_on_transcript)
+            else:
+                self.full_genomic_region = self.genomic_region
             self.transcript_id = transcript.id
             self.iv_on_transcript = iv_on_transcript
             # for read simulation:
@@ -143,27 +149,6 @@ class ReadGeneratingRegion:
             - max(0, downstream_cleavage - self.dist_to_transcript_end)
         )
 
-    # def to_gtf(self) -> str:
-    #     seq_id = self.genomic_region.chrom
-    #     source = "PRICE2"
-    #     if self.type == "ORF":
-    #         typ = "CDS"
-    #     else:
-    #         typ = "exon"
-    #
-    #     score = "."
-    #     strand = self.genomic_region.strand
-    #     phase = "."
-    #     # orf_id = f"{gene_id}_{number:03d}"
-    #     # orf_id = self.id
-    #     attributes = f'gene_id "{self.transcript.gene_id}"; transcript_id "{self.transcript.id}"; orf_id "{self.id}";'
-    #
-    #     s = ""
-    #     for interval in self.genomic_region.intervals:
-    #         s += f"{seq_id}\t{source}\t{typ}\t{interval.start}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
-    #
-    #     return s
-
     def to_gtf(self, loc_id: str) -> str:
         seq_id = self.genomic_region.chrom
         source = "PRICE2"
@@ -178,12 +163,15 @@ class ReadGeneratingRegion:
         strand = self.genomic_region.strand
         phase = "."
         attributes = f'gene_id "{self.transcript.gene_id}"; transcript_id "{self.id}"; loc_id "{loc_id}";'
-
+        if hasattr(self, "log_p_value"):
+            attributes += f'log_p_value "{self.log_p_value}";'
+        if hasattr(self, "mean_rpkm"):
+            attributes += f'mean_rpkm "{self.mean_rpkm}";'
         # s = f'{seq_id}\t{source}\t{typ}\t{self.genomic_region.intervals[0].start}\t{self.genomic_region.intervals[-1].end}\t{score}\t{strand}\t{phase}\t{attributes}\n'
         s = ""
-        for interval in self.genomic_region.intervals:
-            s += f"{seq_id}\t{source}\texon\t{interval.start}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
+        for interval in self.full_genomic_region.intervals:
+            s += f"{seq_id}\t{source}\texon\t{interval.start+1}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
             if typ == "CDS":
-                s += f"{seq_id}\t{source}\tCDS\t{interval.start}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
+                s += f"{seq_id}\t{source}\tCDS\t{interval.start+1}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
 
         return s

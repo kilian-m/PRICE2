@@ -1,5 +1,6 @@
 import os
 import shutil
+import glob
 import sqlite3 as sql
 import numpy as np
 import pandas as pd
@@ -151,19 +152,9 @@ class ORFActivityEstimator:
             ],
         )
 
-        def remove_if_exists(file):
-            if os.path.exists(file):
-                os.remove(file)
-
-        remove_if_exists(f"{self.config['o_dir']}/rpkm.tsv.lock")
-        remove_if_exists(f"{self.config['o_dir']}/results.tsv.lock")
-        remove_if_exists(f"{self.config['o_dir']}/ORFs.gtf.lock")
-        remove_if_exists(f"{self.config['o_dir']}/performance_measurements.tsv.lock")
-
-        remove_if_exists(f"{self.config['o_dir']}/ORFs_all.gtf.lock")
-        remove_if_exists(f"{self.config['o_dir']}/ORFs_coverage_filtered.gtf.lock")
-        remove_if_exists(f"{self.config['o_dir']}/ORFs_deconvolution_filtered.gtf.lock")
-        remove_if_exists(f"{self.config['o_dir']}/ORFs_deconvoluted.gtf.lock")
+        lock_files = glob.glob(os.path.join(self.config["o_dir"], "*.lock"))
+        for lock_file in lock_files:
+            os.remove(lock_file)
 
 
 def process_loc(arguments):
@@ -201,7 +192,7 @@ def process_loc(arguments):
     open_databases_t = t2 - t1  # performance measurement
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/ORFs_all.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/all.gtf")
 
     ##########################
     ### load reads to list ###
@@ -237,7 +228,7 @@ def process_loc(arguments):
     process_reads_1_t = t2 - t1  # performance measurement
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/ORFs_coverage_filtered.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/coverage_filtered")
 
     ################################################
     ### filter ORF candidates ending in one stop ###
@@ -257,7 +248,7 @@ def process_loc(arguments):
     filter_2_t = t2 - t1  # performance measurement
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/ORFs_deconvolution_filtered.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/deconvolution_filtered")
 
     ###################################
     ### generate equivalence groups ###
@@ -331,7 +322,7 @@ def process_loc(arguments):
     objective_args = loc.to_objective_args(runs)
 
     if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/ORFs_deconvoluted.gtf")
+        loc.to_gtf(f"{config['base_o_dir']}/deconvoluted")
 
     t1 = time.time()  # performance measurement
     try:
@@ -419,7 +410,12 @@ def process_loc(arguments):
                             sep="\t",
                         )
                     )
-        loc.to_gtf(f"{config['base_o_dir']}/ORFs.gtf")
+        loc.to_gtf(
+            f"{config['base_o_dir']}/final",
+            write_orfs=True,
+            write_loci=True,
+            write_transcripts=True,
+        )
         lock = FileLock(f"{config['base_o_dir']}/performance_measurements.tsv.lock")
         with lock:
             with open(f"{config['base_o_dir']}/performance_measurements.tsv", "a") as f:
