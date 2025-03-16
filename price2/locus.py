@@ -13,16 +13,16 @@ from filelock import FileLock
 from scipy.optimize import minimize
 from scipy.sparse import block_diag, coo_array
 from scipy.stats import poisson
-from skglm import GroupLasso
 from numba import jit
 from numba.typed import List
 
-from skglm.datafits import QuadraticGroup
-from skglm.penalties import WeightedGroupL2
-from skglm.solvers import GroupBCD
-from skglm import GeneralizedLinearEstimator
+# from skglm import GroupLasso
+# from skglm.datafits import QuadraticGroup
+# from skglm.penalties import WeightedGroupL2
+# from skglm.solvers import GroupBCD
+# from skglm import GeneralizedLinearEstimator
+# from skglm.utils.data import grp_converter
 
-from skglm.utils.data import grp_converter
 
 from numba.core.errors import NumbaTypeSafetyWarning
 import warnings
@@ -905,78 +905,78 @@ class Locus:
         self.best_normal_result = normalized_result
         self.best_result = optimization_result
 
-    def deconvolve_regression(
-        self,
-        runs,
-        lower_λ=-2,
-        upper_λ=7,
-        number_λs=100,
-    ):
-        λs = np.logspace(lower_λ, upper_λ, number_λs)
-
-        x, y, g = self.get_regression_parameters(runs)
-
-        self.r_optimization_results = {}
-        self.r_normal_results = {}
-        self.r_ll = {}
-        self.r_n_features = {}
-        self.r_bics = {}
-        self.r_dof = {}
-
-        for λ in λs:
-
-            grp_indices, grp_ptr = grp_converter(g, len(y))
-            group_sizes = np.diff(grp_ptr)
-            weights = np.ones(len(group_sizes))
-
-            gle = GeneralizedLinearEstimator(
-                datafit=QuadraticGroup(
-                    grp_ptr=grp_ptr,
-                    grp_indices=grp_indices,
-                ),
-                penalty=WeightedGroupL2(
-                    alpha=λ,
-                    weights=weights,
-                    grp_indices=grp_indices,
-                    grp_ptr=grp_ptr,
-                    positive=True,
-                ),
-                solver=GroupBCD(warm_start=True),
-            )
-
-            try:
-                gle.coef_ = initial_guess
-            except NameError:
-                pass
-            gle.fit(x, y)
-            initial_guess = gle.coef_
-
-            result = gle.coef_.reshape((len(runs), -1)).T
-            self.r_optimization_results[λ] = result
-
-            with np.errstate(invalid="ignore"):
-                tmp = result / result.sum(axis=0)
-                tmp[np.isnan(tmp)] = 0
-
-            self.r_normal_results[λ] = tmp
-
-            ll = sum(poisson.logpmf(y, gle.predict(x)))
-            self.r_ll[λ] = ll
-
-            # compute BIC
-            n_samples = x.shape[0]
-            # n_features = np.sum(group_lasso.coef_ != 0)
-            n_features = sum(result.sum(axis=1) != 0)
-            dof = np.log(n_samples) * n_features
-            self.r_dof[λ] = dof
-            self.r_n_features[λ] = n_features
-
-            # bic = n_samples * ll + np.log(n_samples) * n_features
-            bic = -2 * ll + np.log(n_samples) * n_features
-            self.r_bics[λ] = bic
-
-        self.r_best_λ = min(self.r_bics, key=self.r_bics.get)
-        self.r_best_result = self.r_optimization_results[self.r_best_λ]
+    # def deconvolve_regression(
+    #    self,
+    #    runs,
+    #    lower_λ=-2,
+    #    upper_λ=7,
+    #    number_λs=100,
+    # ):
+    #    λs = np.logspace(lower_λ, upper_λ, number_λs)
+    #
+    #    x, y, g = self.get_regression_parameters(runs)
+    #
+    #    self.r_optimization_results = {}
+    #    self.r_normal_results = {}
+    #    self.r_ll = {}
+    #    self.r_n_features = {}
+    #    self.r_bics = {}
+    #    self.r_dof = {}
+    #
+    #    for λ in λs:
+    #
+    #        grp_indices, grp_ptr = grp_converter(g, len(y))
+    #        group_sizes = np.diff(grp_ptr)
+    #        weights = np.ones(len(group_sizes))
+    #
+    #        gle = GeneralizedLinearEstimator(
+    #            datafit=QuadraticGroup(
+    #                grp_ptr=grp_ptr,
+    #                grp_indices=grp_indices,
+    #            ),
+    #            penalty=WeightedGroupL2(
+    #                alpha=λ,
+    #                weights=weights,
+    #                grp_indices=grp_indices,
+    #                grp_ptr=grp_ptr,
+    #                positive=True,
+    #            ),
+    #            solver=GroupBCD(warm_start=True),
+    #        )
+    #
+    #        try:
+    #            gle.coef_ = initial_guess
+    #        except NameError:
+    #            pass
+    #        gle.fit(x, y)
+    #        initial_guess = gle.coef_
+    #
+    #        result = gle.coef_.reshape((len(runs), -1)).T
+    #        self.r_optimization_results[λ] = result
+    #
+    #        with np.errstate(invalid="ignore"):
+    #            tmp = result / result.sum(axis=0)
+    #            tmp[np.isnan(tmp)] = 0
+    #
+    #        self.r_normal_results[λ] = tmp
+    #
+    #        ll = sum(poisson.logpmf(y, gle.predict(x)))
+    #        self.r_ll[λ] = ll
+    #
+    #        # compute BIC
+    #        n_samples = x.shape[0]
+    #        # n_features = np.sum(group_lasso.coef_ != 0)
+    #        n_features = sum(result.sum(axis=1) != 0)
+    #        dof = np.log(n_samples) * n_features
+    #        self.r_dof[λ] = dof
+    #        self.r_n_features[λ] = n_features
+    #
+    #        # bic = n_samples * ll + np.log(n_samples) * n_features
+    #        bic = -2 * ll + np.log(n_samples) * n_features
+    #        self.r_bics[λ] = bic
+    #
+    #    self.r_best_λ = min(self.r_bics, key=self.r_bics.get)
+    #    self.r_best_result = self.r_optimization_results[self.r_best_λ]
 
     def collapse_egs(
         self,
