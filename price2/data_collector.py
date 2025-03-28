@@ -42,6 +42,7 @@ class DataCollector:
         }
 
         if os.path.exists(self.db_path):
+
             db = sql.connect(self.db_path)
             cur = db.cursor()
             cur.execute("SELECT * FROM runs")
@@ -100,19 +101,30 @@ class DataCollector:
         db.commit()
         db.close()
 
-        with Pool(self.config["processes"]) as p:
-            p.map(
-                collect_mappings_run,
-                [
+        try:
+            with Pool(self.config["processes"]) as p:
+                p.map(
+                    collect_mappings_run,
+                    [
+                        (
+                            run.id,
+                            self.bam_dir,
+                            self.db_path,
+                            self.loci_set,
+                        )
+                        for run in self.runs
+                    ],
+                )
+        except AssertionError:
+            for run in self.runs:
+                collect_mappings_run(
                     (
                         run.id,
                         self.bam_dir,
                         self.db_path,
                         self.loci_set,
                     )
-                    for run in self.runs
-                ],
-            )
+                )
 
     def get_chromosome_order(self):
         self.chr_order = None

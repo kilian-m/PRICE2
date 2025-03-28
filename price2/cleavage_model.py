@@ -577,44 +577,44 @@ def from_file(file_path: str) -> dict[str, CleavageModel]:
     return d
 
 
-def cleavage_models_from_bams(
-    bam_dir, wdir, ref_annotation, cm_pickle: str
-) -> dict[str, CleavageModel]:
-    os.makedirs(f"{wdir}/sample_bam", exist_ok=True)
-    if not os.path.exists(cm_pickle):
-        d = {}
-    else:
-        d = from_file(cm_pickle)
-    for bam_file in os.listdir(bam_dir):
-        if bam_file.endswith(".bam"):
-            id = bam_file.split(".")[0]
-            if id in d:
-                continue
-            bam_file_path = f"{bam_dir}/{bam_file}"
-            read_count = pysam.AlignmentFile(bam_file_path, "rb").count()
-            sample_bam_file = f"{wdir}/sample_bam/{bam_file}"
-            open(sample_bam_file, "w").close()
-            fraction_of_reads = 100_000 / read_count
-            pysam.view(
-                "-s",
-                str(fraction_of_reads),
-                "-o",
-                sample_bam_file,
-                bam_file_path,
-                save_stdout=sample_bam_file,
-            )
-
-            ce = CleavageEstimator()
-
-            ce.collect_data(ref_annotation, HTSeq.BAM_Reader(sample_bam_file))
-            ce.correct_table()
-            cleavage_model = ce.run()
-            d[id] = cleavage_model
-            os.remove(sample_bam_file)
-
-    to_file(cm_pickle, d)
-    os.rmdir(f"{wdir}/sample_bam")
-    return d
+# def cleavage_models_from_bams(
+#    bam_dir, wdir, ref_annotation, cm_pickle: str
+# ) -> dict[str, CleavageModel]:
+#    os.makedirs(f"{wdir}/sample_bam", exist_ok=True)
+#    if not os.path.exists(cm_pickle):
+#        d = {}
+#    else:
+#        d = from_file(cm_pickle)
+#    for bam_file in os.listdir(bam_dir):
+#        if bam_file.endswith(".bam"):
+#            id = bam_file.split(".")[0]
+#            if id in d:
+#                continue
+#            bam_file_path = f"{bam_dir}/{bam_file}"
+#            read_count = pysam.AlignmentFile(bam_file_path, "rb").count()
+#            sample_bam_file = f"{wdir}/sample_bam/{bam_file}"
+#            open(sample_bam_file, "w").close()
+#            fraction_of_reads = 100_000 / read_count
+#            pysam.view(
+#                "-s",
+#                str(fraction_of_reads),
+#                "-o",
+#                sample_bam_file,
+#                bam_file_path,
+#                save_stdout=sample_bam_file,
+#            )
+#
+#            ce = CleavageEstimator()
+#
+#            ce.collect_data(ref_annotation, HTSeq.BAM_Reader(sample_bam_file))
+#            ce.correct_table()
+#            cleavage_model = ce.run()
+#            d[id] = cleavage_model
+#            os.remove(sample_bam_file)
+#
+#    to_file(cm_pickle, d)
+#    os.rmdir(f"{wdir}/sample_bam")
+#    return d
 
 
 def select_and_scale(arr, k):

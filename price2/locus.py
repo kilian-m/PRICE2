@@ -657,7 +657,8 @@ class Locus:
     def to_objective_args(self, runs):
         rgrs = list(self.rgr_set)
 
-        run_read_counts = np.array([run.read_count for run in runs])
+        # run_read_counts = np.array([run.read_count for run in runs])
+        run_read_counts = np.array([self.counted_reads[run.id] for run in runs])
 
         cm_lut = np.zeros((len(runs), runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
         for i, run in enumerate(runs):
@@ -783,6 +784,15 @@ class Locus:
                 self.cb = None
             self.cb_dict[λ] = self.cb
 
+            # print(f"callback: {callback}")
+            #
+            # print(f"λ: {λ}")
+            # print(f"cm_lut: {cm_lut.shape}")
+            # print(f"egs: {len(egs)}")
+            # print(f"num_rgrs: {num_rgrs}")
+            # print(f"rgr_lengths: {rgr_lengths}")
+            # print(f"run_read_counts: {run_read_counts}")
+
             optimization_result = minimize(
                 objective_function,
                 initial_guess,
@@ -811,7 +821,8 @@ class Locus:
             ll = log_likelihood(optimization_result.x, run_read_counts, cm_lut, egs)
 
             with np.errstate(invalid="ignore"):
-                tmp = optimization_result.x.reshape(num_rgrs, len(self.counted_reads))
+                tmp = optimization_result.x.copy()
+                tmp = tmp.reshape(num_rgrs, len(self.counted_reads))
                 tmp = tmp / tmp.sum(axis=0)
                 dof = (tmp > 1e-2).sum()
 
@@ -828,7 +839,8 @@ class Locus:
                 del self.cb.args
 
             self.λ_2_result[λ] = optimization_result
-            tmp = optimization_result.x.reshape(num_rgrs, len(run_read_counts))
+            tmp = optimization_result.x.copy()
+            tmp = tmp.reshape(num_rgrs, len(run_read_counts))
             tmp[tmp <= pseudo_min] = 0
             with np.errstate(invalid="ignore"):
                 tmp = tmp / tmp.sum(axis=0)
@@ -1154,6 +1166,10 @@ class Locus:
             self.final_normalized_result, index=rgr_ids, columns=run_ids
         )
         self.result_df["mean"] = self.result_df.mean(axis=1)
+        d = self.result_df.mean(axis=1).to_dict()
+        for rgr in self.rgr_set:
+            if rgr.id in d:
+                rgr.mean_activity = d[rgr.id]
         self.result_df.sort_values(by="mean", inplace=True, ascending=False)
         self.result_df.drop("mean", axis=1, inplace=True)
         self.result_df = self.result_df[self.result_df.sum(axis=1) > 0]

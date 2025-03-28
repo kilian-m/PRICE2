@@ -167,6 +167,8 @@ class ReadGeneratingRegion:
             attributes += f'log_p_value "{self.log_p_value}";'
         if hasattr(self, "mean_rpkm"):
             attributes += f'mean_rpkm "{self.mean_rpkm}";'
+        if hasattr(self, "mean_activity"):
+            attributes += f'mean_activity "{self.mean_activity}";'
         # s = f'{seq_id}\t{source}\t{typ}\t{self.genomic_region.intervals[0].start}\t{self.genomic_region.intervals[-1].end}\t{score}\t{strand}\t{phase}\t{attributes}\n'
         s = ""
         for interval in self.full_genomic_region.intervals:
