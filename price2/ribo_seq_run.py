@@ -78,7 +78,7 @@ def ribo_seq_run_from_bam(
     read_count = pysam.AlignmentFile(bam_file_path, "rb").count()
     sample_bam_file = f"{wdir}/sample_bam/{bam_file}"
     open(sample_bam_file, "w").close()
-    fraction_of_reads = min(1_000_000 / read_count, 1)
+    fraction_of_reads = min(1_000_000 / read_count, 0.99)
     pysam.view(
         "-s",
         str(fraction_of_reads),

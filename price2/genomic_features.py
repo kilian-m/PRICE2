@@ -26,6 +26,7 @@ class Transcript:
         self.coding_length = 0
         self.exon_length = 0
         self.orf_set = set()
+        self.rgr_set = set()
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -69,11 +70,13 @@ class Transcript:
 
     def add_orf(self, orf: "ReadGeneratingRegion") -> None:
         self.orf_set.add(orf)
+        self.rgr_set.add(orf)
         # iv = GenomicInterval(".", orf.iv_on_transcript[0], orf.iv_on_transcript[1], ".")
         # self.orf_intervals[iv.start % 3][iv] += orf
 
     def update_with_filtered_orfs(self, rgr_set: set["ReadGeneratingRegion"]) -> None:
         self.orf_set = self.orf_set & rgr_set
+        self.rgr_set = self.rgr_set & rgr_set
         self.orf_intervals = (
             HTSeq.GenomicArrayOfSets("auto", stranded=False),
             HTSeq.GenomicArrayOfSets("auto", stranded=False),
@@ -111,7 +114,10 @@ class ReadGeneratingRegion:
 
         if genomic_region is None:
             self.genomic_region = transcript.exons.map(
-                (iv_on_transcript[0], iv_on_transcript[1] - 3)
+                (
+                    iv_on_transcript[0],
+                    iv_on_transcript[1],
+                )
             )
             if self.type == "ORF":
                 self.full_genomic_region = transcript.exons.map(iv_on_transcript)

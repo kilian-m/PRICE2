@@ -16,6 +16,8 @@ from scipy.stats import poisson
 from numba import jit
 from numba.typed import List
 
+from collections import defaultdict
+
 # from skglm import GroupLasso
 # from skglm.datafits import QuadraticGroup
 # from skglm.penalties import WeightedGroupL2
@@ -32,6 +34,7 @@ warnings.simplefilter("ignore", category=NumbaTypeSafetyWarning)
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
+from price2.coverage_model import CoveragePosition
 
 
 class EquivalenceGroup:
@@ -99,25 +102,59 @@ class Locus:
         orf_dict = dict()
 
         for transcript in self.transcripts:
-            noise = ReadGeneratingRegion(
-                "NOISE",
-                transcript,
-                transcript.id,
-                (0, len(transcript.exons)),
-            )
-            transcript.noise = noise
-            if not noise in self.rgr_set:
+            if (
+                hasattr(transcript, "cds")
+                and (cds_start := transcript.exons.induce(transcript.cds)[0]) > 0
+            ):
+                cds_start = transcript.exons.induce(transcript.cds)[0]
+                try:
+                    noise = ReadGeneratingRegion(
+                        "NOISE",
+                        transcript,
+                        f"{transcript.id}_a",
+                        (0, cds_start),
+                    )
+                    self.rgr_set.add(noise)
+                    transcript.rgr_set.add(noise)
+                except ValueError:
+                    print(cds_start)
+
+                try:
+                    noise = ReadGeneratingRegion(
+                        "NOISE",
+                        transcript,
+                        f"{transcript.id}_b",
+                        (cds_start, len(transcript.exons)),
+                    )
+                    self.rgr_set.add(noise)
+                    transcript.rgr_set.add(noise)
+                except ValueError:
+                    print(cds_start)
+            else:
+                noise = ReadGeneratingRegion(
+                    "NOISE",
+                    transcript,
+                    transcript.id,
+                    (0, len(transcript.exons)),
+                )
+                # transcript.noise = noise
+                # if not noise in self.rgr_set:
                 self.rgr_set.add(noise)
+                transcript.rgr_set.add(noise)
 
             seq = transcript.exons.get_sequence(genome)
             c = 0
             for orf_iv_on_transcript in find_orfs(seq):
+                rgr_iv_on_transcript = (
+                    orf_iv_on_transcript[0],
+                    orf_iv_on_transcript[1] - 3,
+                )  # remove stop codon
                 c += 1
                 orf = ReadGeneratingRegion(
                     "ORF",
                     transcript,
                     f"{transcript.id}_{c:04d}",
-                    orf_iv_on_transcript,
+                    rgr_iv_on_transcript,
                 )
                 if len(orf) + orf.dist_to_transcript_end < min_length_to_end:
                     continue
@@ -188,21 +225,21 @@ class Locus:
                         lengths[transcript] += 1
 
                     for rsa in reads:
-                        rgr_frame = self.get_rgr_frames(rsa, run)
-                        if not rgr_frame:
+                        rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
+                        if not rgr_frame_covpos:
                             continue
                         if (
-                            not (rgr_frame, len(rsa), rsa.untemplated_addition)
+                            not (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
                             in self.egs[run]
                         ):
                             self.egs[run][
-                                (rgr_frame, len(rsa), rsa.untemplated_addition)
+                                (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
                             ] = EquivalenceGroup()
                         self.egs[run][
-                            (rgr_frame, len(rsa), rsa.untemplated_addition)
+                            (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
                         ].length += 1
 
-    def get_rgr_frames(
+    def get_rgr_frame_covpos(
         self,
         rsa: RiboSeqAlignment,
         run: RiboSeqRun,
@@ -211,7 +248,7 @@ class Locus:
 
         overlap_transcripts = set(self.transcripts)
 
-        rgr_frame = set()
+        rgr_frame_covpos = set()
 
         for query_iv in rsa.genomic_region.intervals:
             for subject_iv, tr_set in self.transcript_intervals[query_iv].steps():
@@ -222,53 +259,156 @@ class Locus:
                 rsa_iv_on_tr = tr.exons.induce(rsa.genomic_region)
             except ValueError:
                 continue
-            rgr_frame.add((tr.noise, None))
-            for orf in tr.orf_set:
+            # rgr_frame_covpos.add((tr.noise, None, CoveragePosition.middle))
+            # for orf in tr.orf_set:
+            for rgr in tr.rgr_set:
                 # full overlap with orf
-                if (
-                    orf.iv_on_transcript[0] <= rsa_iv_on_tr[0]
-                    and orf.iv_on_transcript[1] >= rsa_iv_on_tr[1]
-                ):
-                    frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
-                    if (
-                        run.cleavage_model.pmf(
-                            len(rsa.genomic_region), rsa.untemplated_addition, frame
-                        )
-                        > 0
+                if rgr.type == "NOISE":
+                    frame = None
+                    if (rgr.iv_on_transcript[0] <= rsa_iv_on_tr[0]) and (
+                        rgr.iv_on_transcript[1] >= rsa_iv_on_tr[1]
                     ):
-                        rgr_frame.add((orf, frame))
-                # part overlap with orf
-                elif (
-                    rsa_iv_on_tr[0] <= orf.iv_on_transcript[0] <= rsa_iv_on_tr[1]
-                ) or (rsa_iv_on_tr[0] <= orf.iv_on_transcript[1] <= rsa_iv_on_tr[1]):
-                    frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
-                    # compute at which position in the read the orf starts
-                    region_start = orf.iv_on_transcript[0] - rsa_iv_on_tr[0]
-                    # compute at which position in the read the orf ends
-                    region_end = orf.iv_on_transcript[1] - rsa_iv_on_tr[0]
-                    if (
-                        ol := run.cleavage_model.pmf(
-                            len(rsa),
-                            rsa.untemplated_addition,
-                            frame,
-                            region_start=region_start,
-                            region_end=region_end,
-                        )
-                        > 0
-                    ):
-                        cl = run.cleavage_model.pmf(
-                            len(rsa), rsa.untemplated_addition, frame
-                        )
-                        if ol / cl > overlap_likelihood_ratio_threshold:
-                            rgr_frame.add(
-                                (orf, (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3)
+                        if (
+                            run.cleavage_model.pmf(
+                                len(rsa.genomic_region), rsa.untemplated_addition, frame
                             )
+                            > 0
+                        ):
+                            rgr_frame_covpos.add((rgr, frame, CoveragePosition.middle))
+                    elif (
+                        rsa_iv_on_tr[0] <= rgr.iv_on_transcript[0] <= rsa_iv_on_tr[1]
+                    ) or (
+                        rsa_iv_on_tr[0] <= rgr.iv_on_transcript[1] <= rsa_iv_on_tr[1]
+                    ):
+                        region_start = rgr.iv_on_transcript[0] - rsa_iv_on_tr[0]
+                        region_end = rgr.iv_on_transcript[1] - rsa_iv_on_tr[0]
+                        if (
+                            ol := run.cleavage_model.pmf(
+                                len(rsa),
+                                rsa.untemplated_addition,
+                                frame,
+                                region_start=region_start,
+                                region_end=region_end,
+                            )
+                            > 0
+                        ):
+                            cl = run.cleavage_model.pmf(
+                                len(rsa), rsa.untemplated_addition, frame
+                            )
+                            if ol / cl > overlap_likelihood_ratio_threshold:
+                                rgr_frame_covpos.add(
+                                    (
+                                        rgr,
+                                        frame,
+                                        CoveragePosition.middle,
+                                    )
+                                )
+                elif rgr.type == "ORF":
+                    orf = rgr
+                    if (
+                        orf.iv_on_transcript[0] <= rsa_iv_on_tr[0]
+                        and orf.iv_on_transcript[1] >= rsa_iv_on_tr[1]
+                    ):
+                        frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
+                        if (
+                            run.cleavage_model.pmf(
+                                len(rsa.genomic_region), rsa.untemplated_addition, frame
+                            )
+                            > 0
+                        ):
+                            rgr_frame_covpos.add((orf, frame, CoveragePosition.middle))
+                    # part overlap with orf
+                    elif (
+                        rsa_iv_on_tr[0] <= orf.iv_on_transcript[0] <= rsa_iv_on_tr[1]
+                    ) or (
+                        rsa_iv_on_tr[0] <= orf.iv_on_transcript[1] <= rsa_iv_on_tr[1]
+                    ):
+                        frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
+                        # consider overlap likelihood
+                        # compute at which position in the read the orf starts
+                        region_start = orf.iv_on_transcript[0] + 3 - rsa_iv_on_tr[0]
+                        # compute at which position in the read the orf ends
+                        region_end = orf.iv_on_transcript[1] - 3 - rsa_iv_on_tr[0]
+                        if (
+                            ol := run.cleavage_model.pmf(
+                                len(rsa),
+                                rsa.untemplated_addition,
+                                frame,
+                                region_start=region_start,
+                                region_end=region_end,
+                            )
+                            > 0
+                        ):
+                            cl = run.cleavage_model.pmf(
+                                len(rsa), rsa.untemplated_addition, frame
+                            )
+                            if ol / cl > overlap_likelihood_ratio_threshold:
+                                rgr_frame_covpos.add(
+                                    (
+                                        orf,
+                                        frame,
+                                        CoveragePosition.middle,
+                                    )
+                                )
+                        # consider coverage profile - start
+                        # compute where the orf starts relative to the read
+                        start_position = (
+                            orf.iv_on_transcript[0] - rsa_iv_on_tr[0],
+                            orf.iv_on_transcript[0] + 3 - rsa_iv_on_tr[0],
+                        )
+                        if (
+                            ol := run.cleavage_model.pmf(
+                                len(rsa),
+                                rsa.untemplated_addition,
+                                frame,
+                                region_start=start_position[0],
+                                region_end=start_position[1],
+                            )
+                            > 0
+                        ):
+                            cl = run.cleavage_model.pmf(
+                                len(rsa), rsa.untemplated_addition, frame
+                            )
+                            if (
+                                ol * run.coverage_model.start_factor / cl
+                                > overlap_likelihood_ratio_threshold
+                            ):
+                                rgr_frame_covpos.add(
+                                    (orf, frame, CoveragePosition.start)
+                                )
 
-        if not rgr_frame:
+                        # consider coverage profile - stop
+                        # compute where the orf ends relative to the read
+                        stop_position = (
+                            orf.iv_on_transcript[1] - 3 - rsa_iv_on_tr[0],
+                            orf.iv_on_transcript[1] - rsa_iv_on_tr[0],
+                        )
+                        if (
+                            ol := run.cleavage_model.pmf(
+                                len(rsa),
+                                rsa.untemplated_addition,
+                                frame,
+                                region_start=stop_position[0],
+                                region_end=stop_position[1],
+                            )
+                            > 0
+                        ):
+                            cl = run.cleavage_model.pmf(
+                                len(rsa), rsa.untemplated_addition, frame
+                            )
+                            if (
+                                ol * run.coverage_model.stop_factor / cl
+                                > overlap_likelihood_ratio_threshold
+                            ):
+                                rgr_frame_covpos.add(
+                                    (orf, frame, CoveragePosition.stop)
+                                )
+
+        if not rgr_frame_covpos:
             return
 
-        rgr_frame = frozenset(rgr_frame)
-        return rgr_frame
+        rgr_frame_covpos = frozenset(rgr_frame_covpos)
+        return rgr_frame_covpos
 
     def get_rgr_frames_alt(
         self,
@@ -462,10 +602,10 @@ class Locus:
                     int(rsa.untemplated_addition),
                 ) not in well_fitting_length_oua:
                     continue
-                rgr_frame = self.get_rgr_frames(rsa, run)
-                if not rgr_frame:
+                rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
+                if not rgr_frame_covpos:
                     continue
-                for rgr, frame in rgr_frame:
+                for rgr, frame, covpos in rgr_frame_covpos:
                     if rgr.type == "NOISE":
                         continue
                     if (
@@ -636,14 +776,14 @@ class Locus:
             run_id = run.id
 
             for rsa in self.rsas_dict[run_id]:
-                rgr_frame = self.get_rgr_frames(rsa, run)
+                rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
                 read_count = rsa.read_count
-                if not rgr_frame:
+                if not rgr_frame_covpos:
                     continue
 
                 try:
                     self.egs[run][
-                        (rgr_frame, len(rsa), rsa.untemplated_addition)
+                        (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
                     ].read_count += read_count
                     run.read_count += read_count
                 except KeyError:
@@ -657,7 +797,6 @@ class Locus:
     def to_objective_args(self, runs):
         rgrs = list(self.rgr_set)
 
-        # run_read_counts = np.array([run.read_count for run in runs])
         run_read_counts = np.array([self.counted_reads[run.id] for run in runs])
 
         cm_lut = np.zeros((len(runs), runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
@@ -665,16 +804,22 @@ class Locus:
             cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut / 3
             cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
 
+        coverage_params = np.zeros((len(runs), 3))
+        for i, run in enumerate(runs):
+            coverage_params[i, 0] = run.coverage_model.start_factor
+            coverage_params[i, 1] = 1
+            coverage_params[i, 2] = run.coverage_model.stop_factor
+
         egs = []
         for run in runs:
             l = []
 
-            for (rgr_frame, read_length, oua), eg in self.egs[run].items():
+            for (rgr_frame_covpos, read_length, oua), eg in self.egs[run].items():
                 temp = []
-                for rgr, frame in rgr_frame:
+                for rgr, frame, covpos in rgr_frame_covpos:
                     if frame == None:
                         frame = 3
-                    temp.append((rgr.index, frame))
+                    temp.append((rgr.index, frame, covpos.value))
                 l.append((eg.length, eg.read_count, read_length, int(oua), temp))
             egs.append(l)
 
@@ -693,13 +838,24 @@ class Locus:
             l = List()
             for eg in run:
                 temp = List()
-                for rgr, frame in eg[4]:
-                    temp.append((rgr, frame))
-                l.append((eg[0], eg[1], eg[2], eg[3], temp))
+                for rgr, frame, covpos in eg[4]:
+                    temp.append((rgr, frame, covpos))
+                try:
+                    l.append((eg[0], eg[1], eg[2], eg[3], temp))
+                except TypeError:
+                    pass  # case read is not assigned to a rgr_frame_covpos
 
             egs.append(l)
 
-        return (run_read_counts, cm_lut, egs, num_rgrs, rgr_lengths, initial_guess)
+        return (
+            run_read_counts,
+            cm_lut,
+            coverage_params,
+            egs,
+            num_rgrs,
+            rgr_lengths,
+            initial_guess,
+        )
 
     def get_regression_parameters(self, runs):
 
@@ -740,6 +896,7 @@ class Locus:
         self,
         run_read_counts,
         cm_lut,
+        coverage_params,
         egs,
         num_rgrs,
         rgr_lengths,
@@ -779,19 +936,17 @@ class Locus:
                     rel_thr=callback_args[0],
                     abs_thr=callback_args[1],
                 )
-                self.cb.args = (run_read_counts, cm_lut, egs, num_rgrs, λ)
+                self.cb.args = (
+                    run_read_counts,
+                    cm_lut,
+                    coverage_params,
+                    egs,
+                    num_rgrs,
+                    λ,
+                )
             else:
                 self.cb = None
             self.cb_dict[λ] = self.cb
-
-            # print(f"callback: {callback}")
-            #
-            # print(f"λ: {λ}")
-            # print(f"cm_lut: {cm_lut.shape}")
-            # print(f"egs: {len(egs)}")
-            # print(f"num_rgrs: {num_rgrs}")
-            # print(f"rgr_lengths: {rgr_lengths}")
-            # print(f"run_read_counts: {run_read_counts}")
 
             optimization_result = minimize(
                 objective_function,
@@ -799,6 +954,7 @@ class Locus:
                 args=(
                     run_read_counts,
                     cm_lut,
+                    coverage_params,
                     egs,
                     num_rgrs,
                     λ,
@@ -818,7 +974,9 @@ class Locus:
             # dof = |non-zero activities|
             # BIC = -2 * log(likelihood) + log(observations) * dof
 
-            ll = log_likelihood(optimization_result.x, run_read_counts, cm_lut, egs)
+            ll = log_likelihood(
+                optimization_result.x, run_read_counts, cm_lut, coverage_params, egs
+            )
 
             with np.errstate(invalid="ignore"):
                 tmp = optimization_result.x.copy()
@@ -1007,25 +1165,26 @@ class Locus:
 
         new_egs = {}
         for run in runs:
-            new_egs[run] = {}
+            new_egs[run] = defaultdict(EquivalenceGroup)
             for old_eg_key in self.egs[run]:
-                (rgr_frames, read_length, oua) = old_eg_key
-                new_rgr_frames = set()
-                for rgr, frame in rgr_frames:
+                (rgr_frame_covpos, read_length, oua) = old_eg_key
+                new_rgr_frame_covpos = set()
+                for rgr, frame, covpos in rgr_frame_covpos:
                     if rgr.index in keep_rgr_inds:
-                        new_rgr_frames.add((rgr, frame))
-                new_rgr_frames = frozenset(new_rgr_frames)
-                new_eg_key = (new_rgr_frames, read_length, oua)
-                try:
-                    new_egs[run][new_eg_key].length += self.egs[run][old_eg_key].length
-                    new_egs[run][new_eg_key].read_count += self.egs[run][
-                        old_eg_key
-                    ].read_count
-                except KeyError:
-                    new_egs[run][new_rgr_frames, read_length, oua] = EquivalenceGroup(
-                        self.egs[run][old_eg_key].length,
-                        self.egs[run][old_eg_key].read_count,
-                    )
+                        new_rgr_frame_covpos.add((rgr, frame, covpos))
+                new_rgr_frame_covpos = frozenset(new_rgr_frame_covpos)
+                new_eg_key = (new_rgr_frame_covpos, read_length, oua)
+
+                # try:
+                new_egs[run][new_eg_key].length += self.egs[run][old_eg_key].length
+                new_egs[run][new_eg_key].read_count += self.egs[run][
+                    old_eg_key
+                ].read_count
+                # except KeyError:
+                #    new_egs[run][new_eg_key] = EquivalenceGroup(
+                #        self.egs[run][old_eg_key].length,
+                #        self.egs[run][old_eg_key].read_count,
+                #    )
 
         self.egs = new_egs
         for c, rgr in enumerate(self.rgr_set):
@@ -1035,6 +1194,7 @@ class Locus:
         self,
         run_read_counts,
         cm_lut,
+        cov_params,
         egs,
         num_rgrs,
         rgr_lengths,
@@ -1063,6 +1223,7 @@ class Locus:
             args=(
                 run_read_counts,
                 cm_lut,
+                cov_params,
                 egs,
                 num_rgrs,
                 1,
@@ -1081,6 +1242,7 @@ class Locus:
             optimization_result.x,
             run_read_counts,
             cm_lut,
+            cov_params,
             egs,
         )
 
@@ -1111,6 +1273,7 @@ class Locus:
                 args=(
                     run_read_counts,
                     cm_lut,
+                    cov_params,
                     egs,
                     num_rgrs,
                     1,
@@ -1124,6 +1287,7 @@ class Locus:
                 optimization_result_int.x,
                 run_read_counts,
                 cm_lut,
+                cov_params,
                 egs,
             )
 
@@ -1359,7 +1523,8 @@ def objective_function(
     x,
     run_read_counts,
     cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
+    coverage_params,
+    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
     num_rgrs,
     λ: float,
 ) -> float:
@@ -1373,14 +1538,16 @@ def objective_function(
         for eg in egs[run_index]:
             activity = 0
             δ_derived = np.zeros_like(x)
-            for rgr_index, frame in eg[4]:
+            for rgr_index, frame, cov_pos in eg[4]:
                 activity += (
                     x[rgr_index * num_runs + run_index]
                     * cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, cov_pos]
                 )
-                δ_derived[rgr_index * num_runs + run_index] += cm_lut[
-                    run_index, eg[2], frame, eg[3]
-                ]
+                δ_derived[rgr_index * num_runs + run_index] += (
+                    cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, cov_pos]
+                )
 
             δ = run_read_counts[run_index] * eg[0] * activity
             δ_derived *= run_read_counts[run_index] * eg[0]
@@ -1459,7 +1626,8 @@ def log_likelihood(
     x,
     run_read_counts,
     cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
+    coverage_params,
+    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
 ) -> float:
 
     num_runs = len(run_read_counts)
@@ -1470,10 +1638,11 @@ def log_likelihood(
         for eg in egs[run_index]:
             activity = 0
 
-            for rgr_index, frame in eg[4]:
+            for rgr_index, frame, covpos in eg[4]:
                 activity += (
                     x[rgr_index * num_runs + run_index]
                     * cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, covpos]
                 )
 
             δ = run_read_counts[run_index] * eg[0] * activity

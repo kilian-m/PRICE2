@@ -2,11 +2,24 @@ from price2.reference_annotation import ReferenceAnnotation
 from price2.cleavage_model import CleavageModel, read_in_cds_likelihood
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
+from enum import Enum
+
 import HTSeq
 import numpy as np
 
 
+class CoveragePosition(Enum):
+    start = 0
+    middle = 1
+    stop = 2
+
+
 class CoverageModel:
+    """
+    class that models the higher ribosome footprint coverage at
+    ORF start codons and codons one position upstream of stop codons
+    """
+
     def __init__(
         self,
         sample_bam_path: str,
