@@ -6,14 +6,12 @@ from price2.genomic_features import Transcript
 
 class ReferenceAnnotation:
     cds_intervals: HTSeq.GenomicArrayOfSets
-    ti_sites: HTSeq.GenomicArray
     transcripts: dict[str:Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
 
     def __init__(self, gtf_path: str):  # , canonical: bool = False
         chromosomes = set()
         self.cds_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
-        self.ti_sites = HTSeq.GenomicArrayOfSets("auto", stranded=True)
         self.transcripts = {}
         self.transcript_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
 
@@ -26,7 +24,6 @@ class ReferenceAnnotation:
             if (chr := feature.iv.chrom) not in chromosomes:
                 chromosomes.add(chr)
                 self.cds_intervals.add_chrom(chr)
-                self.ti_sites.add_chrom(chr)
                 self.transcript_intervals.add_chrom(chr)
 
             if feature.type == "transcript":
@@ -48,15 +45,6 @@ class ReferenceAnnotation:
                     self.cds_intervals[feature.iv] += self.transcripts[
                         feature.attr["transcript_id"]
                     ]
-                    iv = HTSeq.GenomicInterval(
-                        feature.iv.chrom,
-                        feature.iv.start,
-                        feature.iv.start + 1,
-                        feature.iv.strand,
-                    )
-                    self.ti_sites[iv] += GenomicRegion(
-                        [iv], chrom=feature.iv.chrom, strand=feature.iv.strand
-                    )
 
         for transcript in self.transcripts.values():
             transcript.cds_regions_to_cds_intervals()

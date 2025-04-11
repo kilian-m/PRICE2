@@ -22,8 +22,8 @@ class CoverageModel:
 
     def __init__(
         self,
-        sample_bam_path: str,
         ra: ReferenceAnnotation,
+        sample_bam_path: str,
         cm: CleavageModel,
     ) -> None:
 

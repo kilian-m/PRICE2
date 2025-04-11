@@ -282,6 +282,8 @@ def process_loc(arguments):
     ##############################################################################
 
     t1 = time.time()  # performance measurement
+    for c, rgr in enumerate(loc.rgr_set):
+        rgr.index = c
     objective_args = loc.to_objective_args(runs)
 
     t2 = time.time()  # performance measurement
@@ -293,23 +295,17 @@ def process_loc(arguments):
 
     t1 = time.time()  # performance measurement
 
-    reg = True
-
-    if reg:
-        loc.deconvolve(
-            *objective_args,
-            config["ftol"],
-            config["gtol"],
-            config["callback"],
-            config["callback_args"],
-            config["pseudo_min"],
-        )
-    else:
-        loc.deconvolve_wo_regularization(
-            *objective_args,
-            config["ftol"],
-            config["gtol"],
-        )
+    loc.deconvolve(
+        *objective_args,
+        config["ftol"],
+        config["gtol"],
+        config["callback"],
+        config["callback_args"],
+        config["pseudo_min"],
+        lower_λ=config["λs"][0],
+        upper_λ=config["λs"][1],
+        number_λs=config["λs"][2],
+    )
 
     t2 = time.time()  # performance measurement
     optimization_t = t2 - t1  # performance measurement

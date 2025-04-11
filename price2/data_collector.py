@@ -6,6 +6,7 @@ import zlib
 import pandas as pd
 import numpy as np
 from multiprocessing import Pool
+from collections import defaultdict
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
@@ -278,13 +279,16 @@ def collect_mappings_run(data):
     cur = db.cursor()
 
     cur.execute("SELECT locus_id FROM reads WHERE run_id = ?", (run_id,))
+
     processed_loc_ids = {loc_id for loc_id, in cur.fetchall()}
+    db.close()
+
     loci_set = {loc for loc in loci_set if loc.id not in processed_loc_ids}
 
     for locus in loci_set:
-        transcripts_counts = {}
+        transcripts_counts = defaultdict(int)
         strand = locus.iv.strand
-        mappings_dict = {}
+        mappings_dict = defaultdict(int)
         for alignment in br.fetch(locus.iv.chrom, locus.iv.start, locus.iv.end):
             if alignment.iv.strand != strand:
                 continue
@@ -307,16 +311,12 @@ def collect_mappings_run(data):
 
             if transcripts:
                 transcripts_ids = frozenset(tr.id for tr in transcripts)
-                ivs_tuple = ((iv.start, iv.end) for iv in rsa.genomic_region.intervals)
+                ivs_tuple = tuple(
+                    (iv.start, iv.end) for iv in rsa.genomic_region.intervals
+                )
                 mapping = (rsa.untemplated_addition, rsa.unique(), ivs_tuple)
-                if mapping not in mappings_dict:
-                    mappings_dict[mapping] = 1
-                else:
-                    mappings_dict[mapping] += 1
-                try:
-                    transcripts_counts[transcripts_ids] += 1
-                except KeyError:
-                    transcripts_counts[transcripts_ids] = 1
+                mappings_dict[mapping] += 1
+                transcripts_counts[transcripts_ids] += 1
 
         read_list = []
         for entry, count in mappings_dict.items():
@@ -352,6 +352,8 @@ def collect_mappings_run(data):
         df["unique"] = df["unique"].astype(bool)
         df["count"] = df["count"].astype(np.uint16)
 
+        db = sql.connect(db_path)
+        cur = db.cursor()
         cur.execute(
             """INSERT INTO reads (
                          locus_id,
@@ -370,5 +372,4 @@ def collect_mappings_run(data):
             (locus.id, run_id, zlib.compress(dumps(transcripts_counts))),
         )
         db.commit()
-
-    db.close()
+        db.close()

@@ -33,7 +33,6 @@ if __name__ == "__main__":
         "deconvolution_filter_min_activity_fraction": 0.1,
         "ftol": 1e-6,
         "gtol": 1e-6,
-        "λs": (5, 5, 1),
         "deconvolution_filter": True,
         "coverage_filter": True,
         "α": 1e-6,

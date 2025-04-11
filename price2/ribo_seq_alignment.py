@@ -78,7 +78,7 @@ class RiboSeqAlignment:
         return len(self.genomic_region)
 
     def __hash__(self) -> int:
-        return hash(self.genomic_region) + self.untemplated_addition
+        return hash(self.genomic_region) + hash(self.untemplated_addition)
 
     def __eq__(self, other: "RiboSeqAlignment") -> bool:
         if (

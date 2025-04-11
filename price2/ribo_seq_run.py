@@ -90,14 +90,14 @@ def ribo_seq_run_from_bam(
 
     # estimate cleavage model
     ce = CleavageEstimator()
-    ce.collect_data(ref_annotation, HTSeq.BAM_Reader(sample_bam_file))
+    ce.collect_data(ref_annotation, sample_bam_file)
     ce.correct_table()
     cleavage_model = ce.run()
 
     # estimate coverage model
     coverageModel = CoverageModel(
-        sample_bam_file,
         ref_annotation,
+        sample_bam_file,
         cleavage_model,
     )
 

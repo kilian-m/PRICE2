@@ -48,6 +48,7 @@ class EquivalenceGroup:
     ) -> None:
         self.length = length
         self.read_count = read_count
+        self.reads = set()
 
 
 class Locus:
@@ -243,7 +244,7 @@ class Locus:
         self,
         rsa: RiboSeqAlignment,
         run: RiboSeqRun,
-        overlap_likelihood_ratio_threshold: float = 0.9,  # .1 .5 .9
+        overlap_likelihood_ratio_threshold: float = 1e-3,  # .1 .5 .9
     ) -> frozenset[tuple[ReadGeneratingRegion, int | None]]:
 
         overlap_transcripts = set(self.transcripts)
@@ -489,32 +490,6 @@ class Locus:
 
         rgr_frame = frozenset(rgr_frame)
         return rgr_frame
-
-    # def to_gtf(self, rgrs=None) -> str:
-    #    seq_id = self.iv.chrom
-    #    source = "PRICE2"
-    #    typ = "exon"
-    #    start = self.iv.start
-    #    end = self.iv.end
-    #    score = "."
-    #    strand = self.iv.strand
-    #    phase = "."
-    #    attributes = f'gene_id "{self.id}";'
-    #
-    #    s = f"{seq_id}\t{source}\t{typ}\t{start}\t{end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
-    #
-    #    if isinstance(rgrs, type(None)):
-    #        for rgr in self.rgr_set:
-    #            s += rgr.to_gtf()
-    #    else:
-    #        rgr_dict = {rgr.id: rgr for rgr in self.rgr_set}
-    #        for rgr in self.rgr_set:
-    #            if rgr.type == "NOISE":
-    #                s += rgr.to_gtf()
-    #        for rgr in rgrs:
-    #            s += rgr_dict[rgr].to_gtf()
-    #
-    #    return s
 
     def gtf_line(self):
         seq_id = self.iv.chrom
@@ -785,6 +760,9 @@ class Locus:
                     self.egs[run][
                         (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
                     ].read_count += read_count
+                    self.egs[run][
+                        (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
+                    ].reads.add(rsa)
                     run.read_count += read_count
                 except KeyError:
                     self.uncounted_reads += read_count
@@ -824,7 +802,8 @@ class Locus:
             egs.append(l)
 
         num_rgrs = len(rgrs)
-        rgr_lengths = np.array([len(rgr) for rgr in rgrs])
+        # rgr_lengths = np.array([len(rgr) for rgr in rgrs])
+        rgr_lengths = np.array([rgr.effective_length() for rgr in rgrs])
 
         # initial_guess = np.full((num_rgrs, len(runs)), 1/sum([len(rgr) for rgr in rgrs]))
         initial_guess = np.full((num_rgrs, len(runs)), 1 / sum(rgr_lengths))
@@ -947,7 +926,6 @@ class Locus:
             else:
                 self.cb = None
             self.cb_dict[λ] = self.cb
-
             optimization_result = minimize(
                 objective_function,
                 initial_guess,
@@ -957,7 +935,7 @@ class Locus:
                     coverage_params,
                     egs,
                     num_rgrs,
-                    λ,
+                    0,
                 ),
                 method="L-BFGS-B",
                 jac=True,
@@ -965,6 +943,23 @@ class Locus:
                 bounds=bounds,
                 options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
             )
+            # optimization_result = minimize(
+            #     objective_function_experimental,
+            #     optimization_result.x,
+            #     args=(
+            #         run_read_counts,
+            #         cm_lut,
+            #         coverage_params,
+            #         egs,
+            #         num_rgrs,
+            #         λ,
+            #     ),
+            #     method="L-BFGS-B",
+            #     jac=True,
+            #     callback=self.cb,
+            #     bounds=bounds,
+            #     options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
+            # )
 
             self.optimization_results[λ] = optimization_result
             initial_guess = optimization_result.x
@@ -1248,6 +1243,7 @@ class Locus:
 
         rgr_ind_list = list(test_rgr_indices)
         try:
+            # sort by activity
             act_sum = self.best_normal_result[np.array(rgr_ind_list)].sum(axis=1)
             rgr_ind_list = np.array(rgr_ind_list)[np.argsort(act_sum)]
         except IndexError:
@@ -1570,6 +1566,120 @@ def objective_function(
         for run_index in range(num_runs):
             grads[rgr_index * num_runs + run_index] += (
                 λ * x[rgr_index * num_runs + run_index] / s_sqrt
+            )
+
+    return loss + λ * penalty, grads
+
+
+# compute the negative log likelihood + a penalty term
+# and the gradient with respect to each activity parameter
+@jit(nopython=True, parallel=False, cache=True)
+def objective_function_experimental(
+    x,
+    run_read_counts,
+    cm_lut,
+    coverage_params,
+    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
+    num_rgrs,
+    λ: float,
+) -> float:
+
+    num_runs = len(run_read_counts)
+
+    loss = 0
+    grads = np.zeros_like(x)
+
+    for run_index in range(num_runs):
+        for eg in egs[run_index]:
+            activity = 0
+            δ_derived = np.zeros_like(x)
+            for rgr_index, frame, cov_pos in eg[4]:
+                activity += (
+                    x[rgr_index * num_runs + run_index]
+                    * cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, cov_pos]
+                )
+                δ_derived[rgr_index * num_runs + run_index] += (
+                    cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, cov_pos]
+                )
+
+            δ = run_read_counts[run_index] * eg[0] * activity
+            δ_derived *= run_read_counts[run_index] * eg[0]
+
+            y = eg[1]
+
+            if y == 0 and δ == 0:
+                continue
+
+            loss += δ - y * np.log(δ)
+            grads += -y * δ_derived / δ + δ_derived
+
+    penalty = 0
+    for rgr_index in range(num_rgrs):
+        s = 0
+        for run_index in range(num_runs):
+            s += x[rgr_index * num_runs + run_index]
+        s_sqrt = s**0.5
+        penalty += s_sqrt
+        for run_index in range(num_runs):
+            grads[rgr_index * num_runs + run_index] += λ / (2 * s_sqrt)
+
+    return loss + λ * penalty, grads
+
+
+@jit(nopython=True, parallel=False, cache=True)
+def objective_function_experimental2(
+    x,
+    run_read_counts,
+    cm_lut,
+    coverage_params,
+    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
+    num_rgrs,
+    λ: float,
+) -> float:
+
+    num_runs = len(run_read_counts)
+
+    loss = 0
+    grads = np.zeros_like(x)
+
+    for run_index in range(num_runs):
+        for eg in egs[run_index]:
+            activity = 0
+            δ_derived = np.zeros_like(x)
+            for rgr_index, frame, cov_pos in eg[4]:
+                activity += (
+                    x[rgr_index * num_runs + run_index]
+                    * cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, cov_pos]
+                )
+                δ_derived[rgr_index * num_runs + run_index] += (
+                    cm_lut[run_index, eg[2], frame, eg[3]]
+                    * coverage_params[run_index, cov_pos]
+                )
+
+            δ = run_read_counts[run_index] * eg[0] * activity
+            δ_derived *= run_read_counts[run_index] * eg[0]
+
+            y = eg[1]
+
+            if y == 0 and δ == 0:
+                continue
+
+            loss += δ - y * np.log(δ)
+            grads += -y * δ_derived / δ + δ_derived
+
+    penalty = 0
+    for rgr_index in range(num_rgrs):
+        s = 0
+        for run_index in range(num_runs):
+            s += x[rgr_index * num_runs + run_index] ** 2
+
+        penalty += s**0.25
+        for run_index in range(num_runs):
+            grads[rgr_index * num_runs + run_index] += (
+                λ * x[rgr_index * num_runs + run_index] / (2 * s**0.75)
             )
 
     return loss + λ * penalty, grads
