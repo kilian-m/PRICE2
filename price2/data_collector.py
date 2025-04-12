@@ -261,6 +261,16 @@ class DataCollector:
             locus.transcripts_number = len(locus.transcripts)
             locus.transcripts = locus.keep_transcripts
 
+            ti = locus.transcript_intervals
+            locus.transcript_intervals = HTSeq.GenomicArrayOfSets(
+                "auto", stranded=True, storage="step"
+            )
+            for iv, val in ti.steps():
+                if val:
+                    for tr in val:
+                        if tr in locus.keep_transcripts:
+                            locus.transcript_intervals[iv] = val
+
             if locus.transcripts:
                 locus.make_rgrs(self.genome)
                 cur.execute("INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus)))

@@ -113,14 +113,14 @@ class ReadGeneratingRegion:
         self.transcript = transcript
 
         if genomic_region is None:
-            self.genomic_region = transcript.exons.map(
-                (
-                    iv_on_transcript[0],
-                    iv_on_transcript[1],
-                )
-            )
+            self.genomic_region = transcript.exons.map(iv_on_transcript)
             if self.type == "ORF":
-                self.full_genomic_region = transcript.exons.map(iv_on_transcript)
+                self.full_genomic_region = transcript.exons.map(
+                    (
+                        iv_on_transcript[0],
+                        iv_on_transcript[1] + 3,
+                    )
+                )
             else:
                 self.full_genomic_region = self.genomic_region
             self.transcript_id = transcript.id

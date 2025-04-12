@@ -57,7 +57,7 @@ class Locus:
     read_count: int
     read_counts: dict[RiboSeqRun, int]
     rgr_set = set[ReadGeneratingRegion]
-    # rgr_intervals: HTSeq.GenomicArrayOfSets
+    transcript_intervals: HTSeq.GenomicArrayOfSets
     transcripts: set[Transcript]
 
     egs: dict[EquivalenceGroup, EquivalenceGroup]
@@ -101,36 +101,45 @@ class Locus:
     ) -> None:
         self.rgr_set = set()
         orf_dict = dict()
+        noise_dict = dict()
 
         for transcript in self.transcripts:
             if (
                 hasattr(transcript, "cds")
-                and (cds_start := transcript.exons.induce(transcript.cds)[0]) > 0
+                and (cds_start := transcript.exons.induce(transcript.cds)[0]) > 5
             ):
                 cds_start = transcript.exons.induce(transcript.cds)[0]
-                try:
-                    noise = ReadGeneratingRegion(
-                        "NOISE",
-                        transcript,
-                        f"{transcript.id}_a",
-                        (0, cds_start),
-                    )
-                    self.rgr_set.add(noise)
-                    transcript.rgr_set.add(noise)
-                except ValueError:
-                    print(cds_start)
+                noise1 = ReadGeneratingRegion(
+                    "NOISE",
+                    transcript,
+                    f"{transcript.id}_a",
+                    (0, cds_start),
+                )
 
-                try:
-                    noise = ReadGeneratingRegion(
-                        "NOISE",
-                        transcript,
-                        f"{transcript.id}_b",
-                        (cds_start, len(transcript.exons)),
-                    )
-                    self.rgr_set.add(noise)
-                    transcript.rgr_set.add(noise)
-                except ValueError:
-                    print(cds_start)
+                noise2 = ReadGeneratingRegion(
+                    "NOISE",
+                    transcript,
+                    f"{transcript.id}_b",
+                    (cds_start, len(transcript.exons)),
+                )
+
+                for noise in [noise1, noise2]:
+                    if not noise in noise_dict:
+                        noise_dict[noise] = noise
+                    else:
+                        alt_noise = noise_dict[noise]
+                        tmp1 = (
+                            alt_noise.dist_to_transcript_end
+                            + alt_noise.dist_to_transcript_start
+                        )
+
+                        tmp2 = (
+                            noise.dist_to_transcript_end
+                            + noise.dist_to_transcript_start
+                        )
+                        if tmp2 > tmp1:
+                            noise_dict[noise] = noise
+
             else:
                 noise = ReadGeneratingRegion(
                     "NOISE",
@@ -138,8 +147,6 @@ class Locus:
                     transcript.id,
                     (0, len(transcript.exons)),
                 )
-                # transcript.noise = noise
-                # if not noise in self.rgr_set:
                 self.rgr_set.add(noise)
                 transcript.rgr_set.add(noise)
 
@@ -173,6 +180,10 @@ class Locus:
                     tmp2 = orf.dist_to_transcript_end + orf.dist_to_transcript_start
                     if tmp2 > tmp1:
                         orf_dict[orf] = orf
+
+        for noise in noise_dict.values():
+            noise.transcript.rgr_set.add(noise)
+        self.rgr_set |= set(noise_dict.values())
         for orf in orf_dict.values():
             orf.transcript.add_orf(orf)
         self.rgr_set |= set(orf_dict.values())
@@ -614,6 +625,12 @@ class Locus:
                 rgr_set.add(rgr)
 
         self.rgr_set = rgr_set
+        rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
+        for step, step_set in self.rgr_intervals.steps():
+            rgr_intervals[step] = step_set & rgr_set
+
+        self.rgr_intervals = rgr_intervals
+
         for c, rgr in enumerate(self.rgr_set):
             rgr.index = c
 
@@ -634,6 +651,13 @@ class Locus:
                 rgr_set.add(rgr)
 
         self.rgr_set = rgr_set
+
+        rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
+        for step, step_set in self.rgr_intervals.steps():
+            rgr_intervals[step] = step_set & rgr_set
+
+        self.rgr_intervals = rgr_intervals
+
         for c, rgr in enumerate(self.rgr_set):
             rgr.index = c
 
