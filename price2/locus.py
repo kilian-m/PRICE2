@@ -959,7 +959,7 @@ class Locus:
                     coverage_params,
                     egs,
                     num_rgrs,
-                    0,
+                    λ,
                 ),
                 method="L-BFGS-B",
                 jac=True,
@@ -1029,6 +1029,88 @@ class Locus:
         self.best_λ = min(self.regularization_dict, key=self.regularization_dict.get)
         self.best_normal_result = self.λ_2_normal_result[self.best_λ]
         self.best_result = self.λ_2_result[self.best_λ]
+
+    def deconvolve_l12(
+        self,
+        run_read_counts,
+        cm_lut,
+        coverage_params,
+        egs,
+        num_rgrs,
+        rgr_lengths,
+        initial_guess,
+        ftol,
+        gtol,
+        pseudo_min,
+        lower_λ=5,
+        upper_λ=5,
+        number_λs=1,
+    ):
+        λs = np.logspace(lower_λ, upper_λ, number_λs)
+        self.optimization_results_l12 = {}
+        self.regularization_dict_l12 = {}
+        self.λ_2_normal_result_l12 = {}
+        self.λ_2_result_l12 = {}
+
+        bounds = [(pseudo_min, None)] * len(initial_guess)
+
+        for λ in λs:
+            optimization_result = minimize(
+                objective_function_experimental2,
+                initial_guess,
+                args=(
+                    run_read_counts,
+                    cm_lut,
+                    coverage_params,
+                    egs,
+                    num_rgrs,
+                    λ,
+                ),
+                method="L-BFGS-B",
+                jac=True,
+                bounds=bounds,
+                options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
+            )
+
+            self.optimization_results_l12[λ] = optimization_result
+            ll = log_likelihood(
+                optimization_result.x, run_read_counts, cm_lut, coverage_params, egs
+            )
+            with np.errstate(invalid="ignore"):
+                tmp = optimization_result.x.copy()
+                tmp = tmp.reshape(num_rgrs, len(self.counted_reads))
+                # tmp = tmp / tmp.sum(axis=0)
+                tmp = tmp.max(axis=0)
+                dof = (tmp > 1e-14).sum()
+
+            self.read_count = sum(self.read_counts.values())
+
+            bic = -2 * ll + np.log(self.read_count) * dof
+
+            self.regularization_dict_l12[λ] = (
+                bic,
+                -2 * ll,
+                np.log(self.read_count) * dof,
+            )
+
+            self.λ_2_result_l12[λ] = optimization_result
+            tmp = optimization_result.x.copy()
+            tmp = tmp.reshape(num_rgrs, len(run_read_counts))
+            tmp[tmp <= pseudo_min] = 0
+            with np.errstate(invalid="ignore"):
+                tmp = tmp / tmp.sum(axis=0)
+                tmp[np.isnan(tmp)] = 0
+            normalized_result = tmp
+
+            self.λ_2_normal_result_l12[λ] = normalized_result
+
+        self.best_λ_l12 = min(
+            self.regularization_dict_l12, key=self.regularization_dict_l12.get
+        )
+        self.best_normal_result_l12 = self.λ_2_normal_result_l12[self.best_λ_l12]
+        self.best_result_l12 = self.λ_2_result_l12[self.best_λ_l12]
+        self.final_normalized_result = self.best_normal_result_l12
+        self.noise_rgr_indices = set()
 
     def deconvolve_wo_regularization(
         self,
@@ -1595,65 +1677,8 @@ def objective_function(
     return loss + λ * penalty, grads
 
 
-# compute the negative log likelihood + a penalty term
-# and the gradient with respect to each activity parameter
 @jit(nopython=True, parallel=False, cache=True)
 def objective_function_experimental(
-    x,
-    run_read_counts,
-    cm_lut,
-    coverage_params,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
-    num_rgrs,
-    λ: float,
-) -> float:
-
-    num_runs = len(run_read_counts)
-
-    loss = 0
-    grads = np.zeros_like(x)
-
-    for run_index in range(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-            δ_derived = np.zeros_like(x)
-            for rgr_index, frame, cov_pos in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, cov_pos]
-                )
-                δ_derived[rgr_index * num_runs + run_index] += (
-                    cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, cov_pos]
-                )
-
-            δ = run_read_counts[run_index] * eg[0] * activity
-            δ_derived *= run_read_counts[run_index] * eg[0]
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-            grads += -y * δ_derived / δ + δ_derived
-
-    penalty = 0
-    for rgr_index in range(num_rgrs):
-        s = 0
-        for run_index in range(num_runs):
-            s += x[rgr_index * num_runs + run_index]
-        s_sqrt = s**0.5
-        penalty += s_sqrt
-        for run_index in range(num_runs):
-            grads[rgr_index * num_runs + run_index] += λ / (2 * s_sqrt)
-
-    return loss + λ * penalty, grads
-
-
-@jit(nopython=True, parallel=False, cache=True)
-def objective_function_experimental2(
     x,
     run_read_counts,
     cm_lut,

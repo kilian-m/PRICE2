@@ -313,32 +313,67 @@ def process_loc(arguments):
     ####################################
     ### filter with likelihood ratio ###
     ####################################
-
-    loc.collapse_egs(runs=runs, min_activity_threshold=config["min_activity_threshold"])
-    objective_args = loc.to_objective_args(runs)
-
-    if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/deconvoluted")
-
-    t1 = time.time()  # performance measurement
-    try:
-        loc.likelihood_ratio_filtering(
-            *objective_args,
-            α=config["α"],
-            ftol=config["ftol"],
-            gtol=config["gtol"],
+    if config["likelihood_ratio_filter"]:
+        loc.collapse_egs(
+            runs=runs, min_activity_threshold=config["min_activity_threshold"]
         )
-    except ValueError:
-        print(f"ValueError in likelihood ratio filtering of {loc.id}")
-    t2 = time.time()  # performance measurement
-    likelihood_ratio_t = t2 - t1  # performance measurement
+        objective_args = loc.to_objective_args(runs)
+
+        if config["verbose_gtf"]:
+            loc.to_gtf(f"{config['base_o_dir']}/deconvoluted")
+
+        t1 = time.time()  # performance measurement
+        try:
+            loc.likelihood_ratio_filtering(
+                *objective_args,
+                α=config["α"],
+                ftol=config["ftol"],
+                gtol=config["gtol"],
+            )
+        except ValueError:
+            print(f"ValueError in likelihood ratio filtering of {loc.id}")
+        t2 = time.time()  # performance measurement
+        likelihood_ratio_t = t2 - t1  # performance measurement
+
+        filtered_lrt = len(loc.keep_rgr_inds)
+
+    #############################
+    ### run L1/2 optimization ###
+    #############################
+
+    if config["l12_optimization"]:
+        (
+            run_read_counts,
+            cm_lut,
+            coverage_params,
+            egs,
+            num_rgrs,
+            rgr_lengths,
+            initial_guess,
+        ) = objective_args
+        initial_guess = loc.best_result.x
+        loc.deconvolve_l12(
+            run_read_counts,
+            cm_lut,
+            coverage_params,
+            egs,
+            num_rgrs,
+            rgr_lengths,
+            initial_guess,
+            config["ftol"],
+            config["gtol"],
+            config["pseudo_min"],
+            lower_λ=config["l12_λs"][0],
+            upper_λ=config["l12_λs"][1],
+            number_λs=config["l12_λs"][2],
+        )
+        filtered_lrt = 0
+        likelihood_ratio_t = 0
 
     ######################
     ### return results ###
     ######################
     loc.keep_rgrs = list(loc.rgr_set)
-
-    filtered_lrt = len(loc.keep_rgr_inds)
 
     # compute number of genes and transcripts
     gene_number = len({rgr.transcript.gene_id for rgr in loc.rgr_set_complete})

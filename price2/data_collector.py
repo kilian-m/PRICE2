@@ -362,7 +362,7 @@ def collect_mappings_run(data):
         df["unique"] = df["unique"].astype(bool)
         df["count"] = df["count"].astype(np.uint16)
 
-        db = sql.connect(db_path)
+        db = sql.connect(db_path, timeout=60)
         cur = db.cursor()
         cur.execute(
             """INSERT INTO reads (
