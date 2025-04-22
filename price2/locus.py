@@ -307,6 +307,8 @@ class Locus:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
+                            if cl == 0:
+                                continue
                             if ol / cl > overlap_likelihood_ratio_threshold:
                                 rgr_frame_covpos.add(
                                     (
@@ -354,7 +356,9 @@ class Locus:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
-                            if ol / cl > overlap_likelihood_ratio_threshold:
+                            if (not cl == 0) and (
+                                ol / cl > overlap_likelihood_ratio_threshold
+                            ):
                                 rgr_frame_covpos.add(
                                     (
                                         orf,
@@ -381,7 +385,7 @@ class Locus:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
-                            if (
+                            if (not cl == 0) and (
                                 ol * run.coverage_model.start_factor / cl
                                 > overlap_likelihood_ratio_threshold
                             ):
@@ -408,7 +412,7 @@ class Locus:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
-                            if (
+                            if (not cl == 0) and (
                                 ol * run.coverage_model.stop_factor / cl
                                 > overlap_likelihood_ratio_threshold
                             ):
@@ -1277,10 +1281,16 @@ class Locus:
                 new_eg_key = (new_rgr_frame_covpos, read_length, oua)
 
                 # try:
-                new_egs[run][new_eg_key].length += self.egs[run][old_eg_key].length
-                new_egs[run][new_eg_key].read_count += self.egs[run][
-                    old_eg_key
-                ].read_count
+                new_eg = new_egs[run][new_eg_key]
+                old_eg = self.egs[run][old_eg_key]
+                # new_egs[run][new_eg_key].length += self.egs[run][old_eg_key].length
+                new_eg.length += old_eg.length
+                # new_egs[run][new_eg_key].read_count += self.egs[run][
+                #    old_eg_key
+                # ].read_count
+                new_eg.read_count += old_eg.read_count
+                new_eg.reads |= old_eg.reads
+
                 # except KeyError:
                 #    new_egs[run][new_eg_key] = EquivalenceGroup(
                 #        self.egs[run][old_eg_key].length,
@@ -1486,6 +1496,8 @@ class Locus:
             m = s / len(d)
             rgr.mean_rpkm = m
         self.rpkm_df = pd.DataFrame(rpkm_dict).T
+
+    # def egs_tsv_string(self):
 
 
 # reject null if true

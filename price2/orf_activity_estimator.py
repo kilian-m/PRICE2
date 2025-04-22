@@ -459,7 +459,9 @@ def process_loc(arguments):
                     )
                 )
 
-    del loc.egs
-    del loc.rsas_dict
+    # loc.
+
+    # del loc.egs
+    # del loc.rsas_dict
 
     return (loc, performance_measurements)
