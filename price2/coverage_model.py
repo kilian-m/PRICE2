@@ -27,7 +27,7 @@ class CoverageModel:
         cm: CleavageModel,
     ) -> None:
 
-        p_site_2_start = np.zeros(250)
+        p_site_2_start = np.zeros(300)  # 250
 
         for aln in HTSeq.BAM_Reader(sample_bam_path):
             aln = RiboSeqAlignment(aln)
@@ -79,9 +79,13 @@ class CoverageModel:
             # position 30 in the array is position 0 in the CDS
             p_site_2_start[p_site + 30] += 1
 
-        self.start_factor = p_site_2_start[30] / p_site_2_start[33:230:3].mean()
+        with np.errstate(divide="raise"):
+            try:
+                self.start_factor = p_site_2_start[30] / p_site_2_start[33:230:3].mean()
+            except (FloatingPointError, ZeroDivisionError):
+                self.start_factor = 1
 
-        p_site_2_stop = np.zeros(250)
+        p_site_2_stop = np.zeros(300)  # 250
         for aln in HTSeq.BAM_Reader(sample_bam_path):
             aln = RiboSeqAlignment(aln)
             transcript_candidates = ra.collect_coding_transcripts(aln.genomic_region)
@@ -131,6 +135,18 @@ class CoverageModel:
             p_site = iv_on_cds[0] + np.argmax(l) * 3
             p_site_2_stop[p_site - len(transcript.cds) + 220] += 1
 
-        self.stop_factor = (
-            p_site_2_stop[217] / p_site_2_stop[217 - 198 : 217 : 3].mean()
-        )
+        with np.errstate(divide="raise"):
+            try:
+                self.stop_factor = (
+                    p_site_2_stop[217] / p_site_2_stop[217 - 198 : 217 : 3].mean()
+                )
+            except (FloatingPointError, ZeroDivisionError):
+                self.stop_factor = 1
+
+    def get_coverage_factor(self, position: CoveragePosition) -> float:
+        if position == CoveragePosition.start:
+            return self.start_factor
+        elif position == CoveragePosition.stop:
+            return self.stop_factor
+        else:
+            return 1
