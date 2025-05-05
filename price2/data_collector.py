@@ -295,6 +295,9 @@ def collect_mappings_run(data):
 
     loci_set = {loc for loc in loci_set if loc.id not in processed_loc_ids}
 
+    l_reads = []
+    l_transcript_read_counts = []
+
     for locus in loci_set:
         transcripts_counts = defaultdict(int)
         strand = locus.iv.strand
@@ -362,24 +365,53 @@ def collect_mappings_run(data):
         df["unique"] = df["unique"].astype(bool)
         df["count"] = df["count"].astype(np.uint16)
 
-        db = sql.connect(db_path, timeout=60)
-        cur = db.cursor()
-        cur.execute(
-            """INSERT INTO reads (
-                         locus_id,
-                         run_id,
-                         reads_blob
-                         ) VALUES (?, ?, ?)""",
-            (locus.id, run_id, zlib.compress(dumps(df))),
+        l_reads.append((locus.id, run_id, zlib.compress(dumps(df))))
+        l_transcript_read_counts.append(
+            (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
         )
 
-        cur.execute(
-            """INSERT INTO transcript_read_counts (
-                         locus_id,
-                         run_id,
-                         transcript_read_counts_blob
-                         ) VALUES (?, ?, ?)""",
-            (locus.id, run_id, zlib.compress(dumps(transcripts_counts))),
-        )
-        db.commit()
-        db.close()
+    db = sql.connect(db_path, timeout=60)
+    cur = db.cursor()
+    cur.executemany(
+        """INSERT INTO reads (
+                     locus_id,
+                     run_id,
+                     reads_blob
+                     ) VALUES (?, ?, ?)""",
+        l_reads,
+    )
+
+    cur.executemany(
+        """INSERT INTO transcript_read_counts (
+                     locus_id,
+                     run_id,
+                     transcript_read_counts_blob
+                     ) VALUES (?, ?, ?)""",
+        l_transcript_read_counts,
+    )
+    db.commit()
+    db.close()
+
+    # db = sql.connect(db_path, timeout=60)
+    # cur = db.cursor()
+    # cur.execute(
+    #    """INSERT INTO reads (
+    #                 locus_id,
+    #                 run_id,
+    #                 reads_blob
+    #                 ) VALUES (?, ?, ?)""",
+    #    (locus.id, run_id, zlib.compress(dumps(df))),
+    # )
+
+
+#
+# cur.execute(
+#    """INSERT INTO transcript_read_counts (
+#                 locus_id,
+#                 run_id,
+#                 transcript_read_counts_blob
+#                 ) VALUES (?, ?, ?)""",
+#    (locus.id, run_id, zlib.compress(dumps(transcripts_counts))),
+# )
+# db.commit()
+# db.close()
