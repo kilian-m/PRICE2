@@ -44,7 +44,7 @@ class DataCollector:
 
         if os.path.exists(self.db_path):
 
-            db = sql.connect(self.db_path)
+            db = sql.connect(self.db_path, timeout=60)
             cur = db.cursor()
             cur.execute("SELECT * FROM runs")
             tmp = [(run_id, run) for run_id, run in cur.fetchall()]
@@ -53,7 +53,7 @@ class DataCollector:
             bam_ids = bam_ids - run_ids
         else:
             self.runs = []
-            db = sql.connect(self.db_path)
+            db = sql.connect(self.db_path, timeout=60)
             cur = db.cursor()
 
             cur.execute(
@@ -281,7 +281,7 @@ class DataCollector:
 
 def collect_mappings_run(data):
 
-    run_id, bam_dir, db_path, loci_set = data
+    run_id, bam_dir, db_path, loci_set, worker_db_path = data
 
     br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
 
@@ -370,7 +370,7 @@ def collect_mappings_run(data):
             (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
         )
 
-    db = sql.connect(db_path, timeout=60)
+    db = sql.connect(worker_db_path, timeout=60)
     cur = db.cursor()
     cur.executemany(
         """INSERT INTO reads (
