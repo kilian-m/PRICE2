@@ -281,19 +281,19 @@ class DataCollector:
 
 def collect_mappings_run(data):
 
-    run_id, bam_dir, db_path, loci_set, worker_db_path = data
+    run_id, bam_dir, db_path, loci_set = data
 
     br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
 
-    db = sql.connect(db_path)
-    cur = db.cursor()
+    # db = sql.connect(db_path)
+    # cur = db.cursor()
+    #
+    # cur.execute("SELECT locus_id FROM reads WHERE run_id = ?", (run_id,))
+    #
+    # processed_loc_ids = {loc_id for loc_id, in cur.fetchall()}
+    # db.close()
 
-    cur.execute("SELECT locus_id FROM reads WHERE run_id = ?", (run_id,))
-
-    processed_loc_ids = {loc_id for loc_id, in cur.fetchall()}
-    db.close()
-
-    loci_set = {loc for loc in loci_set if loc.id not in processed_loc_ids}
+    # loci_set = {loc for loc in loci_set if loc.id not in processed_loc_ids}
 
     l_reads = []
     l_transcript_read_counts = []
@@ -370,7 +370,7 @@ def collect_mappings_run(data):
             (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
         )
 
-    db = sql.connect(worker_db_path, timeout=60)
+    db = sql.connect(db_path, timeout=60)
     cur = db.cursor()
     cur.executemany(
         """INSERT INTO reads (
