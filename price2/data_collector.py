@@ -283,6 +283,8 @@ def collect_mappings_run(data):
 
     run_id, bam_dir, db_path, loci_set = data
 
+    print(f"processing {run_id}")
+
     br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
 
     # db = sql.connect(db_path)
@@ -391,6 +393,8 @@ def collect_mappings_run(data):
     )
     db.commit()
     db.close()
+
+    print(f"processed {run_id}")
 
     # db = sql.connect(db_path, timeout=60)
     # cur = db.cursor()
