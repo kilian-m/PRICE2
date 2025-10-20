@@ -12,6 +12,7 @@ from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
 from price2.locus import Locus
 from price2.ribo_seq_alignment import RiboSeqAlignment
+from price2.config import Config
 
 
 class DataCollector:
@@ -24,14 +25,14 @@ class DataCollector:
         self,
         reference_annotation: ReferenceAnnotation,
         genome: dict[str : HTSeq.Sequence],
-        config: dict,
+        config: Config,
     ):
 
-        self.bam_dir = config["bam_dir"]
+        self.bam_dir = config.bam_dir
         self.get_chromosome_order()
 
         self.reference_annotation = reference_annotation
-        self.db_path = f"{config['w_dir']}/price.db"
+        self.db_path = f"{config.w_dir}/price.db"
         self.make_loci(self.reference_annotation)
         self.config = config
         self.genome = genome
@@ -66,9 +67,9 @@ class DataCollector:
         new_runs = ribo_seq_runs_from_bams(
             self.bam_dir,
             bam_ids,
-            self.config["w_dir"],
+            self.config.w_dir,
             self.reference_annotation,
-            self.config["processes"],
+            self.config.processes,
         )
         self.runs += new_runs
 
@@ -103,7 +104,7 @@ class DataCollector:
         db.close()
 
         try:
-            with Pool(self.config["processes"]) as p:
+            with Pool(self.config.processes) as p:
                 p.map(
                     collect_mappings_run,
                     [
@@ -202,7 +203,7 @@ class DataCollector:
         cur = db.cursor()
         r = cur.execute("""SELECT * FROM runs""")
         num_runs = len([x for x in r.fetchall()])
-        min_explained_reads = self.config["min_explained_reads_per_run"] * num_runs
+        min_explained_reads = self.config.min_explained_reads_per_run * num_runs
 
         loc_dict = {loc.id: loc for loc in self.loci_set}
 
@@ -261,15 +262,28 @@ class DataCollector:
             locus.transcripts_number = len(locus.transcripts)
             locus.transcripts = locus.keep_transcripts
 
-            ti = locus.transcript_intervals
-            locus.transcript_intervals = HTSeq.GenomicArrayOfSets(
-                "auto", stranded=True, storage="step"
+            new_tr_intervals = HTSeq.GenomicArray(
+                list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
             )
-            for iv, val in ti.steps():
-                if val:
-                    for tr in val:
-                        if tr in locus.keep_transcripts:
-                            locus.transcript_intervals[iv] = val
+
+            for step_iv, step_set in locus.transcript_intervals.steps():
+                new_step_set = set()
+                for tr in step_set:
+                    if tr in locus.transcripts:
+                        new_step_set.add(tr)
+                new_tr_intervals[step_iv] = new_step_set
+
+            locus.transcript_intervals = new_tr_intervals
+
+            # ti = locus.transcript_intervals
+            # locus.transcript_intervals = HTSeq.GenomicArrayOfSets(
+            #     "auto", stranded=True, storage="step"
+            # )
+            # for iv, val in ti.steps():
+            #     if val:
+            #         for tr in val:
+            #             if tr in locus.keep_transcripts:
+            #                 locus.transcript_intervals[iv] = val
 
             if locus.transcripts:
                 locus.make_rgrs(self.genome)
@@ -282,8 +296,6 @@ class DataCollector:
 def collect_mappings_run(data):
 
     run_id, bam_dir, db_path, loci_set = data
-
-    print(f"processing {run_id}")
 
     br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
 
@@ -332,7 +344,6 @@ def collect_mappings_run(data):
                 mapping = (rsa.untemplated_addition, rsa.unique(), ivs_tuple)
                 mappings_dict[mapping] += 1
                 transcripts_counts[transcripts_ids] += 1
-
         read_list = []
         for entry, count in mappings_dict.items():
             rsa.untemplated_addition, uniq, ivs_tuple = entry
@@ -393,8 +404,6 @@ def collect_mappings_run(data):
     )
     db.commit()
     db.close()
-
-    print(f"processed {run_id}")
 
     # db = sql.connect(db_path, timeout=60)
     # cur = db.cursor()

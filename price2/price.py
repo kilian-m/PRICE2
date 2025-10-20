@@ -11,9 +11,10 @@ import numba as nb
 nb.set_num_threads(1)
 
 from reference_annotation import ReferenceAnnotation
-from ribo_seq_run import ribo_seq_runs_from_bams
 from data_collector import DataCollector
 from orf_activity_estimator import ORFActivityEstimator
+from config import Config
+
 
 if __name__ == "__main__":
 
@@ -23,35 +24,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    config = {
-        "processes": 80,
-        "warm_start": True,
-        "callback": True,
-        "callback_args": (0.001, 0.001),
-        "min_explained_reads_per_run": 5,
-        "min_well_fitting_reads_per_length": 0.1,
-        "deconvolution_filter_min_activity_fraction": 0.2,
-        "ftol": 1e-6,
-        "gtol": 1e-6,
-        "deconvolution_filter": True,
-        "coverage_filter": True,
-        "α": 1e-10,
-        "verbose_gtf": True,
-        "loci_subset": 0,
-        "callback": True,
-        "callback_args": (0.001, 0.001),
-        "pseudo_min": 1e-14,
-        "min_activity_threshold": 0.01,
-    }
+    config = Config.make_config(config=args.config)
 
-    with open(args.config, "r") as f:
-        json_config = json.load(f)
-    config.update(json_config)
+    wdir = config.w_dir
+    odir = config.o_dir
 
-    wdir = config["w_dir"]
-    odir = config["o_dir"]
-
-    if not config["warm_start"]:
+    if not config.warm_start:
         if os.path.exists(wdir):
             shutil.rmtree(wdir)
         if os.path.exists(odir):
@@ -63,13 +41,13 @@ if __name__ == "__main__":
 
     print("load reference annotation...", end="", flush=True)
     start = time.time()
-    ref_annotation = ReferenceAnnotation(config["gtf_path"])
+    ref_annotation = ReferenceAnnotation(config.gtf_path)
     end = time.time()
     print(f"{end - start:.2e} seconds", flush=True)
 
     print("load genome...", end="", flush=True)
     start = time.time()
-    genome = dict((s.name, s) for s in HTSeq.FastaReader(config["fasta_path"]))
+    genome = dict((s.name, s) for s in HTSeq.FastaReader(config.fasta_path))
     end = time.time()
     print(f"{end - start:.2e} seconds", flush=True)
 
@@ -102,11 +80,23 @@ if __name__ == "__main__":
     #############################
 
     orf_activity_estimator = ORFActivityEstimator(config)
+
     print(
-        f"\nrun ORF deconvolution for {len(data_collector.runs)} runs and {len(orf_activity_estimator.loci_ids)} loci in {config['processes']} processes...",
+        f"\nrun ORF deconvolution for {len(data_collector.runs)} runs and {len(orf_activity_estimator.loci_ids)} loci in {config.processes} processes...",
         flush=True,
     )
     start = time.time()
     orf_activity_estimator.run_orf_deconvolution()
     end = time.time()
     print(f"{end - start:.2e} seconds", flush=True)
+
+    with open(f"{odir}/failed_loci.txt", "w") as f:
+        for loc_id, e in orf_activity_estimator.failed_loci.items():
+            if hasattr(e, "traceback"):
+                f.write(f"{loc_id}\n{e.traceback}\n\n\n")
+            else:
+                f.write(f"{loc_id}\n{e}\n\n\n")
+
+    print(f"orf deconvolution done in {end - start:.2e} seconds")
+    print(f"successful loci: {len(orf_activity_estimator.loci)}")
+    print(f"failed loci: {len(orf_activity_estimator.failed_loci)}")

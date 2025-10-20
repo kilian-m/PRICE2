@@ -11,19 +11,10 @@ import numba as nb
 from filelock import FileLock
 
 from scipy.optimize import minimize
-from scipy.sparse import block_diag, coo_array
-from scipy.stats import poisson
 from numba import jit
 from numba.typed import List
 
 from collections import defaultdict
-
-# from skglm import GroupLasso
-# from skglm.datafits import QuadraticGroup
-# from skglm.penalties import WeightedGroupL2
-# from skglm.solvers import GroupBCD
-# from skglm import GeneralizedLinearEstimator
-# from skglm.utils.data import grp_converter
 
 
 from numba.core.errors import NumbaTypeSafetyWarning
@@ -35,20 +26,7 @@ from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 from price2.coverage_model import CoveragePosition
-
-
-class EquivalenceGroup:
-    length: int
-    read_count: int
-
-    def __init__(
-        self,
-        length: int = 0,
-        read_count: int = 0,
-    ) -> None:
-        self.length = length
-        self.read_count = read_count
-        self.reads = set()
+from price2.equivalence_groups import EquivalenceGroup
 
 
 class Locus:
@@ -199,6 +177,10 @@ class Locus:
         self.rgr_set_complete = self.rgr_set
 
     def make_equivalence_groups_precise(self, runs: list[RiboSeqRun]) -> None:
+        # keep because this is definitely correct
+        warnings.warn(
+            "make_equivalence_groups_precise is deprecated", DeprecationWarning
+        )
         self.egs = dict()
 
         for run in runs:
@@ -255,7 +237,7 @@ class Locus:
         self,
         rsa: RiboSeqAlignment,
         run: RiboSeqRun,
-        overlap_likelihood_ratio_threshold: float = 1e-3,  # .1 .5 .9
+        overlap_likelihood_ratio_threshold: float = 0.2,
     ) -> frozenset[tuple[ReadGeneratingRegion, int | None]]:
 
         overlap_transcripts = set(self.transcripts)
@@ -302,8 +284,7 @@ class Locus:
                                 region_start=region_start,
                                 region_end=region_end,
                             )
-                            > 0
-                        ):
+                        ) > 0:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
@@ -351,8 +332,7 @@ class Locus:
                                 region_start=region_start,
                                 region_end=region_end,
                             )
-                            > 0
-                        ):
+                        ) > 0:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
@@ -380,13 +360,13 @@ class Locus:
                                 region_start=start_position[0],
                                 region_end=start_position[1],
                             )
-                            > 0
-                        ):
+                        ) > 0:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
                             if (not cl == 0) and (
-                                ol * run.coverage_model.start_factor / cl
+                                # ol * run.coverage_model.start_factor / cl
+                                ol / cl
                                 > overlap_likelihood_ratio_threshold
                             ):
                                 rgr_frame_covpos.add(
@@ -407,13 +387,13 @@ class Locus:
                                 region_start=stop_position[0],
                                 region_end=stop_position[1],
                             )
-                            > 0
-                        ):
+                        ) > 0:
                             cl = run.cleavage_model.pmf(
                                 len(rsa), rsa.untemplated_addition, frame
                             )
                             if (not cl == 0) and (
-                                ol * run.coverage_model.stop_factor / cl
+                                # ol * run.coverage_model.stop_factor / cl
+                                ol / cl
                                 > overlap_likelihood_ratio_threshold
                             ):
                                 rgr_frame_covpos.add(
@@ -490,8 +470,7 @@ class Locus:
                             region_start=region_start,
                             region_end=region_end,
                         )
-                        > 0
-                    ):
+                    ) > 0:
                         cl = run.cleavage_model.pmf(
                             len(rsa), rsa.untemplated_addition, frame
                         )
@@ -562,7 +541,7 @@ class Locus:
             """,
             (self.id,),
         )
-
+        self.run_read_count = {}
         self.rsas_dict = {}
         for _, run_id, blob in reads_dfs:
             rsas_run = []
@@ -575,6 +554,10 @@ class Locus:
                 rsas_run.append(rsa)
             self.rsas_dict[run_id] = rsas_run
 
+            self.run_read_count[run_id] = reads_df[reads_df["is_first_iv"]][
+                "count"
+            ].sum()
+
     def make_well_fitting_reads(self, runs):
         well_fitting_rcs = {}
         for run in runs:
@@ -582,7 +565,7 @@ class Locus:
             for rgr in self.rgr_set:
                 if rgr.type == "ORF":
                     well_fitting_rcs[run.id][rgr.id] = 0
-
+        self.wfr_count = 0
         for run in runs:
             well_fitting_indices = run.cleavage_model.get_high_prob_indices()
             well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}
@@ -595,15 +578,21 @@ class Locus:
                 rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
                 if not rgr_frame_covpos:
                     continue
+                # self.wfr_count += rsa.read_count
+                counted = False
                 for rgr, frame, covpos in rgr_frame_covpos:
                     if rgr.type == "NOISE":
                         continue
-                    if (
-                        len(rsa),
-                        int(rsa.untemplated_addition),
-                        frame,
-                    ) in well_fitting_indices:
+                    # if (
+                    #     len(rsa),
+                    #     int(rsa.untemplated_addition),
+                    #     frame,
+                    # ) in well_fitting_indices:
+                    if True:
                         well_fitting_rcs[run.id][rgr.id] += rsa.read_count
+                        if not counted:
+                            self.wfr_count += rsa.read_count
+                            counted = True
 
         self.wfr_df = (
             pd.DataFrame.from_dict(well_fitting_rcs).replace(np.nan, 0).astype(np.int32)
@@ -612,58 +601,45 @@ class Locus:
     # filter RGRs based on coverage
     # compute coverage with well fitting reads for each RGR and each run
     # remove RGRs max coverage below threshold
-    def coverage_filter_rgrs(self, threshold=0.01):
+    def coverage_filter_rgrs(self, config):
 
         rgr_lengths = {rgr.id: len(rgr.genomic_region) for rgr in self.rgr_set}
 
         rgr_lengths = pd.Series(rgr_lengths).reindex(self.wfr_df.index)
         wfr_df_rel = self.wfr_df.div(rgr_lengths, axis=0)
 
-        keep_ORFs_ids = set(wfr_df_rel[wfr_df_rel.max(axis=1) > threshold].index)
+        rgrs_to_remove_ids = set(
+            wfr_df_rel[
+                wfr_df_rel.max(axis=1) <= config.min_well_fitting_reads_per_length
+            ].index
+        )
+        rgrs_to_remove = {
+            rgr
+            for rgr in self.rgr_set
+            if rgr.id in rgrs_to_remove_ids and rgr.type == "ORF"
+        }
 
-        rgr_set = set()
-        for rgr in self.rgr_set:
-            if rgr.id in keep_ORFs_ids:
-                rgr_set.add(rgr)
-            elif rgr.type == "NOISE":
-                rgr_set.add(rgr)
+        self.remove_rgrs(rgrs_to_remove)
 
-        self.rgr_set = rgr_set
-        rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
-        for step, step_set in self.rgr_intervals.steps():
-            rgr_intervals[step] = step_set & rgr_set
-
-        self.rgr_intervals = rgr_intervals
-
-        for c, rgr in enumerate(self.rgr_set):
-            rgr.index = c
-
-    def deconvolution_filter_rgrs(self, min_activity_fraction):
+    def deconvolution_filter_rgrs(self, config):
 
         tmp = self.make_stop_groups()
         optimization_groups = self.split_stop_groups(tmp)
 
-        remove_rgrs = set()
+        rgr_ids_to_remove = set()
         for opt_group in optimization_groups:
-            remove_rgrs |= self.deconvolute_opt_group(opt_group, min_activity_fraction)
+            rgr_ids_to_remove |= self.deconvolute_opt_group(opt_group, config)
 
-        rgr_set = set()
-        for rgr in self.rgr_set:
-            if rgr.type == "NOISE":
-                rgr_set.add(rgr)
-            elif not rgr.id in remove_rgrs:
-                rgr_set.add(rgr)
+        rgrs_to_remove = {
+            rgr
+            for rgr in self.rgr_set
+            if rgr.type == "ORF" and rgr.id in rgr_ids_to_remove
+        }
+        # for rgr in self.rgr_set:
+        #    if rgr.id in rgr_ids_to_remove and rgr.type != "NOISE":
+        #        rgrs_to_remove.add(rgr)
 
-        self.rgr_set = rgr_set
-
-        rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
-        for step, step_set in self.rgr_intervals.steps():
-            rgr_intervals[step] = step_set & rgr_set
-
-        self.rgr_intervals = rgr_intervals
-
-        for c, rgr in enumerate(self.rgr_set):
-            rgr.index = c
+        self.remove_rgrs(rgrs_to_remove)
 
     # assign rgrs to groups corresponding to one stop codon
     # do not consider NOISE rgrs and groups with a single rgr
@@ -712,9 +688,12 @@ class Locus:
         return optimization_groups
 
     def deconvolute_opt_group(
-        self, opt_group, min_activity_fraction=0.1, pseudo_min=1e-14
+        self,
+        opt_group,
+        config,
     ):
-        rgr_indices_to_remove = []
+        # rgr_indices_to_remove = []
+        rgr_indices_to_keep = []
         rgr_read_counts = dict(self.wfr_df.sum(axis=1))
         l = list(opt_group)
         l.sort(key=len, reverse=True)
@@ -722,8 +701,10 @@ class Locus:
 
         min_reads = self.wfr_df.sum().sum() / self.wfr_df.shape[1] * 0.1
 
+        number_of_runs = self.wfr_df.shape[1]
+
         # iterate over runs
-        for i in range(len(self.wfr_df.iloc[0])):
+        for i in range(number_of_runs):  # len(self.wfr_df.iloc[0])):
 
             rgr_read_counts = self.wfr_df.iloc[:, i].to_dict()
 
@@ -743,7 +724,7 @@ class Locus:
             rc = rgr_read_counts[l[-1].id]
             egs[frozenset(s)] = (length, rc)
 
-            bounds = [(pseudo_min, np.inf) for _ in range(len(egs))]
+            bounds = [(config.pseudo_min, None) for _ in range(len(egs))]
             initial_guess = np.full(len(egs), 0.1)
 
             eg_lengths = np.array([egs[eg][0] for eg in egs])
@@ -762,17 +743,22 @@ class Locus:
                 options={"maxiter": 10_000, "maxfun": 1e6},
             )
 
-            rgr_indices_to_remove_one_run = set(
-                np.where(result.x / result.x.sum() < min_activity_fraction)[0]
+            # rgr_indices_to_remove_one_run = set(
+            #     np.where(result.x < config.deconvolution_filter_min_activity)[0]
+            # )
+            rgr_indices_to_keep_one_run = set(
+                np.where(result.x >= config.deconvolution_filter_min_activity)[0]
             )
-            rgr_indices_to_remove.append(rgr_indices_to_remove_one_run)
+            # rgr_indices_to_remove.append(rgr_indices_to_remove_one_run)
+            rgr_indices_to_keep.append(rgr_indices_to_keep_one_run)
 
         try:
-            rgr_indices_to_remove = set.intersection(*rgr_indices_to_remove)
+            # rgr_indices_to_remove = set.intersection(*rgr_indices_to_remove)
+            rgr_indices_to_keep = set.union(*rgr_indices_to_keep)
         except TypeError:
-            rgr_indices_to_remove = set()
+            rgr_indices_to_remove = set(rgr_indices.keys())
 
-        return set([k for k, v in rgr_indices.items() if v in rgr_indices_to_remove])
+        return set([k for k, v in rgr_indices.items() if v not in rgr_indices_to_keep])
 
     def assign_reads_to_egs(self, runs):
         for run in runs:
@@ -800,14 +786,20 @@ class Locus:
                 except KeyError:
                     self.read_counts[run] = int(read_count)
 
-    def to_objective_args(self, runs):
+        self.counted_reads = {}
+        for run in runs:
+            self.counted_reads[run.id] = 0
+            for v in self.egs[run].values():
+                self.counted_reads[run.id] += v.read_count
+
+    def to_deconvolution_args(self, runs):
         rgrs = list(self.rgr_set)
 
-        run_read_counts = np.array([self.counted_reads[run.id] for run in runs])
+        num_runs = len(runs)
 
         cm_lut = np.zeros((len(runs), runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
         for i, run in enumerate(runs):
-            cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut / 3
+            cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut
             cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
 
         coverage_params = np.zeros((len(runs), 3))
@@ -816,12 +808,67 @@ class Locus:
             coverage_params[i, 1] = 1
             coverage_params[i, 2] = run.coverage_model.stop_factor
 
-        egs = []
-        for run in runs:
-            l = []
+        num_rgrs = len(rgrs)
 
+        if hasattr(self, "result"):
+            initial_guess = self.result
+        else:
+            initial_guess = np.ones((num_rgrs, len(runs)))
+        initial_guess = initial_guess.flatten()
+
+        egs = List()
+        for run in runs:
+            l = List()
             for (rgr_frame_covpos, read_length, oua), eg in self.egs[run].items():
-                temp = []
+                if not rgr_frame_covpos:
+                    continue
+                temp = List()
+                for rgr, frame, covpos in rgr_frame_covpos:
+                    if frame == None:
+                        frame = 3
+                    temp.append((rgr.index, frame, covpos.value))
+                l.append((eg.length, eg.read_count, read_length, int(oua), temp))
+            if l:
+                egs.append(l)
+
+        return {
+            "cleavage_model": cm_lut,
+            "coverage_model": coverage_params,
+            "egs": egs,
+            "num_rgrs": num_rgrs,
+            "num_runs": num_runs,
+            "initial_guess": initial_guess,
+        }
+
+    def to_deconvolution_args_experimental(self, runs):
+        rgrs = list(self.rgr_set)
+
+        num_runs = len(runs)
+
+        cm_lut = np.zeros((len(runs), runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
+        for i, run in enumerate(runs):
+            cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut
+            cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
+
+        coverage_params = np.zeros((len(runs), 3))
+        for i, run in enumerate(runs):
+            coverage_params[i, 0] = run.coverage_model.start_factor
+            coverage_params[i, 1] = 1
+            coverage_params[i, 2] = run.coverage_model.stop_factor
+
+        num_rgrs = len(rgrs)
+
+        initial_guess = np.ones((num_rgrs, len(runs)))
+
+        initial_guess = initial_guess.flatten()
+
+        egs = List()
+        for run in runs:
+            l = List()
+            for (rgr_frame_covpos, read_length, oua), eg in self.egs[run].items():
+                if not rgr_frame_covpos:
+                    continue
+                temp = List()
                 for rgr, frame, covpos in rgr_frame_covpos:
                     if frame == None:
                         frame = 3
@@ -829,445 +876,182 @@ class Locus:
                 l.append((eg.length, eg.read_count, read_length, int(oua), temp))
             egs.append(l)
 
-        num_rgrs = len(rgrs)
-        # rgr_lengths = np.array([len(rgr) for rgr in rgrs])
-        rgr_lengths = np.array([rgr.effective_length() for rgr in rgrs])
-
-        # initial_guess = np.full((num_rgrs, len(runs)), 1/sum([len(rgr) for rgr in rgrs]))
-        initial_guess = np.full((num_rgrs, len(runs)), 1 / sum(rgr_lengths))
-
-        initial_guess = initial_guess.flatten()
-
-        egs_unconverted = egs
-        egs = List()
-
-        for run in egs_unconverted:
-            l = List()
-            for eg in run:
-                temp = List()
-                for rgr, frame, covpos in eg[4]:
-                    temp.append((rgr, frame, covpos))
-                try:
-                    l.append((eg[0], eg[1], eg[2], eg[3], temp))
-                except TypeError:
-                    pass  # case read is not assigned to a rgr_frame_covpos
-
-            egs.append(l)
-
-        return (
-            run_read_counts,
-            cm_lut,
-            coverage_params,
-            egs,
-            num_rgrs,
-            rgr_lengths,
-            initial_guess,
-        )
-
-    def get_regression_parameters(self, runs):
-
-        # create y
-        ys = []
-        for run in runs:
-            yt = np.zeros(len(self.egs[run]))
-            for i, eg in enumerate(self.egs[run].values()):
-                yt[i] = eg.read_count
-            ys.append(yt)
-        y = np.concatenate(ys)
-
-        # create x
-        xs = []
-        for run in runs:
-            xt = np.zeros((len(self.egs[run]), len(self.rgr_set)))
-            for i, ((rgr_frame, read_length, oua), eg) in enumerate(
-                self.egs[run].items()
-            ):
-                for rgr, frame in rgr_frame:
-                    xt[i, rgr.index] = (
-                        eg.length
-                        * run.read_count
-                        * run.cleavage_model.pmf(read_length, oua, frame)
-                    )
-            xs.append(coo_array(xt))
-        x = block_diag(xs)
-
-        # create groups
-        groups = [[] for _ in range(len(self.rgr_set))]
-        for j in range(len(self.rgr_set)):
-            for i in range(len(runs)):
-                groups[j].append(i * len(self.rgr_set) + j)
-
-        return x, y, groups
+        return {
+            "cleavage_model": cm_lut,
+            "coverage_model": coverage_params,
+            "egs": egs,
+            "num_rgrs": num_rgrs,
+            "num_runs": num_runs,
+            "initial_guess": initial_guess,
+        }
 
     def deconvolve(
         self,
-        run_read_counts,
-        cm_lut,
-        coverage_params,
-        egs,
-        num_rgrs,
-        rgr_lengths,
-        initial_guess,
-        ftol,
-        gtol,
-        callback,
-        callback_args,
-        pseudo_min,
-        lower_λ=5,
-        upper_λ=5,
-        number_λs=1,
+        config,
+        runs,
     ):
-        # if num_rgrs < 100:
-        #    nb.set_num_threads(1)
-        # else:
-        #    nb.set_num_threads(16)
+        import time
 
-        λs = np.logspace(lower_λ, upper_λ, number_λs)
+        opt_time = 0
+        data_time = 0
 
-        self.initial_guesses = []
-        self.cb_dict = {}
-        self.optimization_results = {}
-        self.regularization_dict = {}
-        self.λ_2_normal_result = {}
-        self.λ_2_result = {}
+        while True:
+            s1 = time.time()
+            deconvolution_args = self.to_deconvolution_args(runs)
+            cm_lut = deconvolution_args["cleavage_model"]
+            coverage_params = deconvolution_args["coverage_model"]
+            egs = deconvolution_args["egs"]
+            num_rgrs = deconvolution_args["num_rgrs"]
+            num_runs = deconvolution_args["num_runs"]
+            # try:
+            #     initial_guess = cb.initial_guess
+            # except NameError:
+            initial_guess = deconvolution_args["initial_guess"]
+            s2 = time.time()
+            data_time += s2 - s1
+            s1 = time.time()
 
-        bounds = [(pseudo_min, None)] * len(initial_guess)
+            bounds = [(config.pseudo_min, None)] * len(initial_guess)
 
-        for λ in λs:
-            self.initial_guesses.append(initial_guess)
-            if callback:
-                self.cb = Callback(
-                    num_rgrs,
-                    len(run_read_counts),
-                    initial_guess=initial_guess,
-                    rel_thr=callback_args[0],
-                    abs_thr=callback_args[1],
-                )
-                self.cb.args = (
-                    run_read_counts,
-                    cm_lut,
-                    coverage_params,
-                    egs,
-                    num_rgrs,
-                    λ,
-                )
-            else:
-                self.cb = None
-            self.cb_dict[λ] = self.cb
+            cb = Callback(initial_guess, num_runs, config, remove_rgrs=True)
+
             optimization_result = minimize(
                 objective_function,
                 initial_guess,
                 args=(
-                    run_read_counts,
+                    num_runs,
                     cm_lut,
                     coverage_params,
                     egs,
                     num_rgrs,
-                    λ,
-                ),
-                method="L-BFGS-B",
-                jac=True,
-                callback=self.cb,
-                bounds=bounds,
-                options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
-            )
-            # optimization_result = minimize(
-            #     objective_function_experimental,
-            #     optimization_result.x,
-            #     args=(
-            #         run_read_counts,
-            #         cm_lut,
-            #         coverage_params,
-            #         egs,
-            #         num_rgrs,
-            #         λ,
-            #     ),
-            #     method="L-BFGS-B",
-            #     jac=True,
-            #     callback=self.cb,
-            #     bounds=bounds,
-            #     options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
-            # )
-
-            self.optimization_results[λ] = optimization_result
-            initial_guess = optimization_result.x
-
-            ### compute BIC
-            # number of observations = number of reads
-            # dof = |non-zero activities|
-            # BIC = -2 * log(likelihood) + log(observations) * dof
-
-            ll = log_likelihood(
-                optimization_result.x, run_read_counts, cm_lut, coverage_params, egs
-            )
-
-            with np.errstate(invalid="ignore"):
-                tmp = optimization_result.x.copy()
-                tmp = tmp.reshape(num_rgrs, len(self.counted_reads))
-                tmp = tmp / tmp.sum(axis=0)
-                dof = (tmp > 1e-2).sum()
-
-            self.read_count = sum(self.read_counts.values())
-
-            bic = -2 * ll + np.log(self.read_count) * dof
-
-            self.regularization_dict[λ] = (
-                bic,
-                -2 * ll,
-                np.log(self.read_count) * dof,
-            )
-            if callback:
-                del self.cb.args
-
-            self.λ_2_result[λ] = optimization_result
-            tmp = optimization_result.x.copy()
-            tmp = tmp.reshape(num_rgrs, len(run_read_counts))
-            tmp[tmp <= pseudo_min] = 0
-            with np.errstate(invalid="ignore"):
-                tmp = tmp / tmp.sum(axis=0)
-                tmp[np.isnan(tmp)] = 0
-            normalized_result = tmp
-
-            self.λ_2_normal_result[λ] = normalized_result
-
-        self.best_λ = min(self.regularization_dict, key=self.regularization_dict.get)
-        self.best_normal_result = self.λ_2_normal_result[self.best_λ]
-        self.best_result = self.λ_2_result[self.best_λ]
-
-    def deconvolve_l12(
-        self,
-        run_read_counts,
-        cm_lut,
-        coverage_params,
-        egs,
-        num_rgrs,
-        rgr_lengths,
-        initial_guess,
-        ftol,
-        gtol,
-        pseudo_min,
-        lower_λ=5,
-        upper_λ=5,
-        number_λs=1,
-    ):
-        λs = np.logspace(lower_λ, upper_λ, number_λs)
-        self.optimization_results_l12 = {}
-        self.regularization_dict_l12 = {}
-        self.λ_2_normal_result_l12 = {}
-        self.λ_2_result_l12 = {}
-
-        bounds = [(pseudo_min, None)] * len(initial_guess)
-
-        for λ in λs:
-            optimization_result = minimize(
-                objective_function_experimental2,
-                initial_guess,
-                args=(
-                    run_read_counts,
-                    cm_lut,
-                    coverage_params,
-                    egs,
-                    num_rgrs,
-                    λ,
+                    config.lam,
                 ),
                 method="L-BFGS-B",
                 jac=True,
                 bounds=bounds,
-                options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
+                callback=cb,
+                options={
+                    "maxiter": 10_000,
+                    "ftol": config.ftol,
+                    "gtol": config.gtol,
+                    "maxls": config.maxls,
+                },
             )
+            s2 = time.time()
+            opt_time += s2 - s1
 
-            self.optimization_results_l12[λ] = optimization_result
-            ll = log_likelihood(
-                optimization_result.x, run_read_counts, cm_lut, coverage_params, egs
-            )
-            with np.errstate(invalid="ignore"):
-                tmp = optimization_result.x.copy()
-                tmp = tmp.reshape(num_rgrs, len(self.counted_reads))
-                # tmp = tmp / tmp.sum(axis=0)
-                tmp = tmp.max(axis=0)
-                dof = (tmp > 1e-14).sum()
+            if cb.success or optimization_result.success:
+                break
+            elif cb.rgr_indices_to_remove:
+                self.result = optimization_result.x.reshape(-1, num_runs)
+                rgrs_to_remove = set(
+                    [
+                        rgr
+                        for rgr in self.rgr_set
+                        if rgr.index in cb.rgr_indices_to_remove and rgr.type == "ORF"
+                    ]
+                )
+                self.remove_rgrs(rgrs_to_remove, runs=runs)
+            else:
+                raise RuntimeError(
+                    f"Optimization stopped unexpectedly. {optimization_result.message}"
+                )
 
-            self.read_count = sum(self.read_counts.values())
+        tmp = optimization_result.x.copy()
+        tmp = tmp.reshape(-1, num_runs)
 
-            bic = -2 * ll + np.log(self.read_count) * dof
+        result = optimization_result
+        result.x = result.x.reshape(-1, num_runs)
+        result.x[result.x <= config.pseudo_min] = 0
 
-            self.regularization_dict_l12[λ] = (
-                bic,
-                -2 * ll,
-                np.log(self.read_count) * dof,
-            )
+        self.result = result.x
 
-            self.λ_2_result_l12[λ] = optimization_result
-            tmp = optimization_result.x.copy()
-            tmp = tmp.reshape(num_rgrs, len(run_read_counts))
-            tmp[tmp <= pseudo_min] = 0
-            with np.errstate(invalid="ignore"):
-                tmp = tmp / tmp.sum(axis=0)
-                tmp[np.isnan(tmp)] = 0
-            normalized_result = tmp
-
-            self.λ_2_normal_result_l12[λ] = normalized_result
-
-        self.best_λ_l12 = min(
-            self.regularization_dict_l12, key=self.regularization_dict_l12.get
+        keep_rgr_indices = set(np.where(self.result > config.rgr_min_activity)[0])
+        keep_rgr_indices |= set(
+            [rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"]
         )
-        self.best_normal_result_l12 = self.λ_2_normal_result_l12[self.best_λ_l12]
-        self.best_result_l12 = self.λ_2_result_l12[self.best_λ_l12]
-        self.final_normalized_result = self.best_normal_result_l12
-        self.noise_rgr_indices = set()
+        rgrs_to_remove = set(
+            [rgr for rgr in self.rgr_set if rgr.index not in keep_rgr_indices]
+        )
+        self.remove_rgrs(rgrs_to_remove, runs=runs)
 
-    def deconvolve_wo_regularization(
-        self,
-        run_read_counts,
-        cm_lut,
-        egs,
-        num_rgrs,
-        rgr_lengths,
-        initial_guess,
-        ftol,
-        gtol,
-        pseudo_min=1e-14,
-    ):
-        # if num_rgrs < 100:
-        #    nb.set_num_threads(1)
-        # else:
-        #    nb.set_num_threads(16)
+        return opt_time, data_time
 
-        self.initial_guesses = []
-        self.cb_dict = {}
-        self.optimization_results = {}
-        self.regularization_dict = {}
-        self.λ_2_normal_result = {}
-        self.λ_2_result = {}
+    def deconvolve_unregularized(self, config, runs):
+        deconvolution_args = self.to_deconvolution_args(runs)
+        run_read_counts = deconvolution_args["run_read_counts"]
+        cm_lut = deconvolution_args["cleavage_model"]
+        coverage_params = deconvolution_args["coverage_model"]
+        egs = deconvolution_args["egs"]
+        num_rgrs = deconvolution_args["num_rgrs"]
+        initial_guess = deconvolution_args["initial_guess"]
+        num_runs = deconvolution_args["num_runs"]
 
-        self.best_λ = 0
+        bounds = [(config.pseudo_min, None)] * len(initial_guess)
 
-        bounds = [(pseudo_min, None)] * len(initial_guess)
+        cb = Callback(initial_guess, num_runs, config)
 
-        self.initial_guesses.append(initial_guess)
-        self.cb = Callback(num_rgrs, len(run_read_counts), initial_guess=initial_guess)
-        self.cb.args = (run_read_counts, cm_lut, egs, num_rgrs, 0)
-
-        optimization_result = minimize(
+        result = minimize(
             objective_function_wo_regularization,
             initial_guess,
             args=(
                 run_read_counts,
                 cm_lut,
+                coverage_params,
                 egs,
             ),
             method="L-BFGS-B",
             jac=True,
-            # callback=self.cb,
             bounds=bounds,
-            options={"maxiter": 10_000, "gtol": gtol, "ftol": ftol},
+            callback=cb,
+            options={"maxiter": 1000, "ftol": config.ftol, "gtol": config.gtol},
         )
 
-        ll = log_likelihood(optimization_result.x, run_read_counts, cm_lut, egs)
+        result.x = result.x.reshape(num_rgrs, len(self.counted_reads))
+        result.x[result.x <= config.pseudo_min] = 0
 
-        self.read_count = sum(self.read_counts.values())
+        self.result = result.x
 
-        del self.cb.args
+        keep_rgr_indices = set(np.where(self.result > 0)[0])
+        keep_rgr_indices |= set(
+            [rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"]
+        )
+        rgrs_to_remove = set(
+            [rgr for rgr in self.rgr_set if rgr.index not in keep_rgr_indices]
+        )
+        self.remove_rgrs(rgrs_to_remove, runs=runs)
 
-        tmp = optimization_result.x.reshape(num_rgrs, len(run_read_counts))
-        tmp[tmp <= pseudo_min] = 0
-        with np.errstate(invalid="ignore"):
-            tmp = tmp / tmp.sum(axis=0)
-            tmp[np.isnan(tmp)] = 0
-        normalized_result = tmp
+    def remove_rgrs(self, rgrs_to_remove, runs=None):
+        # rgr_set
+        old_rgr_set = self.rgr_set
+        self.rgr_set = self.rgr_set - rgrs_to_remove
 
-        self.optimization_results[0] = optimization_result
-        self.best_normal_result = normalized_result
-        self.best_result = optimization_result
+        # rgr indices
+        for c, rgr in enumerate(self.rgr_set):
+            rgr.index = c
 
-    # def deconvolve_regression(
-    #    self,
-    #    runs,
-    #    lower_λ=-2,
-    #    upper_λ=7,
-    #    number_λs=100,
-    # ):
-    #    λs = np.logspace(lower_λ, upper_λ, number_λs)
-    #
-    #    x, y, g = self.get_regression_parameters(runs)
-    #
-    #    self.r_optimization_results = {}
-    #    self.r_normal_results = {}
-    #    self.r_ll = {}
-    #    self.r_n_features = {}
-    #    self.r_bics = {}
-    #    self.r_dof = {}
-    #
-    #    for λ in λs:
-    #
-    #        grp_indices, grp_ptr = grp_converter(g, len(y))
-    #        group_sizes = np.diff(grp_ptr)
-    #        weights = np.ones(len(group_sizes))
-    #
-    #        gle = GeneralizedLinearEstimator(
-    #            datafit=QuadraticGroup(
-    #                grp_ptr=grp_ptr,
-    #                grp_indices=grp_indices,
-    #            ),
-    #            penalty=WeightedGroupL2(
-    #                alpha=λ,
-    #                weights=weights,
-    #                grp_indices=grp_indices,
-    #                grp_ptr=grp_ptr,
-    #                positive=True,
-    #            ),
-    #            solver=GroupBCD(warm_start=True),
-    #        )
-    #
-    #        try:
-    #            gle.coef_ = initial_guess
-    #        except NameError:
-    #            pass
-    #        gle.fit(x, y)
-    #        initial_guess = gle.coef_
-    #
-    #        result = gle.coef_.reshape((len(runs), -1)).T
-    #        self.r_optimization_results[λ] = result
-    #
-    #        with np.errstate(invalid="ignore"):
-    #            tmp = result / result.sum(axis=0)
-    #            tmp[np.isnan(tmp)] = 0
-    #
-    #        self.r_normal_results[λ] = tmp
-    #
-    #        ll = sum(poisson.logpmf(y, gle.predict(x)))
-    #        self.r_ll[λ] = ll
-    #
-    #        # compute BIC
-    #        n_samples = x.shape[0]
-    #        # n_features = np.sum(group_lasso.coef_ != 0)
-    #        n_features = sum(result.sum(axis=1) != 0)
-    #        dof = np.log(n_samples) * n_features
-    #        self.r_dof[λ] = dof
-    #        self.r_n_features[λ] = n_features
-    #
-    #        # bic = n_samples * ll + np.log(n_samples) * n_features
-    #        bic = -2 * ll + np.log(n_samples) * n_features
-    #        self.r_bics[λ] = bic
-    #
-    #    self.r_best_λ = min(self.r_bics, key=self.r_bics.get)
-    #    self.r_best_result = self.r_optimization_results[self.r_best_λ]
+        # rgr_intervals
+        rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
+        for step, step_set in self.rgr_intervals.steps():
+            rgr_intervals[step] = step_set & self.rgr_set
+        self.rgr_intervals = rgr_intervals
+
+        # egs
+        if hasattr(self, "egs"):
+            self.collapse_egs(runs)
+
+        # results
+        if hasattr(self, "result"):
+            index_array = np.zeros(len(self.rgr_set), dtype=int)
+            for c, rgr in enumerate(old_rgr_set):
+                if rgr in self.rgr_set:
+                    index_array[rgr.index] = c
+            self.result = self.result[index_array]
 
     def collapse_egs(
         self,
         runs,
-        min_activity_threshold=0.01,
     ):
-        self.noise_rgr_indices = set(
-            [rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"]
-        )
-        test_rgr_indices = (
-            set(np.where(self.best_normal_result > min_activity_threshold)[0])
-            - self.noise_rgr_indices
-        )
-        keep_rgr_inds = self.noise_rgr_indices | test_rgr_indices
-        self.rgr_set = set([rgr for rgr in self.rgr_set if rgr.index in keep_rgr_inds])
-
         new_egs = {}
         for run in runs:
             new_egs[run] = defaultdict(EquivalenceGroup)
@@ -1275,46 +1059,75 @@ class Locus:
                 (rgr_frame_covpos, read_length, oua) = old_eg_key
                 new_rgr_frame_covpos = set()
                 for rgr, frame, covpos in rgr_frame_covpos:
-                    if rgr.index in keep_rgr_inds:
+                    if rgr in self.rgr_set:
                         new_rgr_frame_covpos.add((rgr, frame, covpos))
                 new_rgr_frame_covpos = frozenset(new_rgr_frame_covpos)
                 new_eg_key = (new_rgr_frame_covpos, read_length, oua)
 
-                # try:
                 new_eg = new_egs[run][new_eg_key]
                 old_eg = self.egs[run][old_eg_key]
-                # new_egs[run][new_eg_key].length += self.egs[run][old_eg_key].length
+
                 new_eg.length += old_eg.length
-                # new_egs[run][new_eg_key].read_count += self.egs[run][
-                #    old_eg_key
-                # ].read_count
+
                 new_eg.read_count += old_eg.read_count
                 new_eg.reads |= old_eg.reads
 
-                # except KeyError:
-                #    new_egs[run][new_eg_key] = EquivalenceGroup(
-                #        self.egs[run][old_eg_key].length,
-                #        self.egs[run][old_eg_key].read_count,
-                #    )
-
         self.egs = new_egs
-        for c, rgr in enumerate(self.rgr_set):
-            rgr.index = c
 
     def likelihood_ratio_filtering(
         self,
-        run_read_counts,
-        cm_lut,
-        cov_params,
-        egs,
-        num_rgrs,
-        rgr_lengths,
-        initial_guess,
-        ftol=1e-6,
-        gtol=1e-6,
-        pseudo_min=1e-14,
-        α=1e-5,
+        config,
+        runs,
     ):
+        deconvolution_args = self.to_deconvolution_args(runs)
+
+        cm_lut = deconvolution_args["cleavage_model"]
+        coverage_params = deconvolution_args["coverage_model"]
+        egs = deconvolution_args["egs"]
+        num_rgrs = deconvolution_args["num_rgrs"]
+        initial_guess = deconvolution_args["initial_guess"]
+        num_runs = deconvolution_args["num_runs"]
+
+        def run_likelihood_optimization(initial_guess, bounds, optim_args):
+            num_runs, cm_lut, cov_params, egs, ftol, gtol = optim_args
+
+            cb = Callback(initial_guess, num_runs, config)
+            optimization_result = minimize(
+                objective_function_wo_regularization,
+                initial_guess,
+                args=(
+                    num_runs,
+                    cm_lut,
+                    cov_params,
+                    egs,
+                ),
+                method="L-BFGS-B",
+                jac=True,
+                bounds=bounds,
+                callback=cb,
+                options={
+                    "maxiter": 10_000,
+                    "ftol": ftol,
+                    "gtol": gtol,
+                    "maxls": config.maxls,
+                },
+            )
+            if cb.success:
+                optimization_result.success = True
+            if not optimization_result.success:
+                print(optimization_result.message)
+                raise RuntimeError(
+                    f"Likelihood ratio filtering failed to converge. {optimization_result.message}"
+                )
+
+            ll = log_likelihood(
+                optimization_result.x,
+                num_runs,
+                cm_lut,
+                cov_params,
+                egs,
+            )
+            return optimization_result, ll
 
         noise_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"}
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
@@ -1325,42 +1138,32 @@ class Locus:
         shape = initial_guess.reshape(num_rgrs, -1).shape
 
         t = np.empty((), dtype=object)
-        t[()] = (pseudo_min, None)
+        t[()] = (config.pseudo_min, None)
         bounds = list(np.full(initial_guess.shape, t))
 
-        optimization_result = minimize(
-            objective_function,
-            initial_guess,
-            args=(
-                run_read_counts,
-                cm_lut,
-                cov_params,
-                egs,
-                num_rgrs,
-                1,
-            ),
-            method="L-BFGS-B",
-            jac=True,
-            bounds=bounds,
-            options={"maxiter": 10_000, "ftol": ftol, "gtol": gtol},
+        optim_args = (
+            num_runs,
+            cm_lut,
+            coverage_params,
+            egs,
+            config.ftol,
+            config.gtol,
         )
+
+        optimization_result, log_likelihood_all = run_likelihood_optimization(
+            initial_guess, bounds, optim_args
+        )
+
+        opt_up_to_date = True
 
         self.final_result = optimization_result
 
         initial_guess = optimization_result.x
 
-        log_likelihood_all = log_likelihood(
-            optimization_result.x,
-            run_read_counts,
-            cm_lut,
-            cov_params,
-            egs,
-        )
-
         rgr_ind_list = list(test_rgr_indices)
         try:
             # sort by activity
-            act_sum = self.best_normal_result[np.array(rgr_ind_list)].sum(axis=1)
+            act_sum = self.result[np.array(rgr_ind_list)].sum(axis=1)
             rgr_ind_list = np.array(rgr_ind_list)[np.argsort(act_sum)]
         except IndexError:
             rgr_ind_list = []
@@ -1368,136 +1171,310 @@ class Locus:
         for rgr_ind in rgr_ind_list:
             free_rgr_ind = keep_rgr_indices - {rgr_ind}
             initial_guess_int = initial_guess.copy().reshape(num_rgrs, -1)
-            initial_guess_int[rgr_ind] = pseudo_min
+
+            initial_guess_int[rgr_ind] = config.pseudo_min
             initial_guess_int = initial_guess_int.flatten()
 
-            t = np.empty((), dtype=object)
-            t[()] = (pseudo_min, pseudo_min)
-            bounds = np.full(shape, t)
-            t[()] = (pseudo_min, None)
-            for index in free_rgr_ind:
-                bounds[index] = t
-            bounds = list(bounds.flatten())
-
-            optimization_result_int = minimize(
-                objective_function,
-                initial_guess_int,
-                args=(
-                    run_read_counts,
-                    cm_lut,
-                    cov_params,
-                    egs,
-                    num_rgrs,
-                    1,
-                ),
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                options={"maxiter": 10_000, "ftol": ftol, "gtol": gtol},
-            )
+            # test if removing the does not significantly decrease the likelihood even without optimization
             log_likelihood_int = log_likelihood(
-                optimization_result_int.x,
-                run_read_counts,
+                initial_guess_int,
+                num_runs,
                 cm_lut,
-                cov_params,
+                coverage_params,
                 egs,
             )
 
             log_p = wilks_test_p(
                 log_likelihood_all,
                 log_likelihood_int,
-                df_diff=len(run_read_counts),  # number of datasets
+                df_diff=num_runs,
             )
+
             self.rgr_dict[rgr_ind].log_p_value = log_p
-            if log_p > np.log(α):
+            if log_p > np.log(config.likelihood_ratio_alpha):
                 # remove rgr
                 keep_rgr_indices.remove(rgr_ind)
-                initial_guess = optimization_result_int.x
+                initial_guess = initial_guess_int
                 log_likelihood_all = log_likelihood_int
-                self.final_result = optimization_result_int
+                opt_up_to_date = False
+                continue
 
-        tmp = self.final_result.x.reshape(num_rgrs, len(run_read_counts))
-        tmp[tmp <= pseudo_min] = 0
+            else:
+                if not opt_up_to_date:
+                    t = np.empty((), dtype=object)
+                    t[()] = (config.pseudo_min, config.pseudo_min)
+                    bounds = np.full(shape, t)
+                    t[()] = (config.pseudo_min, None)
+                    for index in keep_rgr_indices:
+                        bounds[index] = t
+                    bounds = list(bounds.flatten())
+                    optimization_result, log_likelihood_all = (
+                        run_likelihood_optimization(initial_guess, bounds, optim_args)
+                    )
+                    opt_up_to_date = True
+                    self.final_result = optimization_result
+
+                t = np.empty((), dtype=object)
+                t[()] = (config.pseudo_min, config.pseudo_min)
+                bounds = np.full(shape, t)
+                t[()] = (config.pseudo_min, None)
+                for index in free_rgr_ind:
+                    bounds[index] = t
+                bounds = list(bounds.flatten())
+
+                optimization_result_int, log_likelihood_int = (
+                    run_likelihood_optimization(initial_guess_int, bounds, optim_args)
+                )
+
+                log_p = wilks_test_p(
+                    log_likelihood_all,
+                    log_likelihood_int,
+                    df_diff=num_runs,
+                )
+
+                self.rgr_dict[rgr_ind].log_p_value = log_p
+                if log_p > np.log(config.likelihood_ratio_alpha):
+                    keep_rgr_indices.remove(rgr_ind)
+                    initial_guess = optimization_result_int.x
+                    log_likelihood_all = log_likelihood_int
+                    self.final_result = optimization_result_int
+
+        tmp = self.final_result.x.reshape(num_rgrs, num_runs)
+        tmp[tmp <= config.pseudo_min] = 0
+        self.result = tmp
         with np.errstate(invalid="ignore"):
             tmp = tmp / tmp.sum(axis=0)
             tmp[np.isnan(tmp)] = 0
-        self.final_normalized_result = tmp
-        self.keep_rgr_inds = keep_rgr_indices
 
-    def result_matrix(self):
-        return self.best_result.x.reshape(len(self.rgr_set), -1)
+        rgrs_to_remove = set()
+        for rgr in self.rgr_set:
+            if rgr.index not in keep_rgr_indices and rgr.type != "NOISE":
+                rgrs_to_remove.add(rgr)
 
-    def compute_rpkm(self, runs):
-        # make dataframe
-        temp = {rgr.index: rgr for rgr in self.rgr_set}
-        rgr_ids = [temp[i].id for i in range(len(temp))]
-        run_ids = [run.id for run in runs]
+        self.remove_rgrs(rgrs_to_remove, runs=runs)
 
-        try:
-            self.final_normalized_result
-        except AttributeError:
-            print(self.id)
+        self.runs = runs
 
-        self.result_df = pd.DataFrame(
-            self.final_normalized_result, index=rgr_ids, columns=run_ids
+    def likelihood_ratio_filtering_new(
+        self,
+        config,
+        runs,
+    ):
+        deconvolution_args = self.to_deconvolution_args(runs)
+
+        # iterate all test_rgrs and compute likelihoods without optimization
+        noise_rgrs = {rgr for rgr in self.rgr_set if rgr.type == "NOISE"}
+        test_rgrs = {rgr for rgr in self.rgr_set if rgr.type == "ORF"}
+
+        t = np.empty((), dtype=object)
+        t[()] = (config.pseudo_min, None)
+
+        bounds = list(
+            np.full(
+                (deconvolution_args["num_rgrs"] * deconvolution_args["num_runs"]), t
+            )
         )
-        self.result_df["mean"] = self.result_df.mean(axis=1)
-        d = self.result_df.mean(axis=1).to_dict()
-        for rgr in self.rgr_set:
-            if rgr.id in d:
-                rgr.mean_activity = d[rgr.id]
-        self.result_df.sort_values(by="mean", inplace=True, ascending=False)
-        self.result_df.drop("mean", axis=1, inplace=True)
-        self.result_df = self.result_df[self.result_df.sum(axis=1) > 0]
 
-        s = set(self.result_df.index)
-        self.rgr_dict = {}
-        for rgr in self.rgr_set:
-            if rgr.id in s:
-                self.rgr_dict[rgr.id] = rgr
-        self.rgr_set = {rgr for rgr in self.rgr_set if rgr.id in s}
-        for c, rgr in enumerate(self.rgr_set):
-            rgr.index = c
+        optimization_result, log_likelihood_all = run_likelihood_optimization(
+            deconvolution_args["initial_guess"],
+            bounds,
+            deconvolution_args["num_runs"],
+            deconvolution_args["cleavage_model"],
+            deconvolution_args["coverage_model"],
+            deconvolution_args["egs"],
+            config,
+        )
 
-        read_counts = {}
-        rpkm_dict = {}
-        for rgr in self.rgr_dict.values():
-            read_counts[rgr.id] = {}
-            rpkm_dict[rgr.id] = {}
-        for run in runs:
-            s = sum(
+        rgrs_to_remove = set()
+        for rgr in test_rgrs:
+            initial_guess_int = (
+                deconvolution_args["initial_guess"]
+                .copy()
+                .reshape(-1, deconvolution_args["num_runs"])
+            )
+            initial_guess_int[rgr.index] = config.pseudo_min
+            initial_guess_int = initial_guess_int.flatten()
+
+            log_likelihood_int = log_likelihood(
+                initial_guess_int,
+                deconvolution_args["num_runs"],
+                deconvolution_args["cleavage_model"],
+                deconvolution_args["coverage_model"],
+                deconvolution_args["egs"],
+            )
+
+            log_p = wilks_test_p(
+                log_likelihood_all,
+                log_likelihood_int,
+                df_diff=deconvolution_args["num_runs"],
+            )
+
+            if log_p > np.log(config.likelihood_ratio_alpha):
+                rgrs_to_remove.add(rgr)
+        print(f"tested {len(test_rgrs)} rgrs")
+
+        if rgrs_to_remove:
+            self.remove_rgrs(rgrs_to_remove, runs=runs)
+            print(f"removed {len(rgrs_to_remove)} rgrs")
+
+            deconvolution_args = self.to_deconvolution_args(runs)
+
+            noise_rgrs = {rgr for rgr in self.rgr_set if rgr.type == "NOISE"}
+            test_rgrs = {rgr for rgr in self.rgr_set if rgr.type == "ORF"}
+
+            # self.rgr_dict = {rgr.index: rgr for rgr in self.rgr_set}
+
+            t = np.empty((), dtype=object)
+            t[()] = (config.pseudo_min, None)
+            bounds = list(
+                np.full(
+                    deconvolution_args["num_rgrs"] * deconvolution_args["num_runs"], t
+                )
+            )
+
+            optimization_result, log_likelihood_all = run_likelihood_optimization(
+                deconvolution_args["initial_guess"],
+                bounds,
+                deconvolution_args["num_runs"],
+                deconvolution_args["cleavage_model"],
+                deconvolution_args["coverage_model"],
+                deconvolution_args["egs"],
+                config,
+            )
+
+        self.final_result = optimization_result
+        self.result = optimization_result.x.reshape(
+            deconvolution_args["num_rgrs"], deconvolution_args["num_runs"]
+        )
+        # sort rgrs by summed activity
+        act_sum = self.result.sum(axis=1)
+        rgr_list = [rgr for rgr in self.rgr_set]
+        order = np.argsort(act_sum)
+        rgr_list = [rgr_list[i] for i in order]
+        free_rgrs = set(rgr_list)
+        rgrs_to_remove = set()
+
+        for test_rgr in rgr_list:
+            if test_rgr in noise_rgrs:
+                continue
+            initial_guess_int = (
+                deconvolution_args["initial_guess"]
+                .copy()
+                .reshape(-1, deconvolution_args["num_runs"])
+            )
+            initial_guess_int[test_rgr.index] = config.pseudo_min
+            initial_guess_int = initial_guess_int.flatten()
+
+            t = np.empty((), dtype=object)
+            t[()] = (config.pseudo_min, config.pseudo_min)
+            bounds = np.full(
+                (deconvolution_args["num_rgrs"], deconvolution_args["num_runs"]), t
+            )
+            t[()] = (config.pseudo_min, None)
+            for rgr in free_rgrs:
+                if not rgr == test_rgr:
+                    bounds[rgr.index] = t
+            bounds = list(bounds.flatten())
+            optimization_result_int, log_likelihood_all_int = (
+                run_likelihood_optimization(
+                    initial_guess_int,
+                    bounds,
+                    deconvolution_args["num_runs"],
+                    deconvolution_args["cleavage_model"],
+                    deconvolution_args["coverage_model"],
+                    deconvolution_args["egs"],
+                    config,
+                )
+            )
+            log_p = wilks_test_p(
+                log_likelihood_all,
+                log_likelihood_all_int,
+                df_diff=deconvolution_args["num_runs"],
+            )
+
+            if log_p > np.log(config.likelihood_ratio_alpha):
+                free_rgrs.remove(test_rgr)
+                rgrs_to_remove.add(test_rgr)
+                deconvolution_args["initial_guess"] = optimization_result_int.x
+                log_likelihood_all = log_likelihood_all_int
+                self.final_result = optimization_result_int
+
+        tmp = self.final_result.x.reshape(
+            deconvolution_args["num_rgrs"], deconvolution_args["num_runs"]
+        )
+        tmp[tmp <= config.pseudo_min] = 0
+        self.result = tmp
+        with np.errstate(invalid="ignore"):
+            tmp = tmp / tmp.sum(axis=0)
+            tmp[np.isnan(tmp)] = 0
+
+        self.remove_rgrs(rgrs_to_remove, runs=runs)
+
+    def estimate_activities(self, runs, config):
+        rgrs_removed = True
+        while rgrs_removed:
+            deconvolution_args = self.to_deconvolution_args(runs)
+
+            num_runs = deconvolution_args["num_runs"]
+            cm_lut = deconvolution_args["cleavage_model"]
+            coverage_params = deconvolution_args["coverage_model"]
+            egs = deconvolution_args["egs"]
+            num_rgrs = deconvolution_args["num_rgrs"]
+            initial_guess = deconvolution_args["initial_guess"]
+
+            bounds = [(config.pseudo_min, None)] * len(initial_guess)
+
+            cb = Callback(initial_guess, num_runs, config)
+            optimization_result = minimize(
+                objective_function_wo_regularization,
+                initial_guess,
+                args=(
+                    num_runs,
+                    cm_lut,
+                    coverage_params,
+                    egs,
+                ),
+                method="L-BFGS-B",
+                jac=True,
+                bounds=bounds,
+                callback=cb,
+                options={
+                    "maxiter": 10_000,
+                    "gtol": config.gtol,
+                    "ftol": config.ftol,
+                    "maxls": config.maxls,
+                },
+            )
+            if cb.success:
+                optimization_result.success = True
+            if not optimization_result.success:
+                raise RuntimeError(f"Activity estimation failed to converge.")
+
+            tmp = optimization_result.x.copy()
+            tmp = tmp.reshape(num_rgrs, num_runs)
+            tmp[tmp <= config.pseudo_min] = 0
+            self.result = tmp
+
+            # rgr_indices_to_remove = set(np.where(self.result.sum(axis=1) == 0)[0])
+            rgr_indices_to_remove = set(
+                np.where(np.all(self.result < config.rgr_min_activity, axis=1))[0]
+            )
+            rgrs_to_remove = set(
                 [
-                    rgr.effective_length() * self.result_df[run.id][rgr.id]
-                    for rgr in self.rgr_dict.values()
+                    rgr
+                    for rgr in self.rgr_set
+                    if rgr.index in rgr_indices_to_remove and rgr.type == "ORF"
                 ]
             )
-            for rgr in self.rgr_dict.values():
-                if s == 0:
-                    read_counts[rgr.id][run.id] = 0
-                else:
-                    try:
-                        rc = self.read_counts[run]
-                    except KeyError:
-                        rc = 0
-                    read_counts[rgr.id][run.id] = (
-                        rgr.effective_length()
-                        * self.result_df[run.id][rgr.id]
-                        / s
-                        # * run.read_count
-                        * rc
-                        # * self.read_counts[run]
-                    )
-                rpkm_dict[rgr.id][run.id] = (
-                    read_counts[rgr.id][run.id] / (run.read_count / 1e6)
-                ) / rgr.effective_length()
-        for rgr in self.rgr_dict.values():
-            d = rpkm_dict[rgr.id]
-            s = sum(d.values())
-            m = s / len(d)
-            rgr.mean_rpkm = m
-        self.rpkm_df = pd.DataFrame(rpkm_dict).T
+            if rgrs_to_remove:
+                self.remove_rgrs(rgrs_to_remove, runs=runs)
+            else:
+                rgrs_removed = False
 
-    # def egs_tsv_string(self):
+        run_ids = [run.id for run in runs]
+        temp = {rgr.index: rgr for rgr in self.rgr_set}
+        rgr_ids = [temp[i].id for i in range(len(temp))]
+        self.result_df = pd.DataFrame(self.result, index=rgr_ids, columns=run_ids)
 
 
 # reject null if true
@@ -1515,7 +1492,6 @@ def wilks_test_p(log_likelihood_full, log_likelihood_reduced, df_diff=1) -> floa
 @jit(nopython=True, cache=True, parallel=False)
 def filter_objective_numba(x, eg_lengths, eg_read_counts, eg_rgr_ids):
 
-    Σ_rc = sum(eg_read_counts)
     loss = 0
     grads = np.zeros_like(x)
 
@@ -1524,9 +1500,9 @@ def filter_objective_numba(x, eg_lengths, eg_read_counts, eg_rgr_ids):
         δ_derived = np.zeros_like(x)
         for rgr_id in eg_rgrs:
             activity += x[rgr_id]
-            δ_derived[rgr_id] += Σ_rc * eg_len
+            δ_derived[rgr_id] += eg_len
 
-        δ = Σ_rc * eg_len * activity
+        δ = eg_len * activity
         y = eg_rc
 
         if y == 0 and δ == 0:
@@ -1563,79 +1539,52 @@ def find_orfs(
 
 
 class Callback:
-    def __init__(
-        self,
-        num_rgrs,
-        num_runs,
-        initial_guess,
-        pseudo_min=1e-14,
-        rel_thr=0.001,
-        abs_thr=0.001,
-    ):
-        self.num_rgrs = num_rgrs
-        self.num_runs = num_runs
-        self.pseudo_min = pseudo_min
-        self.rel_thr = rel_thr
-        self.abs_thr = abs_thr
+    def __init__(self, initial_guess, number_samples, config, remove_rgrs=False):
+        self.config = config
+        self.previous = initial_guess
+        self.initial_guess = initial_guess
+        self.success = False
+        self.number_samples = number_samples
+        self.rgr_indices_to_remove = set()
+        self.remove_rgrs = remove_rgrs
 
-        tmp = initial_guess.reshape(self.num_rgrs, self.num_runs)
-        tmp[tmp <= self.pseudo_min] = 0
-        with np.errstate(invalid="ignore"):
-            tmp = tmp / tmp.sum(axis=0)
-            tmp[np.isnan(tmp)] = 0
-        normalized_result = tmp
+    def __call__(self, new):
+        tmp = self.previous / new
+        if not np.any(
+            (
+                (
+                    ((1 - self.config.stop_factor_relative) > tmp)
+                    | (tmp > (1 + self.config.stop_factor_relative))
+                )
+                & (new > self.config.rgr_min_activity)
+            )
+        ):
+            self.success = True
+            raise StopIteration
+        else:
+            self.previous = new
 
-        self.intermediate_normalized_results = [normalized_result]
-        # self.ll = []
+        if self.remove_rgrs:
+            x = new.reshape((-1, self.number_samples))
+            self.rgr_indices_to_remove = set(
+                np.where(np.all(x < self.config.rgr_min_activity, axis=1))[0]
+            )
 
-    def __call__(self, x):
-        tmp = x.reshape(self.num_rgrs, self.num_runs)
-        # self.ll.append(objective_function(x, *self.args)[0])
-
-        tmp[tmp <= self.pseudo_min] = 0
-        with np.errstate(invalid="ignore"):
-            tmp = tmp / tmp.sum(axis=0)
-            tmp[np.isnan(tmp)] = 0
-
-        self.intermediate_normalized_results.append(tmp)
-
-        l = 5
-        if len(self.intermediate_normalized_results) > l:
-            if cb_stop(
-                np.array(self.intermediate_normalized_results[-l:]),
-                self.rel_thr,
-                self.abs_thr,
+            if x.shape[0] * self.config.rgrs_to_remove_fraction < len(
+                self.rgr_indices_to_remove
             ):
+                self.initial_guess = x[
+                    np.where(np.any(x >= self.config.rgr_min_activity, axis=1))[0]
+                ].flatten()
                 raise StopIteration
-
-            # tmp = np.array(self.ll[-l:])
-            # if np.abs(((tmp[0 : l - 1] - tmp[1:l]) / tmp[1:l])).mean() < 0.001:
-            #    raise StopIteration
-
-
-@jit(nopython=True, cache=True, parallel=False)
-def cb_stop(x, rel_thr, abs_thr):
-    relative_activity_change = 0
-    max_absolute_activity_change = 0
-    for i in range(-len(x) + 1, 0):
-        relative_activity_change += (
-            np.exp(np.abs(np.log(x[i - 1].sum() / x[i].sum()))) - 1
-        )
-        max_absolute_activity_change += np.max(
-            np.abs(x[i - 1] / x[i - 1].sum(axis=0) - (x[i] / x[i].sum(axis=0)))
-        )
-    if relative_activity_change < rel_thr and max_absolute_activity_change < abs_thr:
-        return True
-    else:
-        return False
 
 
 # compute the negative log likelihood + a penalty term
 # and the gradient with respect to each activity parameter
-@jit(nopython=True, parallel=False, cache=True)
+@jit(nopython=True, cache=True, parallel=False)
 def objective_function(
     x,
-    run_read_counts,
+    num_runs,
     cm_lut,
     coverage_params,
     egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
@@ -1643,7 +1592,7 @@ def objective_function(
     λ: float,
 ) -> float:
 
-    num_runs = len(run_read_counts)
+    # num_runs = len(run_read_counts)
 
     loss = 0
     grads = np.zeros_like(x)
@@ -1663,8 +1612,8 @@ def objective_function(
                     * coverage_params[run_index, cov_pos]
                 )
 
-            δ = run_read_counts[run_index] * eg[0] * activity
-            δ_derived *= run_read_counts[run_index] * eg[0]
+            δ = eg[0] * activity
+            δ_derived *= eg[0]
 
             y = eg[1]
 
@@ -1689,18 +1638,16 @@ def objective_function(
     return loss + λ * penalty, grads
 
 
-@jit(nopython=True, parallel=False, cache=True)
-def objective_function_experimental(
+# compute the negative log likelihood
+# and the gradient regarding each activity parameter
+@jit(nopython=True, cache=True, parallel=False)
+def objective_function_wo_regularization(
     x,
-    run_read_counts,
+    num_runs,
     cm_lut,
     coverage_params,
     egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
-    num_rgrs,
-    λ: float,
 ) -> float:
-
-    num_runs = len(run_read_counts)
 
     loss = 0
     grads = np.zeros_like(x)
@@ -1720,68 +1667,12 @@ def objective_function_experimental(
                     * coverage_params[run_index, cov_pos]
                 )
 
-            δ = run_read_counts[run_index] * eg[0] * activity
-            δ_derived *= run_read_counts[run_index] * eg[0]
+            δ = eg[0] * activity
+            δ_derived *= eg[0]
 
             y = eg[1]
 
             if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-            grads += -y * δ_derived / δ + δ_derived
-
-    penalty = 0
-    for rgr_index in range(num_rgrs):
-        s = 0
-        for run_index in range(num_runs):
-            s += x[rgr_index * num_runs + run_index] ** 2
-
-        penalty += s**0.25
-        for run_index in range(num_runs):
-            grads[rgr_index * num_runs + run_index] += (
-                λ * x[rgr_index * num_runs + run_index] / (2 * s**0.75)
-            )
-
-    return loss + λ * penalty, grads
-
-
-# compute the negative log likelihood
-# and the gradient regarding each activity parameter
-@jit(nopython=True, parallel=False, cache=True)
-def objective_function_wo_regularization(
-    x,
-    run_read_counts,
-    cm_lut,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame
-) -> float:
-
-    num_runs = len(run_read_counts)
-
-    loss = 0
-    grads = np.zeros_like(x)
-
-    for run_index in range(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-            δ_derived = np.zeros_like(x)
-            for rgr_index, frame in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                )
-                δ_derived[rgr_index * num_runs + run_index] += cm_lut[
-                    run_index, eg[2], frame, eg[3]
-                ]
-
-            δ = run_read_counts[run_index] * eg[0] * activity
-            δ_derived *= run_read_counts[run_index] * eg[0]
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                # print("δ == 0")
-                # print(run_read_counts[run_index])
                 continue
 
             loss += δ - y * np.log(δ)
@@ -1795,13 +1686,11 @@ def objective_function_wo_regularization(
 @jit(nopython=True, cache=True, parallel=False)
 def log_likelihood(
     x,
-    run_read_counts,
+    num_runs,
     cm_lut,
     coverage_params,
     egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
 ) -> float:
-
-    num_runs = len(run_read_counts)
 
     ll = 0
 
@@ -1816,7 +1705,7 @@ def log_likelihood(
                     * coverage_params[run_index, covpos]
                 )
 
-            δ = run_read_counts[run_index] * eg[0] * activity
+            δ = eg[0] * activity
 
             y = eg[1]
             if y == 0 and δ == 0:
@@ -1828,52 +1717,91 @@ def log_likelihood(
     return ll
 
 
-@jit(nopython=True, cache=True, parallel=False)
-def run_orf_deconvolution_em_numba(
-    cm_lut: np.ndarray,
+# this was an experiment to remove rgrs in numba data
+# it is not really faster than the python version
+# def remove_rgrs(
+#    rgr_indices_to_remove: set[int],
+#    initial_guess: np.ndarray,
+#    runs_egs: List,
+#    num_rgrs: int,
+#    num_runs: int,
+# ):
+#
+#    initial_guess = initial_guess.reshape(-1, num_runs)
+#    initial_guess = np.delete(initial_guess, list(rgr_indices_to_remove), axis=0)
+#    initial_guess = initial_guess.flatten()
+#
+#    num_rgrs -= len(rgr_indices_to_remove)
+#
+#    new_runs_egs = List()
+#
+#    for run_egs in runs_egs:
+#        new_egs = {}
+#        for eg in run_egs:
+#            s = []
+#            for rgr, frame, covpos in eg[4]:
+#                if rgr in rgr_indices_to_remove:
+#                    continue
+#                s.append((rgr, frame, covpos))
+#            if not s:
+#                continue
+#            s = frozenset(s)
+#            if (s, eg[2], eg[3]) not in new_egs:
+#                new_egs[(s, eg[2], eg[3])] = [eg[0], eg[1], eg[2], eg[3], List(s)]
+#            else:
+#                new_egs[(s, eg[2], eg[3])][0] += eg[0]
+#                new_egs[(s, eg[2], eg[3])][1] += eg[1]
+#
+#        new_runs_egs.append(List([tuple(x) for x in new_egs.values()]))
+#
+#    return {
+#        "initial_guess": initial_guess,
+#        "egs": new_runs_egs,
+#        "num_rgrs": num_rgrs,
+#    }
+
+
+def run_likelihood_optimization(
+    initial_guess,
+    bounds,
+    num_runs,
+    cm_lut,
+    cov_params,
     egs,
-    rgr_lengths: np.ndarray,
-    num_rgrs: int,
-    iterations: int,
-    activity_change_cutoff: float,
-) -> None:
+    config,
+):
 
-    activities = np.full(num_rgrs, 1 / num_rgrs)
+    cb = Callback(initial_guess, num_runs, config)
+    optimization_result = minimize(
+        objective_function_wo_regularization,
+        initial_guess,
+        args=(
+            num_runs,
+            cm_lut,
+            cov_params,
+            egs,
+        ),
+        method="L-BFGS-B",
+        jac=True,
+        bounds=bounds,
+        callback=cb,
+        options={
+            "maxiter": 10_000,
+            "ftol": config.ftol,
+            "gtol": config.gtol,
+            "maxls": config.maxls,
+        },
+    )
+    if cb.success:
+        optimization_result.success = True
+    if not optimization_result.success:
+        raise RuntimeError(f"Likelihood ratio filtering failed to converge")
 
-    num_egs = len(egs)
-
-    for i in range(iterations):
-        rgr_read_counts = np.zeros(num_rgrs)
-        # E-step
-        for eg_index in range(num_egs):
-            read_count = egs[eg_index][1]
-            likelihoods = np.empty(len(egs[eg_index][4]))
-            for j, (rgr_index, frame) in enumerate(egs[eg_index][4]):
-                likelihoods[j] = (
-                    activities[rgr_index]
-                    * cm_lut[egs[eg_index][2], frame, egs[eg_index][3]]
-                )
-            likelihood_sum = likelihoods.sum()
-            if likelihood_sum > 0:
-                p = likelihoods / likelihood_sum
-            else:
-                p = np.full(len(likelihoods), 1 / len(egs[eg_index][4]))
-            for j, (rgr_index, frame) in enumerate(egs[eg_index][4]):
-                rgr_read_counts[rgr_index] += read_count * p[j]
-
-        # M-step
-        new_activities = np.zeros(num_rgrs)
-        for rgr_index in range(num_rgrs):
-            new_activities[rgr_index] = (
-                rgr_read_counts[rgr_index] / rgr_lengths[rgr_index]
-            )
-        new_activities /= new_activities.sum()
-
-        if i > 1:
-            activity_change = sum(np.abs(new_activities - activities))
-            if activity_change < activity_change_cutoff:
-                break
-
-        activities = new_activities
-
-    return activities
+    ll = log_likelihood(
+        optimization_result.x,
+        num_runs,
+        cm_lut,
+        cov_params,
+        egs,
+    )
+    return optimization_result, ll

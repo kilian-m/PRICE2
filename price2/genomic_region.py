@@ -67,7 +67,10 @@ class GenomicRegion:
         # except AttributeError:
         #    self.length = sum([x.end - x.start for x in self.intervals])
         #    return self.length
-        return sum([x.end - x.start for x in self.intervals])
+        if self.length == 0:
+            self.length = sum([x.end - x.start for x in self.intervals])
+        return self.length
+        # return sum([x.end - x.start for x in self.intervals])
 
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
         self.intervals.append(interval)

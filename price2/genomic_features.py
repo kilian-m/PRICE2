@@ -88,6 +88,27 @@ class Transcript:
             )
             self.orf_intervals[iv.start % 3][iv] += orf
 
+        self.rgr_intervals = (
+            HTSeq.GenomicArrayOfSets("auto", stranded=False),
+            HTSeq.GenomicArrayOfSets("auto", stranded=False),
+            HTSeq.GenomicArrayOfSets("auto", stranded=False),
+        )
+        for rgr in self.rgr_set:
+            if rgr.type == "ORF":
+                iv = GenomicInterval(
+                    ".", rgr.iv_on_transcript[0], rgr.iv_on_transcript[1], "."
+                )
+                self.rgr_intervals[iv.start % 3][iv] += rgr
+            else:
+                iv = GenomicInterval(
+                    ".",
+                    rgr.iv_on_transcript[0],
+                    rgr.iv_on_transcript[1],
+                    ".",
+                )
+                for i in range(3):
+                    self.rgr_intervals[i][iv] += rgr
+
 
 class ReadGeneratingRegion:
     type: str  # ORF or NOISE
@@ -149,10 +170,11 @@ class ReadGeneratingRegion:
     def effective_length(
         self, upstream_cleavage: int = 12, downstream_cleavage: int = 17
     ) -> int:
-        return (
+        return max(
+            0,
             len(self.genomic_region)
             - max(0, upstream_cleavage - self.dist_to_transcript_start)
-            - max(0, downstream_cleavage - self.dist_to_transcript_end)
+            - max(0, downstream_cleavage - self.dist_to_transcript_end),
         )
 
     def to_gtf(self, loc_id: str) -> str:

@@ -10,36 +10,41 @@ from pickle import loads, dumps
 import zlib
 from filelock import FileLock
 
-from multiprocessing import Pool
+# import multiprocessing
+# from multiprocessing import Pool
 
 from price2.locus import Locus
 from price2.ribo_seq_alignment import RiboSeqAlignment
+from price2.equivalence_groups import make_equivalence_groups
 
 from tqdm import tqdm
 
 import time
+
+from pebble import ProcessPool
+from concurrent.futures import TimeoutError
 
 
 class ORFActivityEstimator:
 
     def __init__(self, config):
         self.config = config
-        self.db_path = f"{config['w_dir']}/price.db"
+        self.db_path = f"{config.w_dir}/price.db"
 
         db = sql.connect(self.db_path)
         cur = db.cursor()
 
         cur.execute("SELECT locus_id FROM loci")
         self.loci_ids = [id for id, in cur.fetchall()]
-        if config["loci_subset"] > 0:
-            self.loci_ids = self.loci_ids[: config["loci_subset"]]
+        if config.loci_subset > 0:
+            self.loci_ids = self.loci_ids[: config.loci_subset]
 
     def run_orf_deconvolution(self):
 
         self.loci = {}
         loci_ids = set(self.loci_ids)
 
-        performance_measurements = []
+        performance_measurements = {}
 
         db = sql.connect(self.db_path)
         cur = db.cursor()
@@ -47,67 +52,27 @@ class ORFActivityEstimator:
         run_ids = [id for id, in cur.fetchall()]
         db.close()
 
-        if not os.path.exists(f"{self.config['o_dir']}/results.tsv"):
-            lock = FileLock(f"{self.config['o_dir']}/results.tsv.lock")
+        if not os.path.exists(f"{self.config.o_dir}/results.tsv"):
+            lock = FileLock(f"{self.config.o_dir}/results.tsv.lock")
             with lock:
-                with open(f"{self.config['o_dir']}/results.tsv", "a") as f:
+                with open(f"{self.config.o_dir}/results.tsv", "a") as f:
                     f.write("orf_id\t")
                     f.write("\t".join(run_ids))
                     f.write("\n")
-            lock = FileLock(f"{self.config['o_dir']}/rpkm.tsv.lock")
-            with lock:
-                with open(f"{self.config['o_dir']}/rpkm.tsv", "a") as f:
-                    f.write("orf_id\t")
-                    f.write("\t".join(run_ids))
-                    f.write("\n")
-        if not os.path.exists(f"{self.config['o_dir']}/performance_measurements.tsv"):
-            lock = FileLock(f"{self.config['o_dir']}/performance_measurements.tsv.lock")
-            with lock:
-                with open(
-                    f"{self.config['o_dir']}/performance_measurements.tsv", "a"
-                ) as f:
-                    f.write(
-                        "\t".join(
-                            [
-                                "loc_id",
-                                "exon_length",
-                                "read_count",
-                                "overall_time",
-                                "db_time",
-                                "load_reads_time",
-                                "proc_reads_time",
-                                "filter_time",
-                                "eg_time",
-                                "proc_reads_2_time",
-                                "prep_data_time",
-                                "opt_time",
-                                "likelihood_ratio_time",
-                                "unfiltered_rgr_count",
-                                "filtered_coverage_rgr_count",
-                                "filtered_optimization_rgr_count",
-                                "filtered_lrt_rgr_count",
-                                "λ",
-                                "num_transcripts",
-                                "gene_number",
-                                "transcripts_number",
-                                "initial_iterations",
-                                "all_iterations",
-                            ]
-                        )
-                    )
-                    f.write("\n")
-        else:
 
+        if os.path.exists(f"{self.config.o_dir}/performance_measurements.tsv"):
             processed_loc_ids = set(
                 pd.read_csv(
-                    f"{self.config['o_dir']}/performance_measurements.tsv",
+                    f"{self.config.o_dir}/performance_measurements.tsv",
                     sep="\t",
                 )["loc_id"]
             )
             loci_ids = loci_ids - processed_loc_ids
 
-        with Pool(self.config["processes"]) as pool:
-            map_iterator = pool.imap_unordered(
+        pbar = tqdm(total=len(loci_ids))
+
+        with ProcessPool(max_workers=self.config.processes) as pool:
+            future = pool.map(
                 process_loc,
                 [
                     (
@@ -116,83 +81,82 @@ class ORFActivityEstimator:
                     )
                     for locus_id in loci_ids
                 ],
+                timeout=self.config.timeout,
             )
 
-            for result in tqdm(map_iterator, total=len(loci_ids)):
-                loc = result[0]
-                self.loci[loc.id] = loc
-                performance_measurements.append(result[1])
+            iterator = future.result()
 
-        self.performance_df = pd.DataFrame(
-            performance_measurements,
-            columns=[
-                "loc_id",
-                "exon_length",
-                "read_count",
-                "overall_time",
-                "db_time",
-                "load_reads_time",
-                "proc_reads_time",
-                "filter_time",
-                "eg_time",
-                "proc_reads_2_time",
-                "prep_data_time",
-                "opt_time",
-                "likelihood_ratio_time",
-                "unfiltered_rgr_count",
-                "filtered_coverage_rgr_count",
-                "filtered_optimization_rgr_count",
-                "filtered_lrt_rgr_count",
-                "λ",
-                "num_transcripts",
-                "gene_number",
-                "transcripts_number",
-                "initial_iterations",
-                "all_iterations",
-            ],
-        )
+            results = []
+            while True:
+                try:
+                    result = next(iterator)
+                    results.append(result)
+                    pbar.update(1)
+                except TimeoutError as e:
+                    results.append(e)
+                    pbar.update(1)
+                except StopIteration:
+                    pbar.close()
+                    break
+                except Exception as e:
+                    results.append(e)
+                    pbar.update(1)
 
-        lock_files = glob.glob(os.path.join(self.config["o_dir"], "*.lock"))
+        self.loci = {}
+        self.failed_loci = {}
+        for loc_id, result in zip(loci_ids, results):
+            if isinstance(result, Exception):
+                self.failed_loci[loc_id] = result
+            else:
+                self.loci[loc_id] = result[0]
+                performance_measurements[loc_id] = result[1]
+
+        self.performance_df = pd.DataFrame(performance_measurements).T
+
+        lock_files = glob.glob(os.path.join(self.config.o_dir, "*.lock"))
         for lock_file in lock_files:
             os.remove(lock_file)
 
 
 def process_loc(arguments):
-
-    t_start = time.time()  # performance measurement
-
-    t1 = time.time()  # performance measurement
+    nb.set_num_threads(1)
 
     (
         loc_id,
         config,
     ) = arguments
 
-    nb.set_num_threads(1)
+    performance_measurements = {}  # performance measurement
+    performance_measurements["loc_id"] = loc_id  # performance measurement
+    t_start = time.time()  # performance measurement
+    t1 = time.time()  # performance measurement
 
-    lower_λ, upper_λ, number_λs = config["λs"]
-
-    if not "base_o_dir" in config:
-        config["base_o_dir"] = f"{config['o_dir']}"
+    if not hasattr(config, "base_o_dir"):
+        config.base_o_dir = config.o_dir
 
     ###############################
     ### get data from databases ###
     ###############################
-    db_path = f"{config['w_dir']}/price.db"
+    db_path = f"{config.w_dir}/price.db"
     db = sql.connect(db_path)
     cur = db.cursor()
     cur.execute("""SELECT * FROM loci WHERE locus_id = ?""", (loc_id,))
     loc = loads(cur.fetchone()[1])
+    performance_measurements["chrom"] = loc.iv.chrom
+    performance_measurements["strand"] = loc.iv.strand
+    performance_measurements["start"] = loc.iv.start
+    performance_measurements["end"] = loc.iv.end
 
     cur.execute("SELECT * FROM runs")
     runs = [loads(blob) for id, blob in cur.fetchall()]
     db.close()
 
     t2 = time.time()  # performance measurement
-    open_databases_t = t2 - t1  # performance measurement
+    performance_measurements["db_time"] = t2 - t1  # performance measurement
 
-    if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/all.gtf")
+    if config.verbose_gtf:
+        loc.to_gtf(f"{config.base_o_dir}/all.gtf")
+    loc.rgr_filter_sets = {}
 
     ##########################
     ### load reads to list ###
@@ -203,52 +167,63 @@ def process_loc(arguments):
     loc.get_reads_from_db(db_path)
 
     t2 = time.time()  # performance measurement
-    load_reads_t = t2 - t1  # performance measurement
+    performance_measurements["load_reads_time"] = t2 - t1  # performance measurement
 
-    ###############################################################################
-    ### assign reads to ORF candidates, filter ORF candidates based on coverage ###
-    ###############################################################################
+    ######################################
+    ### assign reads to ORF candidates ###
+    ######################################
 
     t1 = time.time()  # performance measurement
     unfiltered_rgr_count = len(loc.rgr_set)  # performance measurement
+    performance_measurements["unfiltered_rgr_count"] = (
+        unfiltered_rgr_count  # performance measurement
+    )
+    loc.rgr_filter_sets["unfiltered"] = loc.rgr_set
 
-    for tr in loc.transcripts:
-        tr.update_with_filtered_orfs(loc.rgr_set)
+    if config.coverage_filter or config.deconvolution_filter:
+        loc.make_well_fitting_reads(runs)
 
-    loc.make_well_fitting_reads(runs)
-
-    if config["coverage_filter"]:
-        loc.coverage_filter_rgrs(config["min_well_fitting_reads_per_length"])
-    else:
-        for c, rgr in enumerate(loc.rgr_set):
-            rgr.index = c
-
-    filtered_1_rgr_count = len(loc.rgr_set)  # performance measurement
     t2 = time.time()  # performance measurement
-    process_reads_1_t = t2 - t1  # performance measurement
+    performance_measurements["assign_reads_time"] = t2 - t1  # performance measurement
 
-    if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/coverage_filtered")
-
-    ################################################
-    ### filter ORF candidates ending in one stop ###
-    ################################################
+    ###############################################
+    ### filter ORF candidates based on coverage ###
+    ###############################################
 
     t1 = time.time()  # performance measurement
-    if config["deconvolution_filter"]:
-        loc.deconvolution_filter_rgrs(
-            config["deconvolution_filter_min_activity_fraction"]
-        )
-    else:
-        for c, rgr in enumerate(loc.rgr_set):
-            rgr.index = c
 
-    filtered_2_rgr_count = len(loc.rgr_set)  # performance measurement
+    if config.coverage_filter:
+        loc.coverage_filter_rgrs(config)
+
+    if config.verbose_gtf:
+        loc.to_gtf(f"{config.base_o_dir}/coverage_filtered")
+    loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
+
+    performance_measurements["filtered_coverage_rgr_count"] = len(
+        loc.rgr_set
+    )  # performance measurement
     t2 = time.time()  # performance measurement
-    filter_2_t = t2 - t1  # performance measurement
+    performance_measurements["coverage_filter_time"] = (
+        t2 - t1
+    )  # performance measurement
 
-    if config["verbose_gtf"]:
-        loc.to_gtf(f"{config['base_o_dir']}/deconvolution_filtered")
+    ##############################################################
+    ### deconvolution filter ORF candidates ending in one stop ###
+    ##############################################################
+
+    t1 = time.time()  # performance measurement
+    if config.deconvolution_filter:
+        loc.deconvolution_filter_rgrs(config)
+
+    loc.rgr_filter_sets["deconvolution_filtered"] = loc.rgr_set
+    performance_measurements["filtered_deconvolution_rgr_count"] = len(
+        loc.rgr_set
+    )  # performance measurement
+    t2 = time.time()  # performance measurement
+    performance_measurements["filter_2_time"] = t2 - t1  # performance measurement
+
+    if config.verbose_gtf:
+        loc.to_gtf(f"{config.base_o_dir}/deconvolution_filtered")
 
     ###################################
     ### generate equivalence groups ###
@@ -258,9 +233,9 @@ def process_loc(arguments):
         tr.update_with_filtered_orfs(loc.rgr_set)
 
     t1 = time.time()  # performance measurement
-    loc.make_equivalence_groups_precise(runs)
+    loc.egs = make_equivalence_groups(loc, runs)
     t2 = time.time()  # performance measurement
-    generate_equivalence_t = t2 - t1  # performance measurement
+    performance_measurements["eg_time"] = t2 - t1  # performance measurement
 
     ##########################################
     ### assign reads to equivalence groups ###
@@ -269,170 +244,89 @@ def process_loc(arguments):
     t1 = time.time()  # performance measurement
     loc.assign_reads_to_egs(runs)
     t2 = time.time()  # performance measurement
-    process_reads_2_t = t2 - t1  # performance measurement
-
-    loc.counted_reads = {}
-    for run in runs:
-        loc.counted_reads[run.id] = 0
-        for v in loc.egs[run].values():
-            loc.counted_reads[run.id] += v.read_count
-
-    ##############################################################################
-    ##### prepare data to be used efficiently by the numba objective function ####
-    ##############################################################################
-
-    t1 = time.time()  # performance measurement
-    for c, rgr in enumerate(loc.rgr_set):
-        rgr.index = c
-    objective_args = loc.to_objective_args(runs)
-
-    t2 = time.time()  # performance measurement
-    prepare_data_t = t2 - t1  # performance measurement
+    performance_measurements["proc_reads_2_time"] = t2 - t1  # performance measurement
 
     ############################
     ### run the optimization ###
     ############################
-
-    t1 = time.time()  # performance measurement
-
     loc.deconvolve(
-        *objective_args,
-        config["ftol"],
-        config["gtol"],
-        config["callback"],
-        config["callback_args"],
-        config["pseudo_min"],
-        lower_λ=config["λs"][0],
-        upper_λ=config["λs"][1],
-        number_λs=config["λs"][2],
+        config,
+        runs=runs,
     )
 
+    # performance_measurements["opt_time"] = opt_time  # performance measurement
+    # performance_measurements["data_time"] = data_time  # performance measurement
+
+    loc.rgr_filter_sets["deconvoluted"] = loc.rgr_set
+    performance_measurements["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
+    # performance_measurements["iterations"] = loc.optimization_result.nit
     t2 = time.time()  # performance measurement
-    optimization_t = t2 - t1  # performance measurement
+    performance_measurements["optimization_time"] = t2 - t1  # performance measurement
 
     ####################################
     ### filter with likelihood ratio ###
     ####################################
-    if config["likelihood_ratio_filter"]:
-        loc.collapse_egs(
-            runs=runs, min_activity_threshold=config["min_activity_threshold"]
-        )
-        objective_args = loc.to_objective_args(runs)
 
-        if config["verbose_gtf"]:
-            loc.to_gtf(f"{config['base_o_dir']}/deconvoluted")
+    if config.verbose_gtf:
+        loc.to_gtf(f"{config.base_o_dir}/deconvoluted")
 
+    if config.likelihood_ratio_filter:
         t1 = time.time()  # performance measurement
-        try:
-            loc.likelihood_ratio_filtering(
-                *objective_args,
-                α=config["α"],
-                ftol=config["ftol"],
-                gtol=config["gtol"],
-            )
-        except ValueError:
-            print(f"ValueError in likelihood ratio filtering of {loc.id}")
-        t2 = time.time()  # performance measurement
-        likelihood_ratio_t = t2 - t1  # performance measurement
 
-        filtered_lrt = len(loc.keep_rgr_inds)
-
-    #############################
-    ### run L1/2 optimization ###
-    #############################
-
-    if config["l12_optimization"]:
-        (
-            run_read_counts,
-            cm_lut,
-            coverage_params,
-            egs,
-            num_rgrs,
-            rgr_lengths,
-            initial_guess,
-        ) = objective_args
-        initial_guess = loc.best_result.x
-        loc.deconvolve_l12(
-            run_read_counts,
-            cm_lut,
-            coverage_params,
-            egs,
-            num_rgrs,
-            rgr_lengths,
-            initial_guess,
-            config["ftol"],
-            config["gtol"],
-            config["pseudo_min"],
-            lower_λ=config["l12_λs"][0],
-            upper_λ=config["l12_λs"][1],
-            number_λs=config["l12_λs"][2],
+        loc.likelihood_ratio_filtering(
+            config,
+            runs,
         )
-        filtered_lrt = 0
-        likelihood_ratio_t = 0
+
+        loc.rgr_filter_sets["likelihood_ratio_filtered"] = loc.rgr_set
+        t2 = time.time()  # performance measurement
+        performance_measurements["likelihood_ratio_time"] = (
+            t2 - t1
+        )  # performance measurement
+
+        performance_measurements["filtered_lrt_rgr_count"] = len(loc.rgr_set)
+        performance_measurements["orf_count"] = len(
+            [1 for rgr in loc.rgr_set if rgr.type == "ORF"]
+        )
+
+    ##########################
+    ### estimate activites ###
+    ##########################
+
+    t1 = time.time()  # performance measurement
+    loc.estimate_activities(runs, config)
+
+    t2 = time.time()  # performance measurement
+    performance_measurements["activity_time"] = t2 - t1  # performance measurement
 
     ######################
     ### return results ###
     ######################
-    loc.keep_rgrs = list(loc.rgr_set)
 
     # compute number of genes and transcripts
-    gene_number = len({rgr.transcript.gene_id for rgr in loc.rgr_set_complete})
-    transcripts_number = loc.transcripts_number
+    performance_measurements["gene_number"] = len(
+        {rgr.transcript.gene_id for rgr in loc.rgr_set_complete}
+    )  # performance measurement
 
-    # number of iterations
-    # initial
-    initial_iterations = list(loc.optimization_results.values())[0].nit
+    performance_measurements["transcripts_number"] = (
+        loc.transcripts_number
+    )  # performance measurement
 
-    all_iterations = sum([r.nit for r in loc.optimization_results.values()])
+    del loc.egs
+    del loc.rsas_dict
 
     t_end = time.time()  # performance measurement
-    overall_t = t_end - t_start  # performance measurement
+    performance_measurements["overall_time"] = (
+        t_end - t_start
+    )  # performance measurement
 
-    exon_length = loc.exon_length
-    performance_measurements = [
-        loc_id,
-        exon_length,
-        loc.read_count,
-        overall_t,
-        open_databases_t,
-        load_reads_t,
-        process_reads_1_t,
-        filter_2_t,
-        generate_equivalence_t,
-        process_reads_2_t,
-        prepare_data_t,
-        optimization_t,
-        likelihood_ratio_t,
-        unfiltered_rgr_count,
-        filtered_1_rgr_count,
-        filtered_2_rgr_count,
-        filtered_lrt,
-        loc.best_λ,
-        len(loc.noise_rgr_indices),
-        gene_number,
-        transcripts_number,
-        initial_iterations,
-        all_iterations,
-    ]
+    performance_measurements["exon_length"] = loc.exon_length  # performance measurement
 
-    loc.compute_rpkm(runs)
-
-    if config["o_dir"]:
+    if config.o_dir:
         if not loc.result_df.empty:
-            lock = FileLock(f"{config['base_o_dir']}/results.tsv.lock")
+            lock = FileLock(f"{config.base_o_dir}/results.tsv.lock")
             with lock:
-                with open(f"{config['base_o_dir']}/results.tsv", "a") as f:
-                    f.write(
-                        loc.result_df.to_csv(
-                            header=False,
-                            index=True,
-                            float_format="{:.2e}".format,
-                            sep="\t",
-                        )
-                    )
-            lock = FileLock(f"{config['base_o_dir']}/rpkm.tsv.lock")
-            with lock:
-                with open(f"{config['base_o_dir']}/rpkm.tsv", "a") as f:
+                with open(f"{config.base_o_dir}/results.tsv", "a") as f:
                     f.write(
                         loc.result_df.to_csv(
                             header=False,
@@ -442,26 +336,25 @@ def process_loc(arguments):
                         )
                     )
         loc.to_gtf(
-            f"{config['base_o_dir']}/final",
+            f"{config.base_o_dir}/final",
             write_orfs=True,
             write_loci=True,
             write_transcripts=True,
         )
-        lock = FileLock(f"{config['base_o_dir']}/performance_measurements.tsv.lock")
+        if not os.path.exists(f"{config.base_o_dir}/performance_measurements.tsv"):
+            header = True
+        else:
+            header = False
+        lock = FileLock(f"{config.base_o_dir}/performance_measurements.tsv.lock")
         with lock:
-            with open(f"{config['base_o_dir']}/performance_measurements.tsv", "a") as f:
+            with open(f"{config.base_o_dir}/performance_measurements.tsv", "a") as f:
                 f.write(
                     pd.DataFrame([performance_measurements]).to_csv(
-                        header=False,
+                        header=header,
                         index=False,
                         float_format="{:.2e}".format,
                         sep="\t",
                     )
                 )
-
-    # loc.
-
-    # del loc.egs
-    # del loc.rsas_dict
 
     return (loc, performance_measurements)

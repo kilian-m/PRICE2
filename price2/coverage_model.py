@@ -7,6 +7,8 @@ from enum import Enum
 import HTSeq
 import numpy as np
 
+import warnings
+
 
 class CoveragePosition(Enum):
     start = 0
@@ -82,8 +84,17 @@ class CoverageModel:
         with np.errstate(divide="raise"):
             try:
                 self.start_factor = p_site_2_start[30] / p_site_2_start[33:230:3].mean()
+                self.start_factor = max(1, self.start_factor)
             except (FloatingPointError, ZeroDivisionError):
                 self.start_factor = 1
+            if p_site_2_start[30] < 100:
+                warnings.warn(
+                    f"only {p_site_2_start[30]} reads at start codon position. Low evidence for coverage model"
+                )
+            if p_site_2_start[33:230:3].mean() < 100:
+                warnings.warn(
+                    f"only {p_site_2_start[33:230:3].sum()} reads at middle codon position. Low evidence for coverage model"
+                )
 
         p_site_2_stop = np.zeros(300)  # 250
         for aln in HTSeq.BAM_Reader(sample_bam_path):
@@ -140,8 +151,17 @@ class CoverageModel:
                 self.stop_factor = (
                     p_site_2_stop[217] / p_site_2_stop[217 - 198 : 217 : 3].mean()
                 )
+                self.stop_factor = max(1, self.stop_factor)
             except (FloatingPointError, ZeroDivisionError):
                 self.stop_factor = 1
+            if p_site_2_stop[217] < 100:
+                warnings.warn(
+                    f"only {p_site_2_stop[217]} reads at stop codon position. Low evidence for coverage model"
+                )
+            if p_site_2_stop[217 - 198 : 217 : 3].mean() < 100:
+                warnings.warn(
+                    f"only {p_site_2_stop[217 - 198 : 217 : 3].sum()} reads at middle codon position. Low evidence for coverage model"
+                )
 
     def get_coverage_factor(self, position: CoveragePosition) -> float:
         if position == CoveragePosition.start:

@@ -5,12 +5,15 @@ import pysam
 import pickle
 
 import os
+from functools import lru_cache
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+
+import warnings
 
 
 class CleavageModel:
@@ -51,6 +54,8 @@ class CleavageModel:
                 )
 
         self.non_zero_lengths = np.nonzero(self.noise_lut.sum(axis=1))[0]
+        self.fill_dist_to_orf_start()
+        self.fill_dist_to_orf_end()
 
     def pmf(
         self,
@@ -63,7 +68,7 @@ class CleavageModel:
         # region_start relative to read start
         # region_end relative to read start
         # length is the matching length of the alignment
-        if length > len(self.pl) + len(self.pr) + 3 + int(oua):
+        if length >= len(self.pl) + len(self.pr) + 3 + int(oua):
             return 0
 
         if frame == None:  # noise
@@ -79,7 +84,7 @@ class CleavageModel:
                     region_start,
                     region_end,
                 )
-            return temp / 3
+            return temp
         else:  # CDS
             if region_start == 0 and region_end == 10**10:
                 return self.cds_lut[length, frame, int(oua)]
@@ -131,21 +136,119 @@ class CleavageModel:
 
         return max_prob_positions
 
+    def fill_dist_to_orf_start(self, overlap_likelihood_ratio_thresh: float = 0.2):
+        self.dist_to_orf_start = {}
+        for read_length in self.non_zero_lengths:
+            for oua in [True, False]:
+                for frame in [None, 0, 1, 2]:
+                    cl = self.pmf(read_length, oua, frame)
+                    if cl == 0:
+                        continue
+                    if type(frame) == int:
+                        positions = np.arange(-frame % 3, read_length, 3)
+                    else:
+                        positions = np.arange(read_length)
+                    likelihoods = np.empty(positions.shape)
+                    # at each position in the read assume the orf starts there
+                    for i, pos in enumerate(positions):
+                        ol = self.pmf(read_length, oua, frame, region_start=pos)
+                        likelihoods[i] = ol / cl
+                    try:
+                        position = -positions[
+                            likelihoods > overlap_likelihood_ratio_thresh
+                        ].max()
+                        self.dist_to_orf_start[(read_length, oua, frame)] = position
+                    except ValueError:
+                        pass
+
+    def get_dist_to_orf_start(self, read_length, oua, frame):
+        try:
+            return self.dist_to_orf_start[(read_length, oua, frame)]
+        except AttributeError:
+            self.fill_dist_to_orf_start()
+            return self.dist_to_orf_start[(read_length, oua, frame)]
+
+    def fill_dist_to_orf_end(self, overlap_likelihood_ratio_thresh: float = 0.2):
+        self.dist_to_orf_end = {}
+        for read_length in self.non_zero_lengths:
+            for oua in [True, False]:
+                for frame in [None, 0, 1, 2]:
+                    cl = self.pmf(read_length, oua, frame)
+                    if cl == 0:
+                        continue
+                    if type(frame) == int:
+                        positions = np.arange(-frame % 3, read_length, 3)
+                    else:
+                        positions = np.arange(read_length)
+                    likelihoods = np.empty(positions.shape)
+                    # at each position in the read assume the orf ends there
+                    for i, pos in enumerate(positions):
+                        if frame is None:
+                            ol = self.pmf(read_length, oua, frame, region_end=pos + 1)
+                        else:
+                            ol = self.pmf(read_length, oua, frame, region_end=pos + 3)
+                        likelihoods[i] = ol / cl
+                    try:
+                        position = -positions[
+                            likelihoods > overlap_likelihood_ratio_thresh
+                        ].min()
+                        self.dist_to_orf_end[(read_length, oua, frame)] = position
+                    except ValueError:
+                        pass
+
+    def get_dist_to_orf_end(self, read_length, oua, frame):
+        try:
+            return self.dist_to_orf_end[(read_length, oua, frame)]
+        except AttributeError:
+            self.fill_dist_to_orf_end()
+            return self.dist_to_orf_end[(read_length, oua, frame)]
+
     def plot(self, ax=None) -> None:
         if not ax:
             fig, ax = plt.subplots(1, 1, figsize=(6, 6))
         ax.bar(range(-len(self.pl) + 1, 1), self.pl[::-1])
         ax.bar(range(len(self.pr)), self.pr)
         ax.set_xlim(-30, 25)
-        ax.set_ylim(0, 0.8)
-        fill = Rectangle((-5, 0.7), self.pu * 25, 0.05, fill=True, facecolor="tab:red")
+        ax.set_ylim(0, 1)  # .8
+        fill = Rectangle((-5, 0.9), self.pu * 25, 0.05, fill=True, facecolor="tab:red")
         frame = Rectangle(
-            (-5, 0.7), 25, 0.05, fill=False, edgecolor="black", linewidth=2
+            (-5, 0.9), 25, 0.05, fill=False, edgecolor="black", linewidth=2
         )
         ax.add_patch(fill)
         ax.add_patch(frame)
         ax.set_xlabel("position relative to p-site")
         ax.set_ylabel("cleavage probability")
+
+    # for a given read compute the most likely distance from the read start to the p-site
+    @lru_cache(maxsize=None)
+    def shift(self, read_length, oua, frame):
+        f0 = (-frame) % 3
+
+        pr = self.pr
+        pl = self.pl
+
+        i = np.arange(f0, read_length - 2, 3)
+
+        likelihoods = pl[i] * pr[read_length - i - 3]
+
+        if oua:
+            if likelihoods.sum() == 0:
+                raise ValueError("Read does not fit cleavage model")
+            return likelihoods.argmax() * 3 + f0
+
+        else:
+            likelihoods *= 1 - self.pu
+
+            read_length -= 1
+            frame = (frame + 1) % 3
+            f1 = (-frame) % 3
+
+            i = np.arange(f1, read_length - 2, 3)
+            likelihoods_ua = pl[i] * pr[read_length - i - 3] * self.pu * 1 / 4
+
+            if len(likelihoods) == len(likelihoods_ua) + 1:
+                likelihoods_ua = np.insert(likelihoods_ua, 0, 0)
+            return (likelihoods + likelihoods_ua).argmax() * 3 + f0
 
 
 @njit
@@ -162,7 +265,7 @@ def read_in_cds_likelihood(
 
     f0 = (-frame) % 3
 
-    start_index = max(f0, region_start, length - len(pr) - 2)  # -3
+    start_index = max(f0, region_start, length - len(pr) - 2)
     if start_index % 3 == f0 % 3:
         pass
     elif start_index % 3 == (f0 + 1) % 3:
@@ -200,7 +303,7 @@ def read_in_cds_likelihood(
 
         l += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
 
-    return l
+    return l * 3
 
 
 @njit
@@ -233,7 +336,7 @@ def read_in_noise_likelihood(
         region_end -= 1
 
         i = np.arange(
-            max(0, region_start, length - 3 - len(pr)),
+            max(0, region_start, length - 2 - len(pr)),
             min(len(pl), length - 2, region_end - 2),
         )
         l += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
@@ -337,6 +440,11 @@ class CleavageEstimator:
             else:
                 if (type(dist_to_start) == int) and (-100 < dist_to_start < 100):
                     self.dist_starts[dist_to_start + 100] += 1
+
+        if self.counted_alns < sufficient_counted_alns:
+            warnings.warn(
+                f"Not enough alignments counted. {self.counted_alns} < {sufficient_counted_alns} for {sample_bam_path}"
+            )
 
     def correct_table(self) -> None:
         temp_table = self.table.copy()
