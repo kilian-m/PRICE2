@@ -42,7 +42,7 @@ class Config:
     # coverage filter removes ORFs with low average coverage of well fitting reads (consider max across all runs)
     coverage_filter: bool = True
     # threshold for coverage filter
-    min_well_fitting_reads_per_length: float = 1
+    min_well_fitting_reads_per_length: float = 0.1  # 1
 
     # only keep the set of transcripts that are necessary to explain the most observed reads
     # number of reads that need to be explained by a single transcript per run to be retained
@@ -71,11 +71,15 @@ class Config:
     rgrs_to_remove_fraction: float = 0.5
     # minimal activity (in at least one run) for rgrs to be retained, used at various places
     rgr_min_activity: float = 0.01
+    # minimal fraction of the canonical ORF activity to be retained
+    min_activity_fraction: float = 0.1  # 0.1
 
     # apply likelihood ratio
     likelihood_ratio_filter: bool = True
     # threshold for likelihood ratio
     likelihood_ratio_alpha: float = 1e-10
+    # loci information is not saved in master processes to save memory
+    safe_memory: bool = False
 
     @classmethod
     def make_config(cls, **kwargs):

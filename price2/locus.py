@@ -526,6 +526,15 @@ class Locus:
                         if rgr.type == "ORF":
                             f.write(rgr.to_gtf(self.id))
 
+    def to_tsv(self, prefix):
+        path = f"{prefix}_orfs.tsv"
+        lock = FileLock(path + ".lock")
+        with lock:
+            with open(path, "a") as f:
+                for rgr in self.rgr_set:
+                    if rgr.type == "ORF":
+                        f.write(rgr.to_tsv_line(self.id))
+
     #############################################
     ### functions for orf activity estimation ###
     #############################################
@@ -809,6 +818,7 @@ class Locus:
             coverage_params[i, 2] = run.coverage_model.stop_factor
 
         num_rgrs = len(rgrs)
+        rgr_lengths = np.array([len(rgr) for rgr in rgrs])
 
         if hasattr(self, "result"):
             initial_guess = self.result
@@ -836,6 +846,7 @@ class Locus:
             "coverage_model": coverage_params,
             "egs": egs,
             "num_rgrs": num_rgrs,
+            "rgr_lengths": rgr_lengths,
             "num_runs": num_runs,
             "initial_guess": initial_guess,
         }
@@ -903,6 +914,7 @@ class Locus:
             egs = deconvolution_args["egs"]
             num_rgrs = deconvolution_args["num_rgrs"]
             num_runs = deconvolution_args["num_runs"]
+            rgr_lengths = deconvolution_args["rgr_lengths"]
             # try:
             #     initial_guess = cb.initial_guess
             # except NameError:
@@ -913,7 +925,13 @@ class Locus:
 
             bounds = [(config.pseudo_min, None)] * len(initial_guess)
 
-            cb = Callback(initial_guess, num_runs, config, remove_rgrs=True)
+            cb = Callback(
+                initial_guess,
+                num_runs,
+                config,
+                remove_rgrs=True,
+                rgr_lengths=rgr_lengths,
+            )
 
             optimization_result = minimize(
                 objective_function,
@@ -966,13 +984,25 @@ class Locus:
 
         self.result = result.x
 
-        keep_rgr_indices = set(np.where(self.result > config.rgr_min_activity)[0])
-        keep_rgr_indices |= set(
-            [rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"]
+        x = self.result
+        x_t = x.T
+        canonical_indices = (rgr_lengths * x_t).argmax(axis=1)
+        min_activities = np.maximum(
+            x_t[np.arange(x_t.shape[0]), canonical_indices]
+            * config.min_activity_fraction,
+            config.rgr_min_activity,
+        )
+        self.rgr_indices_to_remove = set(
+            np.where(np.all(x < min_activities, axis=1))[0]
         )
         rgrs_to_remove = set(
-            [rgr for rgr in self.rgr_set if rgr.index not in keep_rgr_indices]
+            [
+                rgr
+                for rgr in self.rgr_set
+                if rgr.index in self.rgr_indices_to_remove and rgr.type == "ORF"
+            ]
         )
+
         self.remove_rgrs(rgrs_to_remove, runs=runs)
 
         return opt_time, data_time
@@ -1539,12 +1569,15 @@ def find_orfs(
 
 
 class Callback:
-    def __init__(self, initial_guess, number_samples, config, remove_rgrs=False):
+    def __init__(
+        self, initial_guess, number_samples, config, rgr_lengths=None, remove_rgrs=False
+    ):
         self.config = config
         self.previous = initial_guess
         self.initial_guess = initial_guess
         self.success = False
         self.number_samples = number_samples
+        self.rgr_lengths = rgr_lengths
         self.rgr_indices_to_remove = set()
         self.remove_rgrs = remove_rgrs
 
@@ -1566,16 +1599,22 @@ class Callback:
 
         if self.remove_rgrs:
             x = new.reshape((-1, self.number_samples))
-            self.rgr_indices_to_remove = set(
-                np.where(np.all(x < self.config.rgr_min_activity, axis=1))[0]
-            )
 
+            if self.rgr_lengths is None:
+                raise ValueError("rgr_lengths must be provided to remove rgrs.")
+            x_t = x.T
+            canonical_indices = (self.rgr_lengths * x_t).argmax(axis=1)
+            min_activities = np.maximum(
+                x_t[np.arange(x_t.shape[0]), canonical_indices]
+                * self.config.min_activity_fraction,
+                self.config.rgr_min_activity,
+            )
+            self.rgr_indices_to_remove = set(
+                np.where(np.all(x < min_activities, axis=1))[0]
+            )
             if x.shape[0] * self.config.rgrs_to_remove_fraction < len(
                 self.rgr_indices_to_remove
             ):
-                self.initial_guess = x[
-                    np.where(np.any(x >= self.config.rgr_min_activity, axis=1))[0]
-                ].flatten()
                 raise StopIteration
 
 
