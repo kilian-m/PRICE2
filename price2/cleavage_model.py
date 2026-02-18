@@ -1,24 +1,43 @@
-import numpy as np
-from numba import njit
-import HTSeq
-import pysam
-import pickle
+"""Cleavage site estimation for Ribo-seq data.
 
-import os
+Provides the cleavage model (probability distributions for left and right
+cleavage positions relative to the P-site) and an EM-based estimator that
+learns the model parameters from mapped Ribo-seq reads.
+"""
+
+import pickle
+import warnings
 from functools import lru_cache
+from typing import Optional
+
+import HTSeq
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.patches import Rectangle
+from numba import njit
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-
-import warnings
-
 
 class CleavageModel:
+    """Ribosome cleavage model for Ribo-seq reads.
 
-    def __init__(self, pl: np.array, pr: np.array, pu: float) -> None:
+    Models the probability of left (upstream) and right (downstream)
+    cleavage positions relative to the P-site, plus the probability
+    of an untemplated addition (UTA).
+
+    Parameters
+    ----------
+    pl : np.ndarray
+        Left cleavage probability distribution, shape (n_left,).
+    pr : np.ndarray
+        Right cleavage probability distribution, shape (n_right,).
+    pu : float
+        Probability of an untemplated addition.
+    """
+
+    def __init__(self, pl: np.ndarray, pr: np.ndarray, pu: float) -> None:
         self.pl = pl
         self.pr = pr
         self.pu = pu
@@ -61,30 +80,49 @@ class CleavageModel:
         self,
         length: int,
         oua: bool,
-        frame: int = None,
+        frame: Optional[int] = None,
         region_start: int = 0,
         region_end: int = 10**10,
     ) -> float:
+        """Compute the probability of observing a read.
+
+        Parameters
+        ----------
+        length : int
+            Matching length of the alignment.
+        oua : bool
+            Whether the read has an untemplated addition.
+        frame : int or None, optional
+            Reading frame (0, 1, 2) for CDS reads, or None for
+            noise reads.
+        region_start : int, optional
+            Start of the region relative to the read start.
+        region_end : int, optional
+            End of the region relative to the read start.
+
+        Returns
+        -------
+        float
+            Probability of the read under the model.
+        """
         # region_start relative to read start
         # region_end relative to read start
         # length is the matching length of the alignment
         if length >= len(self.pl) + len(self.pr) + 3 + int(oua):
             return 0
 
-        if frame == None:  # noise
+        if frame is None:  # noise
             if region_start == 0 and region_end == 10**10:
-                temp = self.noise_lut[length, int(oua)]
-            else:
-                temp = read_in_noise_likelihood(
-                    self.pl,
-                    self.pr,
-                    self.pu,
-                    length,
-                    oua,
-                    region_start,
-                    region_end,
-                )
-            return temp
+                return self.noise_lut[length, int(oua)]
+            return read_in_noise_likelihood(
+                self.pl,
+                self.pr,
+                self.pu,
+                length,
+                oua,
+                region_start,
+                region_end,
+            )
         else:  # CDS
             if region_start == 0 and region_end == 10**10:
                 return self.cds_lut[length, frame, int(oua)]
@@ -108,50 +146,83 @@ class CleavageModel:
                 region_end,
             )
 
-    def rvs(self, size: int = 1):
+    def rvs(self, size: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Draw random cleavage samples from the model.
+
+        Parameters
+        ----------
+        size : int, optional
+            Number of samples to draw (default 1).
+
+        Returns
+        -------
+        tuple of np.ndarray
+            ``(left_positions, right_positions, uta_flags)``.
+        """
         pl = np.random.choice(np.arange(len(self.pl)), size=size, p=self.pl)
         pr = np.random.choice(np.arange(len(self.pr)), size=size, p=self.pr)
         u = np.random.choice([True, False], size=size, p=[self.pu, 1 - self.pu])
         return (pl, pr, u)
 
-    # get all read variants, meaning all valid upstream and downstream cleavages
-    # but only the most likely combination for each read length
-    def get_read_variants(self):
-        length_dict = {}  # length -> (likelihood, (pl, pr, u))
-        for i in range(len(self.pl)):
-            for j in range(len(self.pr)):
-                for u in [True, False]:
-                    length = i + 3 + j + int(u)
+    def get_high_prob_indices(self, prob_sum: float = 0.3) -> list[tuple[int, ...]]:
+        """Return CDS LUT indices covering the highest-probability entries.
 
-    def get_high_prob_indices(self, prob_sum: float = 0.3):
+        Greedily selects entries from ``cds_lut`` until their cumulative
+        probability reaches *prob_sum*.
 
+        Parameters
+        ----------
+        prob_sum : float, optional
+            Cumulative probability threshold (default 0.3).
+
+        Returns
+        -------
+        list of tuple
+            Indices ``(length, frame, oua)`` of the selected entries.
+        """
         lut = self.cds_lut.copy()
-        s = 0
-        max_prob_positions = []
-        while s < prob_sum:
+        cumulative = 0.0
+        max_prob_positions: list[tuple[int, ...]] = []
+        while cumulative < prob_sum:
             index = np.unravel_index(lut.argmax(), lut.shape)
-            s += lut[index]
+            cumulative += lut[index]
             max_prob_positions.append(index)
             lut[index] = 0
-
         return max_prob_positions
 
-    def fill_dist_to_orf_start(self, overlap_likelihood_ratio_thresh: float = 0.2):
-        self.dist_to_orf_start = {}
+    def fill_dist_to_orf_start(
+        self, overlap_likelihood_ratio_thresh: float = 0.2
+    ) -> None:
+        """Pre-compute minimum distance from read start to ORF start.
+
+        For every valid ``(read_length, oua, frame)`` combination,
+        determine the farthest upstream position where the
+        likelihood ratio still exceeds *overlap_likelihood_ratio_thresh*.
+
+        Parameters
+        ----------
+        overlap_likelihood_ratio_thresh : float, optional
+            Likelihood ratio threshold (default 0.2).
+        """
+        self.dist_to_orf_start: dict[tuple[int, bool, Optional[int]], int] = {}
         for read_length in self.non_zero_lengths:
             for oua in [True, False]:
                 for frame in [None, 0, 1, 2]:
                     cl = self.pmf(read_length, oua, frame)
                     if cl == 0:
                         continue
-                    if type(frame) == int:
+                    if isinstance(frame, int):
                         positions = np.arange(-frame % 3, read_length, 3)
                     else:
                         positions = np.arange(read_length)
                     likelihoods = np.empty(positions.shape)
-                    # at each position in the read assume the orf starts there
                     for i, pos in enumerate(positions):
-                        ol = self.pmf(read_length, oua, frame, region_start=pos)
+                        ol = self.pmf(
+                            read_length,
+                            oua,
+                            frame,
+                            region_start=pos,
+                        )
                         likelihoods[i] = ol / cl
                     try:
                         position = -positions[
@@ -161,32 +232,64 @@ class CleavageModel:
                     except ValueError:
                         pass
 
-    def get_dist_to_orf_start(self, read_length, oua, frame):
+    def get_dist_to_orf_start(
+        self,
+        read_length: int,
+        oua: bool,
+        frame: Optional[int],
+    ) -> int:
+        """Return minimum distance from read start to ORF start.
+
+        Lazily initialises the lookup via
+        :meth:`fill_dist_to_orf_start` on first access.
+        """
         try:
             return self.dist_to_orf_start[(read_length, oua, frame)]
         except AttributeError:
             self.fill_dist_to_orf_start()
             return self.dist_to_orf_start[(read_length, oua, frame)]
 
-    def fill_dist_to_orf_end(self, overlap_likelihood_ratio_thresh: float = 0.2):
-        self.dist_to_orf_end = {}
+    def fill_dist_to_orf_end(
+        self, overlap_likelihood_ratio_thresh: float = 0.2
+    ) -> None:
+        """Pre-compute minimum distance from read start to ORF end.
+
+        For every valid ``(read_length, oua, frame)`` combination,
+        determine the farthest downstream position where the
+        likelihood ratio still exceeds *overlap_likelihood_ratio_thresh*.
+
+        Parameters
+        ----------
+        overlap_likelihood_ratio_thresh : float, optional
+            Likelihood ratio threshold (default 0.2).
+        """
+        self.dist_to_orf_end: dict[tuple[int, bool, Optional[int]], int] = {}
         for read_length in self.non_zero_lengths:
             for oua in [True, False]:
                 for frame in [None, 0, 1, 2]:
                     cl = self.pmf(read_length, oua, frame)
                     if cl == 0:
                         continue
-                    if type(frame) == int:
+                    if isinstance(frame, int):
                         positions = np.arange(-frame % 3, read_length, 3)
                     else:
                         positions = np.arange(read_length)
                     likelihoods = np.empty(positions.shape)
-                    # at each position in the read assume the orf ends there
                     for i, pos in enumerate(positions):
                         if frame is None:
-                            ol = self.pmf(read_length, oua, frame, region_end=pos + 1)
+                            ol = self.pmf(
+                                read_length,
+                                oua,
+                                frame,
+                                region_end=pos + 1,
+                            )
                         else:
-                            ol = self.pmf(read_length, oua, frame, region_end=pos + 3)
+                            ol = self.pmf(
+                                read_length,
+                                oua,
+                                frame,
+                                region_end=pos + 3,
+                            )
                         likelihoods[i] = ol / cl
                     try:
                         position = -positions[
@@ -196,32 +299,78 @@ class CleavageModel:
                     except ValueError:
                         pass
 
-    def get_dist_to_orf_end(self, read_length, oua, frame):
+    def get_dist_to_orf_end(
+        self,
+        read_length: int,
+        oua: bool,
+        frame: Optional[int],
+    ) -> int:
+        """Return minimum distance from read start to ORF end.
+
+        Lazily initialises the lookup via
+        :meth:`fill_dist_to_orf_end` on first access.
+        """
         try:
             return self.dist_to_orf_end[(read_length, oua, frame)]
         except AttributeError:
             self.fill_dist_to_orf_end()
             return self.dist_to_orf_end[(read_length, oua, frame)]
 
-    def plot(self, ax=None) -> None:
-        if not ax:
-            fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    def plot(self, ax: Optional[plt.Axes] = None) -> None:
+        """Plot the cleavage model.
+
+        Shows left/right cleavage distributions as bar charts and
+        the untemplated-addition probability as a red bar.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None, optional
+            Axes to draw on. A new figure is created when *None*.
+        """
+        if ax is None:
+            _, ax = plt.subplots(1, 1, figsize=(6, 6))
         ax.bar(range(-len(self.pl) + 1, 1), self.pl[::-1])
         ax.bar(range(len(self.pr)), self.pr)
         ax.set_xlim(-30, 25)
-        ax.set_ylim(0, 1)  # .8
-        fill = Rectangle((-5, 0.9), self.pu * 25, 0.05, fill=True, facecolor="tab:red")
-        frame = Rectangle(
-            (-5, 0.9), 25, 0.05, fill=False, edgecolor="black", linewidth=2
+        ax.set_ylim(0, 1)
+        fill = Rectangle(
+            (-5, 0.9),
+            self.pu * 25,
+            0.05,
+            fill=True,
+            facecolor="tab:red",
+        )
+        border = Rectangle(
+            (-5, 0.9),
+            25,
+            0.05,
+            fill=False,
+            edgecolor="black",
+            linewidth=2,
         )
         ax.add_patch(fill)
-        ax.add_patch(frame)
+        ax.add_patch(border)
         ax.set_xlabel("position relative to p-site")
         ax.set_ylabel("cleavage probability")
 
-    # for a given read compute the most likely distance from the read start to the p-site
     @lru_cache(maxsize=None)
-    def shift(self, read_length, oua, frame):
+    def shift(self, read_length: int, oua: bool, frame: int) -> int:
+        """Compute the most likely distance from read start to P-site.
+
+        Parameters
+        ----------
+        read_length : int
+            Matching length of the read.
+        oua : bool
+            Whether the read has an untemplated addition.
+        frame : int
+            Reading frame (0, 1, or 2).
+
+        Returns
+        -------
+        int
+            Offset from read start to the P-site.
+        """
         f0 = (-frame) % 3
 
         pr = self.pr
@@ -262,7 +411,32 @@ def read_in_cds_likelihood(
     region_start: int = 0,
     region_end: int = 10 * 10,
 ) -> float:
+    """Compute the likelihood of a read under the CDS model.
 
+    Parameters
+    ----------
+    pl : np.ndarray
+        Left cleavage probability distribution.
+    pr : np.ndarray
+        Right cleavage probability distribution.
+    pu : float
+        Untemplated addition probability.
+    length : int
+        Matching length of the alignment.
+    frame : int
+        Reading frame (0, 1, or 2).
+    oua : bool
+        Whether the read has an untemplated addition.
+    region_start : int, optional
+        Region start relative to the read start.
+    region_end : int, optional
+        Region end relative to the read start.
+
+    Returns
+    -------
+    float
+        Read likelihood under the CDS cleavage model.
+    """
     f0 = (-frame) % 3
 
     start_index = max(f0, region_start, length - len(pr) - 2)
@@ -275,14 +449,14 @@ def read_in_cds_likelihood(
 
     i = np.arange(start_index, min(len(pl), length - 2, region_end - 2), 3)
 
-    l = (pl[i] * pr[length - i - 3]).sum()
+    likelihood = (pl[i] * pr[length - i - 3]).sum()
 
     if oua:
-        l *= pu * 3 / 4
+        likelihood *= pu * 3 / 4
 
     else:
         # assume there is no ua
-        l *= 1 - pu
+        likelihood *= 1 - pu
         # assume there is an ua
         length -= 1
         region_start -= 1
@@ -301,9 +475,9 @@ def read_in_cds_likelihood(
 
         i = np.arange(start_index, min(len(pl), length - 2, region_end - 2), 3)
 
-        l += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
+        likelihood += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
 
-    return l * 3
+    return likelihood * 3
 
 
 @njit
@@ -316,19 +490,45 @@ def read_in_noise_likelihood(
     region_start: int = 0,
     region_end: int = 10 * 10,
 ) -> float:
+    """Compute the likelihood of a read under the noise model.
 
+    Same as :func:`read_in_cds_likelihood` but without reading-frame
+    constraints (the cleavage can occur at any position).
+
+    Parameters
+    ----------
+    pl : np.ndarray
+        Left cleavage probability distribution.
+    pr : np.ndarray
+        Right cleavage probability distribution.
+    pu : float
+        Untemplated addition probability.
+    length : int
+        Matching length of the alignment.
+    oua : bool
+        Whether the read has an untemplated addition.
+    region_start : int, optional
+        Region start relative to the read start.
+    region_end : int, optional
+        Region end relative to the read start.
+
+    Returns
+    -------
+    float
+        Read likelihood under the noise cleavage model.
+    """
     i = np.arange(
         max(0, region_start, length - len(pr) - 2),
         min(len(pl), length - 2, region_end - 2),
     )
-    l = (pl[i] * pr[length - i - 3]).sum()
+    likelihood = (pl[i] * pr[length - i - 3]).sum()
 
     if oua:
-        l *= pu * 3 / 4
+        likelihood *= pu * 3 / 4
 
     else:
         # assume there is no ua
-        l *= 1 - pu
+        likelihood *= 1 - pu
 
         # assume there is an ua
         length -= 1
@@ -339,11 +539,28 @@ def read_in_noise_likelihood(
             max(0, region_start, length - 2 - len(pr)),
             min(len(pl), length - 2, region_end - 2),
         )
-        l += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
-    return l
+        likelihood += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
+    return likelihood
 
 
 class CleavageEstimator:
+    """EM-based estimator for cleavage model parameters.
+
+    Learns left/right cleavage distributions and the
+    untemplated-addition probability from reads that map
+    unambiguously to annotated CDS regions.
+
+    Parameters
+    ----------
+    repeats : int, optional
+        Number of random restarts for the EM algorithm.
+    maxiter : int, optional
+        Maximum EM iterations per restart.
+    delta_cutoff : float, optional
+        Convergence threshold on parameter change.
+    seed : int, optional
+        Random seed for reproducibility.
+    """
 
     def __init__(
         self,
@@ -352,7 +569,6 @@ class CleavageEstimator:
         delta_cutoff: float = 0.001,
         seed: int = 42,
     ) -> None:
-
         self.table = np.zeros(shape=(100, 3, 2, 1), dtype=np.int32)
         self.obs_min_len = 15
         self.obs_max_len = 40
@@ -372,8 +588,31 @@ class CleavageEstimator:
         min_dist_to_end: int = 30,
         sufficient_counted_alns: int = 100_000,
     ) -> None:
+        """Collect read-length / frame / UTA counts from a BAM file.
+
+        Iterates over uniquely-mapped reads that fall within CDS
+        regions and tallies their length, reading frame and
+        untemplated-addition status into ``self.table``.
+
+        Parameters
+        ----------
+        reference_annotation : ReferenceAnnotation
+            Parsed reference annotation.
+        sample_bam_path : str
+            Path to the BAM file.
+        min_considered_length : int, optional
+            Minimum read length to consider.
+        max_considered_length : int, optional
+            Maximum read length to consider.
+        min_dist_to_start : int, optional
+            Minimum distance from CDS start to count a read.
+        min_dist_to_end : int, optional
+            Minimum distance from CDS end to count a read.
+        sufficient_counted_alns : int, optional
+            Stop after counting this many alignments.
+        """
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
-        self.dist_starts = np.zeros(shape=(200), dtype=np.int32)
+        self.dist_starts = np.zeros(shape=(200,), dtype=np.int32)
         self.outside_cds = 0
         self.not_unique = 0
         self.not_countable = 0
@@ -385,9 +624,6 @@ class CleavageEstimator:
             if not aln.unique():
                 self.not_unique += 1
                 continue
-            # if aln.close_to_any_tis(reference_annotation):
-            #    self.not_countable += 1
-            #    continue
             if not min_considered_length <= len(aln) < max_considered_length:
                 self.bad_length += 1
                 continue
@@ -421,8 +657,13 @@ class CleavageEstimator:
                         break
 
             else:
-                if not frame is None:
-                    self.table[len(aln), frame, int(aln.untemplated_addition), 0] += 1
+                if frame is not None:
+                    self.table[
+                        len(aln),
+                        frame,
+                        int(aln.untemplated_addition),
+                        0,
+                    ] += 1
                     self.counted_alns += 1
                     if self.counted_alns >= sufficient_counted_alns:
                         break
@@ -434,30 +675,53 @@ class CleavageEstimator:
                 except ValueError:
                     new_dist_to_start = None
 
-                if type(new_dist_to_start) == int:
+                if isinstance(new_dist_to_start, int):
                     if dist_to_start is None:
                         dist_to_start = new_dist_to_start
                     elif dist_to_start != new_dist_to_start:
                         break
             else:
-                if (type(dist_to_start) == int) and (-100 < dist_to_start < 100):
+                if isinstance(dist_to_start, int) and (-100 < dist_to_start < 100):
                     self.dist_starts[dist_to_start + 100] += 1
 
         if self.counted_alns < sufficient_counted_alns:
             warnings.warn(
-                f"Not enough alignments counted. {self.counted_alns} < {sufficient_counted_alns} for {sample_bam_path}\nnot_unique: {self.not_unique}\nnot_countable: {self.not_countable}\noutside_cds: {self.outside_cds}\nbad_length: {self.bad_length}\n"
+                f"Not enough alignments counted: "
+                f"{self.counted_alns} < {sufficient_counted_alns} "
+                f"for {sample_bam_path}\n"
+                f"  not_unique: {self.not_unique}\n"
+                f"  not_countable: {self.not_countable}\n"
+                f"  outside_cds: {self.outside_cds}\n"
+                f"  bad_length: {self.bad_length}",
+                stacklevel=2,
             )
 
     def correct_table(self) -> None:
+        """Swap frame-1 and frame-2 columns in the count table."""
         temp_table = self.table.copy()
-        (self.table[:, 0, :, :], self.table[:, 1, :, :], self.table[:, 2, :, :]) = (
+        (
+            self.table[:, 0, :, :],
+            self.table[:, 1, :, :],
+            self.table[:, 2, :, :],
+        ) = (
             temp_table[:, 0, :, :],
             temp_table[:, 2, :, :],
             temp_table[:, 1, :, :],
         )
 
     def run(self, regularize: bool = True) -> CleavageModel:
+        """Run EM estimation and return the fitted cleavage model.
 
+        Parameters
+        ----------
+        regularize : bool, optional
+            Whether to apply regularisation (default True).
+
+        Returns
+        -------
+        CleavageModel
+            The fitted cleavage model.
+        """
         self.best_ll, self.best_u, self.best_pl, self.best_pr = repeat(
             self.repeats,
             self.obs_max_len,
@@ -474,56 +738,90 @@ class CleavageEstimator:
             self.regularize()
         return CleavageModel(self.best_pl, self.best_pr, self.best_u)
 
-    def regularize(self, keep_prob: float = 0.9):
-        pl = self.best_pl.copy()
-        self.best_pl = select_and_scale(pl, keep_prob)
-        pr = self.best_pr.copy()
-        self.best_pr = select_and_scale(pr, keep_prob)
+    def regularize(self, keep_prob: float = 0.9) -> None:
+        """Zero out low-probability entries and re-normalise.
+
+        Parameters
+        ----------
+        keep_prob : float, optional
+            Cumulative probability mass to retain (default 0.9).
+        """
+        self.best_pl = select_and_scale(self.best_pl.copy(), keep_prob)
+        self.best_pr = select_and_scale(self.best_pr.copy(), keep_prob)
 
     def compute_shift(self, range_start: int = -25, range_end: int = -5) -> int:
+        """Compute the shift to align pl with the start-distance histogram.
+
+        Returns
+        -------
+        int
+            Shift that aligns the cleavage model to the P-site.
+        """
         pl_rev = self.best_pl[::-1]
         pl_maxpos = pl_rev.argmax()
 
         overlayed = np.zeros(range_end - range_start)
         for i in range(range_start, range_end):
-            overlayed[i - range_start] = sum(
-                pl_rev
-                * self.dist_starts[
-                    100 + i - pl_maxpos : 100 + i - pl_maxpos + len(pl_rev)
-                ]
-            )
+            start = 100 + i - pl_maxpos
+            end = start + len(pl_rev)
+            overlayed[i - range_start] = np.dot(pl_rev, self.dist_starts[start:end])
 
         overlayed_diff = overlayed[3:] - overlayed[:-3]
         return -(overlayed_diff.argmax() - pl_maxpos + range_start + len(pl_rev) + 2)
 
     def correct_max_pos(self, shift: int) -> None:
-        pl = np.zeros(len(self.best_pl))
-        for i in range(len(self.best_pl)):
-            if i - shift >= 0 and i - shift < len(self.best_pl):
+        """Shift pl and pr arrays and re-normalise.
+
+        Parameters
+        ----------
+        shift : int
+            Number of positions to shift.
+        """
+        n = len(self.best_pl)
+        pl = np.zeros(n)
+        for i in range(n):
+            if 0 <= i - shift < n:
                 pl[i] = self.best_pl[i - shift]
 
         pr = np.zeros(len(self.best_pr))
         for i in range(len(self.best_pr)):
-            if i + shift >= 0 and i + shift < len(self.best_pl):
+            if 0 <= i + shift < n:
                 pr[i] = self.best_pr[i + shift]
 
-        pl = pl / pl.sum()
-        pr = pr / pr.sum()
-
-        self.best_pl = pl
-        self.best_pr = pr
+        self.best_pl = pl / pl.sum()
+        self.best_pr = pr / pr.sum()
 
 
 @njit
 def compute_ll(
-    table,
-    obs_min_len,
-    obs_max_len,
-    pl,
-    pr,
-    u,
-    c,
+    table: np.ndarray,
+    obs_min_len: int,
+    obs_max_len: int,
+    pl: np.ndarray,
+    pr: np.ndarray,
+    u: float,
+    c: int,
 ) -> float:
+    """Compute the log-likelihood of the observed count table.
+
+    Parameters
+    ----------
+    table : np.ndarray
+        Observed counts, shape ``(max_len, 3 (frame), 2 (untemplated_addition), n_conditions)``.
+    obs_min_len, obs_max_len : int
+        Range of observed read lengths.
+    pl, pr : np.ndarray
+        Left / right cleavage distributions.
+    u : float
+        Untemplated-addition probability.
+    c : int
+        Condition index into the table's last axis.
+
+    Returns
+    -------
+    float
+        Log-likelihood.
+    """
     ll = 0
     for length in range(obs_min_len, obs_max_len + 1):
         for frame in range(3):
@@ -551,15 +849,39 @@ def compute_ll(
 
 @njit
 def repeat(
-    repeats,
-    obs_max_len,
-    obs_min_len,
-    table,
-    maxiter,
-    c,
-    delta_cutoff,
-    seed=42,
-):
+    repeats: int,
+    obs_max_len: int,
+    obs_min_len: int,
+    table: np.ndarray,
+    maxiter: int,
+    c: int,
+    delta_cutoff: float,
+    seed: int = 42,
+) -> tuple:
+    """Run the EM algorithm with multiple random restarts.
+
+    Parameters
+    ----------
+    repeats : int
+        Number of random restarts.
+    obs_max_len, obs_min_len : int
+        Observed read length range.
+    table : np.ndarray
+        Count table.
+    maxiter : int
+        Maximum iterations per restart.
+    c : int
+        Condition index.
+    delta_cutoff : float
+        Convergence threshold.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    tuple
+        ``(best_ll, best_u, best_pl, best_pr)``.
+    """
     np.random.seed(seed)
 
     total = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
@@ -570,11 +892,6 @@ def repeat(
 
         pl = np.random.rand(obs_max_len + 1)
         pr = np.random.rand(obs_max_len + 1)
-
-        # maxpos = 12
-        # pl[maxpos-1]*=4
-        # pl[maxpos]*=10
-        # pl[maxpos+1]*=4
 
         pl = pl / pl.sum()
         pr = pr / pr.sum()
@@ -606,10 +923,10 @@ def repeat(
                     frame1 = (frame - 1) % 3
                     left = np.arange(frame, length - 3, 3)
                     left1 = np.arange(frame1, length - 3, 3)
-                    sum = eps
+                    total_p = eps
 
-                    sum += (pl[left1] * pr[length - left1 - 3 - 1]).sum()
-                    s = pl[left1] * pr[length - left1 - 3 - 1] / sum * n
+                    total_p += (pl[left1] * pr[length - left1 - 3 - 1]).sum()
+                    s = pl[left1] * pr[length - left1 - 3 - 1] / total_p * n
                     ql1[left1 + 1] += s
                     qr1[length - left1 - 1 - 3] += s
 
@@ -627,17 +944,17 @@ def repeat(
                     sum1 += (pl[left1] * pr[length - left1 - 3 - 1] * prop).sum()
 
                     sum0 += (pl[left] * pr[length - left - 3] * (1 - prop)).sum()
-                    sum = sum1 + sum0
+                    total_p = sum1 + sum0
 
-                    s = pl[left1] * pr[length - left1 - 3 - 1] * prop / sum * n
+                    s = pl[left1] * pr[length - left1 - 3 - 1] * prop / total_p * n
                     ql1[left1] += s
                     qr1[length - left1 - 1 - 3] += s
 
-                    s = pl[left] * pr[length - left - 3] * (1 - prop) / sum * n
+                    s = pl[left] * pr[length - left - 3] * (1 - prop) / total_p * n
                     ql0[left] += s
                     qr0[length - left - 3] += s
 
-                    qu += sum1 / sum * n
+                    qu += sum1 / total_p * n
 
             old_pl = pl.copy()
             old_pr = pr.copy()
@@ -648,9 +965,9 @@ def repeat(
             N = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
             u = qu / N
 
-            model_change = (np.absolute(old_pl - pl)).sum() + (
-                np.absolute(old_pr - pr)
-            ).sum()
+            model_change = (
+                np.absolute(old_pl - pl).sum() + np.absolute(old_pr - pr).sum()
+            )
             if model_change < delta_cutoff:
                 better_ll = compute_ll(table, obs_min_len, obs_max_len, pl, pr, u, c)
                 better_u = u
@@ -669,45 +986,73 @@ def repeat(
     return best_ll, best_u, best_pl, best_pr
 
 
-def to_file(file_path: str, d: dict[str, CleavageModel]) -> None:
-    # convert dict to pickleable list
-    l = []
-    for k, v in d.items():
-        l.append((k, v.pl, v.pr, v.pu))
-    with open(file_path, "wb") as f:
-        pickle.dump(l, f)
+def to_file(file_path: str, models: dict[str, CleavageModel]) -> None:
+    """Serialise a dict of cleavage models to a pickle file.
+
+    Parameters
+    ----------
+    file_path : str
+        Output file path.
+    models : dict[str, CleavageModel]
+        Mapping of sample name to cleavage model.
+    """
+    records = [(name, m.pl, m.pr, m.pu) for name, m in models.items()]
+    with open(file_path, "wb") as fh:
+        pickle.dump(records, fh)
 
 
 def from_file(file_path: str) -> dict[str, CleavageModel]:
-    with open(file_path, "rb") as f:
-        l = pickle.load(f)
-    d = {}
-    for k, pl, pr, pu in l:
-        d[k] = CleavageModel(pl, pr, pu)
-    return d
+    """Deserialise cleavage models from a pickle file.
+
+    Parameters
+    ----------
+    file_path : str
+        Input file path (written by :func:`to_file`).
+
+    Returns
+    -------
+    dict[str, CleavageModel]
+        Mapping of sample name to cleavage model.
+    """
+    with open(file_path, "rb") as fh:
+        records = pickle.load(fh)
+    return {name: CleavageModel(pl, pr, pu) for name, pl, pr, pu in records}
 
 
-def select_and_scale(arr, k):
-    # Step 1: Sort the array in descending order while keeping track of original indices
+def select_and_scale(arr: np.ndarray, keep_prob: float) -> np.ndarray:
+    """Keep the largest elements up to *keep_prob* mass, zero the rest.
+
+    Elements are selected in descending order until their cumulative
+    sum reaches *keep_prob*, then the result is re-normalised.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input probability distribution.
+    keep_prob : float
+        Cumulative probability mass to retain.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered and re-normalised distribution.
+    """
     sorted_indices = np.argsort(arr)[::-1]
     sorted_arr = arr[sorted_indices]
 
-    # Step 2: Select elements until their sum is at least k
-    cumulative_sum = 0
-    selected_indices = []
+    cumulative_sum = 0.0
+    selected_indices: list[int] = []
     for i, elem in enumerate(sorted_arr):
-        if cumulative_sum >= k:
+        if cumulative_sum >= keep_prob:
             break
         selected_indices.append(sorted_indices[i])
         cumulative_sum += elem
 
-    # Step 3: Reconstruct the array with zeros and place selected elements in their original positions
     result = np.zeros_like(arr)
     for idx in selected_indices:
         result[idx] = arr[idx]
-    # Step 4: Normalize the selected elements
-    selected_sum = result.sum()
-    if selected_sum > 0:
-        result = result / selected_sum
 
+    total = result.sum()
+    if total > 0:
+        result /= total
     return result
