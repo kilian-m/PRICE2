@@ -375,19 +375,21 @@ class CleavageEstimator:
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
         self.dist_starts = np.zeros(shape=(200), dtype=np.int32)
         self.outside_cds = 0
+        self.not_unique = 0
         self.not_countable = 0
+        self.bad_length = 0
         self.counted_alns = 0
         for aln in HTSeq.BAM_Reader(sample_bam_path):
             aln = RiboSeqAlignment(aln)
 
             if not aln.unique():
-                self.not_countable += 1
+                self.not_unique += 1
                 continue
             # if aln.close_to_any_tis(reference_annotation):
             #    self.not_countable += 1
             #    continue
             if not min_considered_length <= len(aln) < max_considered_length:
-                self.not_countable += 1
+                self.bad_length += 1
                 continue
             transcript_candidates = reference_annotation.collect_coding_transcripts(
                 aln.genomic_region
@@ -443,7 +445,7 @@ class CleavageEstimator:
 
         if self.counted_alns < sufficient_counted_alns:
             warnings.warn(
-                f"Not enough alignments counted. {self.counted_alns} < {sufficient_counted_alns} for {sample_bam_path}"
+                f"Not enough alignments counted. {self.counted_alns} < {sufficient_counted_alns} for {sample_bam_path}\nnot_unique: {self.not_unique}\nnot_countable: {self.not_countable}\noutside_cds: {self.outside_cds}\nbad_length: {self.bad_length}\n"
             )
 
     def correct_table(self) -> None:

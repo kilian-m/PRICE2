@@ -39,9 +39,12 @@ class DataCollector:
 
     def collect_runs(self):
 
-        bam_ids = {
-            f.split(".")[0] for f in os.listdir(self.bam_dir) if f.endswith(".bam")
-        }
+        if self.config.bam_ids:
+            bam_ids = set(self.config.bam_ids)
+        else:
+            bam_ids = {
+                f.split(".")[0] for f in os.listdir(self.bam_dir) if f.endswith(".bam")
+            }
 
         if os.path.exists(self.db_path):
 
@@ -101,6 +104,11 @@ class DataCollector:
         )
 
         db.commit()
+
+        processed_run_ids = {
+            run_id for run_id, in cur.execute("SELECT DISTINCT run_id FROM reads")
+        }
+
         db.close()
 
         try:
@@ -115,6 +123,7 @@ class DataCollector:
                             self.loci_set,
                         )
                         for run in self.runs
+                        if run.id not in processed_run_ids
                     ],
                 )
         except AssertionError:
@@ -286,7 +295,7 @@ class DataCollector:
             #                 locus.transcript_intervals[iv] = val
 
             if locus.transcripts:
-                locus.make_rgrs(self.genome)
+                locus.make_rgrs(self.genome, self.config)
                 cur.execute("INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus)))
 
         db.commit()
@@ -404,27 +413,3 @@ def collect_mappings_run(data):
     )
     db.commit()
     db.close()
-
-    # db = sql.connect(db_path, timeout=60)
-    # cur = db.cursor()
-    # cur.execute(
-    #    """INSERT INTO reads (
-    #                 locus_id,
-    #                 run_id,
-    #                 reads_blob
-    #                 ) VALUES (?, ?, ?)""",
-    #    (locus.id, run_id, zlib.compress(dumps(df))),
-    # )
-
-
-#
-# cur.execute(
-#    """INSERT INTO transcript_read_counts (
-#                 locus_id,
-#                 run_id,
-#                 transcript_read_counts_blob
-#                 ) VALUES (?, ?, ?)""",
-#    (locus.id, run_id, zlib.compress(dumps(transcripts_counts))),
-# )
-# db.commit()
-# db.close()

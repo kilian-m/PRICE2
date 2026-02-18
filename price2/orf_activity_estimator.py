@@ -5,13 +5,12 @@ import sqlite3 as sql
 import numpy as np
 import pandas as pd
 import numba as nb
+import psutil
+import multiprocessing as mp
 
 from pickle import loads, dumps
 import zlib
 from filelock import FileLock
-
-# import multiprocessing
-# from multiprocessing import Pool
 
 from price2.locus import Locus
 from price2.ribo_seq_alignment import RiboSeqAlignment
@@ -22,7 +21,12 @@ from tqdm import tqdm
 import time
 
 from pebble import ProcessPool
+import multiprocessing as mp
+
+mp.set_start_method("forkserver", force=True)
 from concurrent.futures import TimeoutError
+import traceback
+import resource
 
 
 class ORFActivityEstimator:
@@ -69,9 +73,15 @@ class ORFActivityEstimator:
             )
             loci_ids = loci_ids - processed_loc_ids
 
+        loci_ids = list(loci_ids)
         pbar = tqdm(total=len(loci_ids))
 
-        with ProcessPool(max_workers=self.config.processes) as pool:
+        # make directory to indicate processing loci
+        processing_dir = f"{self.config.w_dir}/processing_loci"
+        if not os.path.exists(processing_dir):
+            os.makedirs(processing_dir)
+
+        with ProcessPool(max_workers=self.config.processes, max_tasks=1) as pool:
             future = pool.map(
                 process_loc,
                 [
@@ -87,31 +97,44 @@ class ORFActivityEstimator:
             iterator = future.result()
 
             results = []
+            i = 0
             while True:
                 try:
                     result = next(iterator)
-                    results.append(result)
+                    if not self.config.save_memory:
+                        results.append(result)
                     pbar.update(1)
-                except TimeoutError as e:
-                    results.append(e)
-                    pbar.update(1)
+                    i += 1
                 except StopIteration:
                     pbar.close()
                     break
-                except Exception as e:
-                    results.append(e)
+                except (TimeoutError, Exception) as e:
+
+                    stack = traceback.format_exc()
+                    lock = FileLock(f"{self.config.o_dir}/failed_loci.txt.lock")
+                    with lock:
+                        with open(f"{self.config.o_dir}/failed_loci.txt", "a") as f:
+                            f.write(f"{loci_ids[i]}\n{str(e)}\n{stack}\n\n")
+                    if not self.config.save_memory:
+                        results.append(e)
                     pbar.update(1)
+                    i += 1
 
-        self.loci = {}
-        self.failed_loci = {}
-        for loc_id, result in zip(loci_ids, results):
-            if isinstance(result, Exception):
-                self.failed_loci[loc_id] = result
-            else:
-                self.loci[loc_id] = result[0]
-                performance_measurements[loc_id] = result[1]
+                # except Exception as e:
+                #     results.append(e)
+                #     pbar.update(1)
+                #     i += 1
+        if not self.config.save_memory:
+            self.loci = {}
+            self.failed_loci = {}
+            for loc_id, result in zip(loci_ids, results):
+                if isinstance(result, Exception):
+                    self.failed_loci[loc_id] = result
+                else:
+                    self.loci[loc_id] = result[0]
+                    performance_measurements[loc_id] = result[1]
 
-        self.performance_df = pd.DataFrame(performance_measurements).T
+            self.performance_df = pd.DataFrame(performance_measurements).T
 
         lock_files = glob.glob(os.path.join(self.config.o_dir, "*.lock"))
         for lock_file in lock_files:
@@ -119,12 +142,19 @@ class ORFActivityEstimator:
 
 
 def process_loc(arguments):
-    nb.set_num_threads(1)
 
     (
         loc_id,
         config,
     ) = arguments
+
+    # make file in working directory that shows that locus processing has started
+    filename = f"{config.w_dir}/processing_loci/{loc_id}"
+    with open(filename, "w") as f:
+        pass
+
+    # memory_limit = int(config.memory_limit_gb * 1024 * 1024 * 1024)
+    # resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
 
     performance_measurements = {}  # performance measurement
     performance_measurements["loc_id"] = loc_id  # performance measurement
@@ -155,8 +185,14 @@ def process_loc(arguments):
     performance_measurements["db_time"] = t2 - t1  # performance measurement
 
     if config.verbose_gtf:
-        loc.to_gtf(f"{config.base_o_dir}/all.gtf")
+        loc.to_gtf(f"{config.base_o_dir}/all")
+        loc.to_tsv(f"{config.base_o_dir}/all")
     loc.rgr_filter_sets = {}
+
+    # from pyfaidx import Fasta
+    #
+    # genome = Fasta(config.fasta_path)
+    # loc.to_fasta(f"{config.base_o_dir}", genome)
 
     ##########################
     ### load reads to list ###
@@ -197,6 +233,7 @@ def process_loc(arguments):
 
     if config.verbose_gtf:
         loc.to_gtf(f"{config.base_o_dir}/coverage_filtered")
+        loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
     loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
 
     performance_measurements["filtered_coverage_rgr_count"] = len(
@@ -224,10 +261,15 @@ def process_loc(arguments):
 
     if config.verbose_gtf:
         loc.to_gtf(f"{config.base_o_dir}/deconvolution_filtered")
+        loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
 
     ###################################
     ### generate equivalence groups ###
     ###################################
+
+    performance_measurements["mem_before_egs"] = (
+        psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
+    )
 
     for tr in loc.transcripts:
         tr.update_with_filtered_orfs(loc.rgr_set)
@@ -235,6 +277,11 @@ def process_loc(arguments):
     t1 = time.time()  # performance measurement
     loc.egs = make_equivalence_groups(loc, runs)
     t2 = time.time()  # performance measurement
+
+    performance_measurements["mem_after_egs"] = (
+        psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
+    )
+
     performance_measurements["eg_time"] = t2 - t1  # performance measurement
 
     ##########################################
@@ -245,6 +292,9 @@ def process_loc(arguments):
     loc.assign_reads_to_egs(runs)
     t2 = time.time()  # performance measurement
     performance_measurements["proc_reads_2_time"] = t2 - t1  # performance measurement
+    performance_measurements["read_count"] = sum(
+        [rc for _, rc in loc.counted_reads.items()]
+    )
 
     ############################
     ### run the optimization ###
@@ -269,6 +319,7 @@ def process_loc(arguments):
 
     if config.verbose_gtf:
         loc.to_gtf(f"{config.base_o_dir}/deconvoluted")
+        loc.to_tsv(f"{config.base_o_dir}/deconvoluted")
 
     if config.likelihood_ratio_filter:
         t1 = time.time()  # performance measurement
@@ -312,8 +363,14 @@ def process_loc(arguments):
         loc.transcripts_number
     )  # performance measurement
 
-    del loc.egs
-    del loc.rsas_dict
+    performance_measurements["occupied_memory_mb"] = (
+        psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
+    )
+
+    end_memory = psutil.Process(os.getpid()).memory_full_info().rss / 1024 / 1024
+
+    # del loc.egs
+    # del loc.rsas_dict
 
     t_end = time.time()  # performance measurement
     performance_measurements["overall_time"] = (
@@ -322,39 +379,47 @@ def process_loc(arguments):
 
     performance_measurements["exon_length"] = loc.exon_length  # performance measurement
 
-    if config.o_dir:
-        if not loc.result_df.empty:
-            lock = FileLock(f"{config.base_o_dir}/results.tsv.lock")
-            with lock:
-                with open(f"{config.base_o_dir}/results.tsv", "a") as f:
-                    f.write(
-                        loc.result_df.to_csv(
-                            header=False,
-                            index=True,
-                            float_format="{:.2e}".format,
-                            sep="\t",
-                        )
-                    )
-        loc.to_gtf(
-            f"{config.base_o_dir}/final",
-            write_orfs=True,
-            write_loci=True,
-            write_transcripts=True,
-        )
-        if not os.path.exists(f"{config.base_o_dir}/performance_measurements.tsv"):
-            header = True
-        else:
-            header = False
-        lock = FileLock(f"{config.base_o_dir}/performance_measurements.tsv.lock")
+    if not loc.result_df.empty:
+        lock = FileLock(f"{config.base_o_dir}/results.tsv.lock")
         with lock:
-            with open(f"{config.base_o_dir}/performance_measurements.tsv", "a") as f:
+            with open(f"{config.base_o_dir}/results.tsv", "a") as f:
                 f.write(
-                    pd.DataFrame([performance_measurements]).to_csv(
-                        header=header,
-                        index=False,
+                    loc.result_df.to_csv(
+                        header=False,
+                        index=True,
                         float_format="{:.2e}".format,
                         sep="\t",
                     )
                 )
+    loc.to_gtf(
+        f"{config.base_o_dir}/final",
+        write_orfs=True,
+        write_loci=True,
+        write_transcripts=True,
+    )
 
-    return (loc, performance_measurements)
+    loc.to_tsv(f"{config.base_o_dir}/final")
+
+    if not os.path.exists(f"{config.base_o_dir}/performance_measurements.tsv"):
+        header = True
+    else:
+        header = False
+    lock = FileLock(f"{config.base_o_dir}/performance_measurements.tsv.lock")
+    with lock:
+        with open(f"{config.base_o_dir}/performance_measurements.tsv", "a") as f:
+            f.write(
+                pd.DataFrame([performance_measurements]).to_csv(
+                    header=header,
+                    index=False,
+                    float_format="{:.2e}".format,
+                    sep="\t",
+                )
+            )
+
+    # delete processing locus file
+    os.remove(filename)
+
+    if config.save_memory:
+        return
+    else:
+        return (loc, performance_measurements)

@@ -9,10 +9,11 @@ class GenomicRegion:
 
     def __init__(
         self,
-        intervals: list[GenomicInterval],
+        intervals: list[GenomicInterval] = None,
         chrom: str = None,
         strand: str = None,
         df=None,
+        gi_string: str = None,
     ) -> None:
         if df is not None:
             self.intervals = [
@@ -23,6 +24,19 @@ class GenomicRegion:
             ]
             self.chrom = self.intervals[0].chrom
             self.strand = self.intervals[0].strand
+        elif gi_string is not None:
+            chrom_strand, intervals_str = gi_string.split(":")
+            chrom = chrom_strand[:-1]
+            strand = chrom_strand[-1]
+            intervals = [
+                HTSeq.GenomicInterval(chrom, int(start), int(end), strand)
+                for start, end in (x.split("-") for x in intervals_str.split("|"))
+            ]
+            if strand == "-":
+                intervals = intervals[::-1]
+            self.chrom = chrom
+            self.strand = strand
+            self.intervals = intervals
         else:
             if chrom:
                 self.chrom = chrom
@@ -53,7 +67,7 @@ class GenomicRegion:
         # return hash((self.strand, self.chrom, tuple(self.intervals)))
 
     def __str__(self):
-        s = f"{self.chrom}:{self.strand}"
+        s = f"{self.chrom}{self.strand}"
         for i in self.intervals:
             s += f":[{i.start},{i.end})"
         return s
@@ -243,6 +257,27 @@ class GenomicRegion:
                 if s_iv.end != o_iv.end or s_iv.start > o_iv.start:
                     return False
         return True
+
+    def truncate(self, length, end) -> "GenomicRegion":
+        # end is "5'" or "3'"
+        # length is how much should be cut off
+        if length <= 0:
+            raise ValueError("Length must be positive")
+
+        if length >= self.length:
+            raise ValueError("Cannot truncate more than the total length")
+
+        # Calculate new start and end positions in region coordinates
+        if end == "5'":
+            new_start = length
+            new_end = self.length
+        elif end == "3'":
+            new_start = 0
+            new_end = self.length - length
+        else:
+            raise ValueError("end must be '5'' or '3''")
+
+        return self.map((new_start, new_end))
 
 
 def cut_intervals(interval_list, start, end) -> list:

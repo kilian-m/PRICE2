@@ -91,9 +91,9 @@ class CoverageModel:
                 warnings.warn(
                     f"only {p_site_2_start[30]} reads at start codon position. Low evidence for coverage model"
                 )
-            if p_site_2_start[33:230:3].mean() < 100:
+            if p_site_2_start[33:230:3].sum() < 100:
                 warnings.warn(
-                    f"only {p_site_2_start[33:230:3].sum()} reads at middle codon position. Low evidence for coverage model"
+                    f"only {p_site_2_start[33:230:3].sum()} reads at middle codon position. Low evidence for coverage model. sample: {sample_bam_path}"
                 )
 
         p_site_2_stop = np.zeros(300)  # 250
@@ -156,11 +156,11 @@ class CoverageModel:
                 self.stop_factor = 1
             if p_site_2_stop[217] < 100:
                 warnings.warn(
-                    f"only {p_site_2_stop[217]} reads at stop codon position. Low evidence for coverage model"
+                    f"only {p_site_2_stop[217]} reads at stop codon position. Low evidence for coverage model. sample: {sample_bam_path}"
                 )
-            if p_site_2_stop[217 - 198 : 217 : 3].mean() < 100:
+            if p_site_2_stop[217 - 198 : 217 : 3].sum() < 100:
                 warnings.warn(
-                    f"only {p_site_2_stop[217 - 198 : 217 : 3].sum()} reads at middle codon position. Low evidence for coverage model"
+                    f"only {p_site_2_stop[217 - 198 : 217 : 3].sum()} reads at middle codon position. Low evidence for coverage model. sample: {sample_bam_path}"
                 )
 
     def get_coverage_factor(self, position: CoveragePosition) -> float:

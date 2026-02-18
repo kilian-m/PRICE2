@@ -6,9 +6,6 @@ import shutil
 import time
 
 import HTSeq
-import numba as nb
-
-nb.set_num_threads(1)
 
 from reference_annotation import ReferenceAnnotation
 from data_collector import DataCollector
@@ -57,7 +54,7 @@ if __name__ == "__main__":
     db_path = f"{wdir}/price.db"
     data_collector = DataCollector(ref_annotation, genome, config)
 
-    print("compute cleavage models...", end="", flush=True)
+    print("compute cleavage and coverage models...", end="", flush=True)
     start = time.time()
     data_collector.collect_runs()
     end = time.time()
@@ -79,6 +76,15 @@ if __name__ == "__main__":
     ### run ORF deconvolution ###
     #############################
 
+    # del genome
+    # del ref_annotation
+    # l = len(data_collector.runs)
+    # del data_collector
+    #
+    # import gc
+    #
+    # gc.collect()
+
     orf_activity_estimator = ORFActivityEstimator(config)
 
     print(
@@ -90,13 +96,13 @@ if __name__ == "__main__":
     end = time.time()
     print(f"{end - start:.2e} seconds", flush=True)
 
-    with open(f"{odir}/failed_loci.txt", "w") as f:
-        for loc_id, e in orf_activity_estimator.failed_loci.items():
-            if hasattr(e, "traceback"):
-                f.write(f"{loc_id}\n{e.traceback}\n\n\n")
-            else:
-                f.write(f"{loc_id}\n{e}\n\n\n")
+    # with open(f"{odir}/failed_loci.txt", "w") as f:
+    #     for loc_id, e in orf_activity_estimator.failed_loci.items():
+    #         if hasattr(e, "traceback"):
+    #             f.write(f"{loc_id}\n{e.traceback}\n\n\n")
+    #         else:
+    #             f.write(f"{loc_id}\n{e}\n\n\n")
 
-    print(f"orf deconvolution done in {end - start:.2e} seconds")
-    print(f"successful loci: {len(orf_activity_estimator.loci)}")
-    print(f"failed loci: {len(orf_activity_estimator.failed_loci)}")
+    # print(f"orf deconvolution done in {end - start:.2e} seconds")
+    # print(f"successful loci: {len(orf_activity_estimator.loci)}")
+    # print(f"failed loci: {len(orf_activity_estimator.failed_loci)}")

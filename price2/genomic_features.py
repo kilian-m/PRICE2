@@ -27,6 +27,7 @@ class Transcript:
         self.exon_length = 0
         self.orf_set = set()
         self.rgr_set = set()
+        self.biotype = feature.attr.get("transcript_biotype", "unknown")
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -205,3 +206,10 @@ class ReadGeneratingRegion:
                 s += f"{seq_id}\t{source}\tCDS\t{interval.start+1}\t{interval.end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
 
         return s
+
+    def to_tsv_line(self, loc_id: str) -> str:
+        #  ID, ENSG, loc_id, location in chrom_strand:intervals
+        id = self.id
+        gene_id = self.transcript.gene_id
+        ivs = str(self.genomic_region)
+        return f"{id}\t{gene_id}\t{loc_id}\t{ivs}\n"

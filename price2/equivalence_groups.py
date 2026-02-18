@@ -341,7 +341,7 @@ def traverse_dag(splice_graph, read_length) -> dict:
     return read_equivalence_graph
 
 
-def bla(source_node, egis, read_length, oua):
+def get_equivalence_groups_dict(source_node, egis, read_length, oua):
     egs_dict = {}
     stack = []
     stack.append(source_node)
@@ -389,7 +389,9 @@ def make_equivalence_groups(loc, runs):
                     for tr in loc.transcripts
                 }
 
-                for k, v in bla(read_equivalence_graph, egis, read_length, oua).items():
+                for k, v in get_equivalence_groups_dict(
+                    read_equivalence_graph, egis, read_length, oua
+                ).items():
 
                     try:
                         egs[run][k].length += v.length

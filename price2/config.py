@@ -24,11 +24,15 @@ class Config:
     fasta_path: str = ""
     # bam directory with mapped ribo-seq runs
     bam_dir: str = ""
+    # optional list of bam ids if only a subset of bams in bam_dir should be considered
+    bam_ids: list[str] = None
 
     # number of parallel processes
     processes: int = 80
     # timeout for each locus in seconds
     timeout: int = 60 * 30
+    # memory limit for each worker in GB
+    memory_limit_gb: int = 5
     # recompute everything if false
     warm_start: bool = True
     # if true, write gtf file of retained ORFs for each intermediate step
@@ -38,15 +42,15 @@ class Config:
     # number of loci to process, for debugging, set to 0 for all, REMOVE
     loci_subset: int = 0  # 0 for all / temporary
 
+    # only keep the set of transcripts that are necessary to explain the most observed reads
+    # number of reads that need to be explained by a single transcript per run to be retained
+    min_explained_reads_per_run: int = 5
+
     # ORF candidate filtering based on well fitting reads
     # coverage filter removes ORFs with low average coverage of well fitting reads (consider max across all runs)
     coverage_filter: bool = True
     # threshold for coverage filter
-    min_well_fitting_reads_per_length: float = 0.1  # 1
-
-    # only keep the set of transcripts that are necessary to explain the most observed reads
-    # number of reads that need to be explained by a single transcript per run to be retained
-    min_explained_reads_per_run: int = 5
+    min_well_fitting_reads_per_length: float = 0.1
 
     # consider ORFs that are compatible with the same exons and ending in the same stop codon
     # deconvolute on these stop groups based on well fitting reads (within one each run)
@@ -79,7 +83,12 @@ class Config:
     # threshold for likelihood ratio
     likelihood_ratio_alpha: float = 1e-10
     # loci information is not saved in master processes to save memory
-    safe_memory: bool = False
+    save_memory: bool = True
+
+    # start codons to consider when generating ORF candidates
+    start_codons: tuple = ("ATG", "CTG", "GTG", "ACG")
+    # stop codons to consider when generating ORF candidates
+    stop_codons: tuple = ("TAA", "TAG", "TGA")
 
     @classmethod
     def make_config(cls, **kwargs):
