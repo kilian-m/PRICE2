@@ -1,3 +1,5 @@
+"""Reference annotation loading and interval indexing from GTF files."""
+
 import HTSeq
 
 from price2.genomic_region import GenomicRegion
@@ -5,11 +7,36 @@ from price2.genomic_features import Transcript
 
 
 class ReferenceAnnotation:
+    """Index a GTF reference annotation for fast interval queries.
+
+    Parses a GTF file and builds interval-indexed data structures for
+    transcripts, exons, and CDS regions, enabling efficient lookup of
+    transcripts overlapping a given genomic region.
+
+    Attributes
+    ----------
+    cds_intervals : HTSeq.GenomicArrayOfSets
+        Interval index mapping genomic positions to transcripts whose CDS
+        overlaps those positions.
+    transcripts : dict[str, Transcript]
+        Mapping from transcript ID to :class:`~price2.genomic_features.Transcript`
+        object.
+    transcript_intervals : HTSeq.GenomicArrayOfSets
+        Interval index mapping genomic positions to transcripts whose exons
+        overlap those positions.
+    """
     cds_intervals: HTSeq.GenomicArrayOfSets
-    transcripts: dict[str:Transcript]
+    transcripts: dict[str, Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
 
-    def __init__(self, gtf_path: str):  # , canonical: bool = False
+    def __init__(self, gtf_path: str) -> None:
+        """Parse a GTF file and build genomic interval indexes.
+
+        Parameters
+        ----------
+        gtf_path : str
+            Path to the GTF annotation file.
+        """
         chromosomes = set()
         self.cds_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
         self.transcripts = {}
@@ -49,7 +76,19 @@ class ReferenceAnnotation:
         for transcript in self.transcripts.values():
             transcript.cds_regions_to_cds_intervals()
 
-    def collect_coding_transcripts(self, region: GenomicRegion):
+    def collect_coding_transcripts(self, region: GenomicRegion) -> set[Transcript]:
+        """Return all transcripts with a CDS overlapping *region*.
+
+        Parameters
+        ----------
+        region : GenomicRegion
+            The genomic region to query.
+
+        Returns
+        -------
+        set[Transcript]
+            Transcripts whose CDS intervals overlap any exon of *region*.
+        """
         transcripts = set()
         for interval in region.intervals:
             try:
@@ -59,7 +98,19 @@ class ReferenceAnnotation:
                 pass
         return transcripts
 
-    def collect_transcripts(self, region: GenomicRegion):
+    def collect_transcripts(self, region: GenomicRegion) -> set[Transcript]:
+        """Return all transcripts with an exon overlapping *region*.
+
+        Parameters
+        ----------
+        region : GenomicRegion
+            The genomic region to query.
+
+        Returns
+        -------
+        set[Transcript]
+            Transcripts whose exon intervals overlap any exon of *region*.
+        """
         transcripts = set()
         for interval in region.intervals:
             for iv, value in self.transcript_intervals[interval].steps():

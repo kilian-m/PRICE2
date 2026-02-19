@@ -1,108 +1,228 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 import json
 
 
 @dataclass
 class Config:
-    # REQUIRED
-    # base directory
-    # generally the folder structure is:
-    # base_dir/
-    #   o_dir/
-    #   w_dir/
+    """Configuration for a PRICE2 run.
+
+    All parameters are loaded from a JSON file via :meth:`make_config`.
+    Paths that are left as empty strings are derived automatically from
+    ``base_dir`` in :meth:`__post_init__`.
+
+    The directory layout assumed by default::
+
+        base_dir/
+        ├── o_dir/      # output
+        ├── w_dir/      # working / SQLite database
+        ├── bam_dir/    # mapped Ribo-seq BAM files
+        └── logs/       # log files
+
+    Parameters
+    ----------
+    base_dir : str
+        Root directory for the run.  All relative paths default to
+        subdirectories of this directory (required).
+    o_dir : str
+        Output directory.  Defaults to ``<base_dir>/o_dir``.
+    w_dir : str
+        Working directory (holds ``price.db`` SQLite database).
+        Defaults to ``<base_dir>/w_dir``.
+    l_file : str
+        Log file path.  Defaults to ``<base_dir>/logs/process.log``.
+    gtf_path : str
+        Path to the reference annotation GTF file.
+    fasta_path : str
+        Path to the reference genome FASTA file.
+    bam_dir : str
+        Directory containing mapped Ribo-seq BAM files.
+        Defaults to ``<base_dir>/bam_dir``.
+    bam_ids : list[str] or None
+        Optional subset of BAM file identifiers to process.  When
+        ``None`` all BAM files found in ``bam_dir`` are used.
+    processes : int
+        Number of parallel worker processes.
+    timeout : int
+        Per-locus timeout in seconds.
+    memory_limit_gb : int
+        Per-worker memory limit in gigabytes.
+    warm_start : bool
+        When ``True``, reuse cached intermediate results stored in the
+        working directory.  When ``False``, recompute from scratch.
+    verbose_gtf : bool
+        Write GTF files of retained ORFs after each filtering step.
+    pseudo_min : float
+        Lower bound applied to activity estimates during optimisation to
+        avoid ``log(0)`` numerical instability.
+    loci_subset : int
+        Limit the number of loci to process (0 = no limit).  Intended
+        for debugging only.
+    min_explained_reads_per_run : int
+        Minimum number of reads that must be explained by a single
+        transcript per run for that transcript to be retained.
+    coverage_filter : bool
+        Enable the coverage filter, which removes ORF candidates with
+        insufficient average well-fitting read coverage.
+    min_well_fitting_reads_per_length : float
+        Coverage-filter threshold: minimum well-fitting reads per
+        nucleotide length (taken as the maximum across all runs).
+    deconvolution_filter : bool
+        Enable the pre-deconvolution filter that removes ORF candidates
+        with low estimated activity within stop-codon groups.
+    deconvolution_filter_min_activity : float
+        Minimum activity threshold used by the deconvolution filter.
+    stop_factor_relative : float
+        Convergence criterion for the main optimisation: stop when the
+        relative change in every activity falls below this value.
+    ftol : float
+        ``ftol`` tolerance passed to ``scipy.optimize.minimize``
+        (L-BFGS-B).  Set to 0 to rely solely on ``stop_factor_relative``.
+    gtol : float
+        ``gtol`` tolerance passed to ``scipy.optimize.minimize``
+        (L-BFGS-B).  Set to 0 to rely solely on ``stop_factor_relative``.
+    maxls : int
+        Maximum number of line-search steps in all optimisations.
+    lam : float
+        Group-LASSO regularisation strength λ.
+    rgrs_to_remove_fraction : float
+        Fraction of RGRs that must have low activity before iterative
+        removal is triggered during main deconvolution.
+    rgr_min_activity : float
+        Minimum activity (in at least one run) for an RGR to be retained.
+    min_activity_fraction : float
+        Minimum activity expressed as a fraction of the canonical ORF
+        activity for an ORF to be retained.
+    likelihood_ratio_filter : bool
+        Apply a likelihood-ratio test as the final filtering step.
+    likelihood_ratio_alpha : float
+        Significance threshold for the likelihood-ratio test.
+    save_memory : bool
+        When ``True``, locus objects are not stored in the master process
+        to reduce peak memory usage.
+    start_codons : tuple[str, ...]
+        Codons accepted as translation start sites for ORF candidate
+        generation.
+    stop_codons : tuple[str, ...]
+        Codons accepted as translation stop sites for ORF candidate
+        generation.
+    """
+
+    # ------------------------------------------------------------------ #
+    # Required                                                             #
+    # ------------------------------------------------------------------ #
     base_dir: str
 
-    # output directory
+    # ------------------------------------------------------------------ #
+    # Paths (derived from base_dir when left empty)                       #
+    # ------------------------------------------------------------------ #
     o_dir: str = ""
-    # working directory
     w_dir: str = ""
-    # log file
     l_file: str = ""
-    # reference annotation gtf path
     gtf_path: str = ""
-    # reference genome fasta path
     fasta_path: str = ""
-    # bam directory with mapped ribo-seq runs
     bam_dir: str = ""
-    # optional list of bam ids if only a subset of bams in bam_dir should be considered
-    bam_ids: list[str] = None
+    bam_ids: list[str] | None = None
 
-    # number of parallel processes
+    # ------------------------------------------------------------------ #
+    # Parallelism & runtime                                                #
+    # ------------------------------------------------------------------ #
     processes: int = 80
-    # timeout for each locus in seconds
     timeout: int = 60 * 30
-    # memory limit for each worker in GB
     memory_limit_gb: int = 5
-    # recompute everything if false
     warm_start: bool = True
-    # if true, write gtf file of retained ORFs for each intermediate step
     verbose_gtf: bool = True
-    # lower bounds for activity estimates in optimization processes because of numerical instability at 0
     pseudo_min: float = 1e-14
-    # number of loci to process, for debugging, set to 0 for all, REMOVE
-    loci_subset: int = 0  # 0 for all / temporary
+    loci_subset: int = 0
 
-    # only keep the set of transcripts that are necessary to explain the most observed reads
-    # number of reads that need to be explained by a single transcript per run to be retained
+    # ------------------------------------------------------------------ #
+    # Transcript pre-filtering                                             #
+    # ------------------------------------------------------------------ #
     min_explained_reads_per_run: int = 5
 
-    # ORF candidate filtering based on well fitting reads
-    # coverage filter removes ORFs with low average coverage of well fitting reads (consider max across all runs)
+    # ------------------------------------------------------------------ #
+    # Coverage filter                                                      #
+    # ------------------------------------------------------------------ #
     coverage_filter: bool = True
-    # threshold for coverage filter
     min_well_fitting_reads_per_length: float = 0.1
 
-    # consider ORFs that are compatible with the same exons and ending in the same stop codon
-    # deconvolute on these stop groups based on well fitting reads (within one each run)
-    # remove ORFs with low estimated activity in all runs
+    # ------------------------------------------------------------------ #
+    # Deconvolution filter                                                 #
+    # ------------------------------------------------------------------ #
     deconvolution_filter: bool = True
-    # threshold for deconvolution filter
     deconvolution_filter_min_activity: float = 0.1
 
-    # main ORF deconvolution is done by maximizing a regularized poisson likelihood with regards to ORF activities
-    # stop iteration if the relative change in each activity is less than this value (or the activity is small)
+    # ------------------------------------------------------------------ #
+    # Main optimisation                                                    #
+    # ------------------------------------------------------------------ #
     stop_factor_relative: float = 0.01
-    # ftol and gtol for scipy.optimize.minimize as alternatives to stop_factor_relative
-    ftol: float = 0  # 1e-10  # 1e-6  #
-    gtol: float = 0  # 1e-10  # 1e-6  #
-    # maximal steps in line search in all optimizations
+    ftol: float = 0
+    gtol: float = 0
     maxls: int = 200
-    # regularization strength lamba, 100 seems to work well in simulated data
     lam: float = 100
 
-    # in main deconvolution rgrs with low activity are removed
-    # fraction of rgrs that need to have low activity to start this process
+    # ------------------------------------------------------------------ #
+    # RGR activity thresholds                                              #
+    # ------------------------------------------------------------------ #
     rgrs_to_remove_fraction: float = 0.5
-    # minimal activity (in at least one run) for rgrs to be retained, used at various places
     rgr_min_activity: float = 0.01
-    # minimal fraction of the canonical ORF activity to be retained
-    min_activity_fraction: float = 0.1  # 0.1
+    min_activity_fraction: float = 0.1
 
-    # apply likelihood ratio
+    # ------------------------------------------------------------------ #
+    # Likelihood-ratio filter                                              #
+    # ------------------------------------------------------------------ #
     likelihood_ratio_filter: bool = True
-    # threshold for likelihood ratio
     likelihood_ratio_alpha: float = 1e-10
-    # loci information is not saved in master processes to save memory
     save_memory: bool = True
 
-    # start codons to consider when generating ORF candidates
-    start_codons: tuple = ("ATG", "CTG", "GTG", "ACG")
-    # stop codons to consider when generating ORF candidates
-    stop_codons: tuple = ("TAA", "TAG", "TGA")
+    # ------------------------------------------------------------------ #
+    # ORF candidate generation                                             #
+    # ------------------------------------------------------------------ #
+    start_codons: tuple[str, ...] = ("ATG", "CTG", "GTG", "ACG")
+    stop_codons: tuple[str, ...] = ("TAA", "TAG", "TGA")
+
+    # ------------------------------------------------------------------ #
+    # Factory                                                              #
+    # ------------------------------------------------------------------ #
 
     @classmethod
-    def make_config(cls, **kwargs):
+    def make_config(cls, **kwargs: object) -> Config:
+        """Create a :class:`Config` from keyword arguments and/or a JSON file.
+
+        When ``config`` is present in *kwargs* its value is treated as a
+        path to a JSON configuration file.  Values supplied directly as
+        keyword arguments take precedence over those in the file.
+        Unknown keys are silently ignored.
+
+        Parameters
+        ----------
+        **kwargs : object
+            Arbitrary keyword arguments.  The special key ``config`` may
+            point to a JSON file path; all remaining keys must correspond
+            to :class:`Config` field names.
+
+        Returns
+        -------
+        Config
+            A fully initialised :class:`Config` instance.
+
+        Examples
+        --------
+        >>> cfg = Config.make_config(config="run.json", lam=50)
+        >>> cfg = Config.make_config(base_dir="/data/run1", lam=200)
+        """
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
         if "config" in kwargs:
-            with open(kwargs["config"], "r") as f:
+            with open(kwargs["config"], "r") as f:  # type: ignore[arg-type]
                 json_dict = json.load(f)
             kwargs = {**json_dict, **kwargs}
 
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_fields}
-
         return cls(**filtered_kwargs)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Resolve empty path fields to their default locations under ``base_dir``."""
         if self.o_dir == "":
             self.o_dir = f"{self.base_dir}/o_dir"
         if self.w_dir == "":

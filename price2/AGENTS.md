@@ -13,10 +13,27 @@
 - Run the tests and ensure that they fail prior to generating any solutions.
 - Write code that passes the tests.
 - **IMPORTANT:** Do not modify the tests simply so that the code passes. Only modify the tests if you identify a specific error in the test.
+- if code in unclear to you ask me what it is supposed to do
+- **IMPORTANT:** I have not focused on testing the code before. This process needs human supervision. For now do not apply this strategy. Ignore testing.
 
 ## Current Development Priorities
 
 1. **Code cleanup:** The codebase needs cleaning up — add docstrings, type hints, tests and improve structure.
+    list of files to clean up
+    - cleavage_model.py ✔
+    - coverage_model.py ✔
+    - price.py ✔
+    - config.py ✔
+    - reference_annotation.py ✔
+    - genomic_region.py ✔
+    - genomic_features.py ✔
+    - ribo_seq_alignment.py ✔
+    - ribo_seq_run.py ✔
+    - equivalence_groups.py
+    - data_collector.py
+    - locus.py
+    - orf_activity_estimator.py
+    - job_scheduler.py
 2. **Deconvolution algorithm:** Improve the core ORF deconvolution algorithm.
 3. **New features:** Add new functionality after the algorithm is solid.
 4. **Performance:** Optimize after features are stable.

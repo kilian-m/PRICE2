@@ -1,24 +1,81 @@
+"""Genomic region representation for multi-exonic coordinate handling.
+
+Provides the ``GenomicRegion`` class for representing potentially
+multi-exonic genomic regions and performing coordinate transformations
+between genomic and region-local coordinate systems.
+
+Notes
+-----
+Intervals are stored in **chromosome order** (ascending start
+coordinate), regardless of strand.  For negative-strand regions this
+is the reverse of translation order.  The project convention is
+0-based, half-open coordinates throughout.
+"""
+
+from __future__ import annotations
+
 import HTSeq
+import pandas as pd
 from HTSeq import GenomicInterval
 
 
 class GenomicRegion:
-    strand: str
+    """A possibly multi-exonic genomic region on a single chromosome.
+
+    Intervals are stored in chromosome order (ascending start position).
+    All coordinates are 0-based, half-open.
+
+    Attributes
+    ----------
+    chrom : str
+        Chromosome / reference sequence name.
+    strand : str
+        ``'+'`` or ``'-'``.
+    intervals : list[GenomicInterval]
+        Exonic intervals in chromosome order.
+    length : int
+        Total spliced length (sum of exon lengths).
+    """
+
     chrom: str
-    intervals: list[GenomicInterval]  # in order of the strand (like in GTF file)
+    strand: str
+    intervals: list[GenomicInterval]
+    length: int
 
     def __init__(
         self,
-        intervals: list[GenomicInterval] = None,
-        chrom: str = None,
-        strand: str = None,
-        df=None,
-        gi_string: str = None,
+        intervals: list[GenomicInterval] | None = None,
+        chrom: str | None = None,
+        strand: str | None = None,
+        df: pd.DataFrame | None = None,
+        gi_string: str | None = None,
     ) -> None:
+        """Create a ``GenomicRegion``.
+
+        Exactly one of *intervals*, *df*, or *gi_string* must be given.
+
+        Parameters
+        ----------
+        intervals : list[GenomicInterval] | None
+            Pre-built HTSeq ``GenomicInterval`` objects.
+        chrom : str | None
+            Chromosome name (inferred from *intervals* if omitted).
+        strand : str | None
+            Strand (inferred from *intervals* if omitted).
+        df : pd.DataFrame | None
+            DataFrame with columns ``chrom``, ``start``, ``end``,
+            ``strand``.
+        gi_string : str | None
+            Compact string representation, e.g.
+            ``"chr1+:100-200|300-400"``.
+        """
         if df is not None:
             self.intervals = [
                 HTSeq.GenomicInterval(
-                    row["chrom"], row["start"], row["end"], row["strand"]
+                    row["chrom"],
+                    row["start"],
+                    row["end"],
+                    row["strand"],
                 )
                 for _, row in df.iterrows()
             ]
@@ -38,21 +95,14 @@ class GenomicRegion:
             self.strand = strand
             self.intervals = intervals
         else:
-            if chrom:
-                self.chrom = chrom
-            else:
-                self.chrom = intervals[0].chrom
-            if strand:
-                self.strand = strand
-            else:
-                self.strand = intervals[0].strand
+            self.chrom = chrom if chrom else intervals[0].chrom
+            self.strand = strand if strand else intervals[0].strand
             self.intervals = intervals
 
-        self.length = sum([x.end - x.start for x in self.intervals])
-
+        self.length = sum(iv.end - iv.start for iv in self.intervals)
         self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, GenomicRegion):
             return False
         return (
@@ -61,41 +111,65 @@ class GenomicRegion:
             and self.strand == other.strand
         )
 
-    def __hash__(self):
-        # hash changes when intervals are added!!!
+    def __hash__(self) -> int:
+        # NOTE: hash changes when intervals are added via add_interval.
         return self.hash
-        # return hash((self.strand, self.chrom, tuple(self.intervals)))
 
-    def __str__(self):
+    def __str__(self) -> str:
         s = f"{self.chrom}{self.strand}"
-        for i in self.intervals:
-            s += f":[{i.start},{i.end})"
+        for iv in self.intervals:
+            s += f":[{iv.start},{iv.end})"
         return s
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return str(self)
 
-    def __len__(self):
-        # try:
-        #    return self.length
-        # except AttributeError:
-        #    self.length = sum([x.end - x.start for x in self.intervals])
-        #    return self.length
+    def __len__(self) -> int:
         if self.length == 0:
-            self.length = sum([x.end - x.start for x in self.intervals])
+            self.length = sum(iv.end - iv.start for iv in self.intervals)
         return self.length
-        # return sum([x.end - x.start for x in self.intervals])
 
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
+        """Append an exon interval and recompute the hash.
+
+        Parameters
+        ----------
+        interval : HTSeq.GenomicInterval
+            Interval to append.
+
+        Notes
+        -----
+        Calling this method invalidates any previously stored hash.
+        """
         self.intervals.append(interval)
         self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
-    # other is a region that lies within the query region
-    # return the coordinates relative to the query
-    def induce(self, other: "GenomicRegion") -> tuple[int, int]:
+    def induce(self, other: GenomicRegion) -> tuple[int, int]:
+        """Express *other* as region-local coordinates within *self*.
 
+        *other* must be a sub-region of *self* (same exon structure
+        in the overlapping part).
+
+        Parameters
+        ----------
+        other : GenomicRegion
+            Region whose coordinates should be expressed
+            relative to *self*.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(start, end)`` in spliced region-local coordinates
+            (0-based, half-open).
+
+        Raises
+        ------
+        ValueError
+            If *other* is on a different chromosome/strand or
+            is not compatible with *self*'s exon structure.
+        """
         if self.chrom != other.chrom or self.strand != other.strand:
-            raise ValueError("Query region is not compatible with reference region.")
+            raise ValueError("Query region is not compatible with reference " "region.")
         ref_intervals = self.intervals
         query_intervals = other.intervals
 
@@ -103,13 +177,19 @@ class GenomicRegion:
             exons_end = ref_intervals[0].end
             ref_intervals = [
                 HTSeq.GenomicInterval(
-                    ri.chrom, exons_end - ri.end, exons_end - ri.start, ri.strand
+                    ri.chrom,
+                    exons_end - ri.end,
+                    exons_end - ri.start,
+                    ri.strand,
                 )
                 for ri in ref_intervals
             ]
             query_intervals = [
                 HTSeq.GenomicInterval(
-                    qi.chrom, exons_end - qi.end, exons_end - qi.start, qi.strand
+                    qi.chrom,
+                    exons_end - qi.end,
+                    exons_end - qi.start,
+                    qi.strand,
                 )
                 for qi in query_intervals
             ]
@@ -117,20 +197,20 @@ class GenomicRegion:
         # overlapping part
         s = max(ref_intervals[0].start, query_intervals[0].start)
         e = min(ref_intervals[-1].end, query_intervals[-1].end)
-        cut_query_intervals = cut_intervals(query_intervals, s, e)
-        cut_ref_intervals = cut_intervals(ref_intervals, s, e)
-        if cut_query_intervals != cut_ref_intervals:
-            raise ValueError("Query region is not compatible with reference region.")
+        cut_query = cut_intervals(query_intervals, s, e)
+        cut_ref = cut_intervals(ref_intervals, s, e)
+        if cut_query != cut_ref:
+            raise ValueError("Query region is not compatible with reference " "region.")
 
         # upstream part
         upstream_query = cut_intervals(query_intervals, query_intervals[0].start, s)
         if len(upstream_query) > 1:
-            raise ValueError("Query region is not compatible with reference region.")
+            raise ValueError("Query region is not compatible with reference " "region.")
 
         # downstream part
         downstream_query = cut_intervals(query_intervals, e, query_intervals[-1].end)
         if len(downstream_query) > 1:
-            raise ValueError("Query region is not compatible with reference region.")
+            raise ValueError("Query region is not compatible with reference " "region.")
 
         upstream_ref = cut_intervals(ref_intervals, ref_intervals[0].start, s)
 
@@ -143,102 +223,138 @@ class GenomicRegion:
                 - ref_intervals[-1].end
             )
         else:
-            start = sum([x[1] - x[0] for x in upstream_ref])
-        end = start + sum([x.end - x.start for x in query_intervals])
+            start = sum(x[1] - x[0] for x in upstream_ref)
+        end = start + sum(iv.end - iv.start for iv in query_intervals)
         return (start, end)
 
-    # iv_in_region are the coordinates of the interval in the region
-    # return the coordinates of the interval in genomic coordinates
-    def map(self, iv_in_region: tuple[int, int]) -> "GenomicRegion":
+    def map(self, iv_in_region: tuple[int, int]) -> GenomicRegion:
+        """Map region-local coordinates back to genomic coordinates.
+
+        Parameters
+        ----------
+        iv_in_region : tuple[int, int]
+            ``(start, end)`` in spliced region-local coordinates
+            (0-based, half-open).
+
+        Returns
+        -------
+        GenomicRegion
+            New ``GenomicRegion`` covering the mapped genomic
+            intervals.
+        """
         start_in_region, end_in_region = iv_in_region
         if self.strand == "+":
-            s = 0  # exon length from transcript start
-            interval_index = 0
-            region_starts = []
-            region_ends = []
+            s = 0  # cumulative exon length from transcript start
+            idx = 0
+            region_starts: list[int] = []
+            region_ends: list[int] = []
             while (
-                interval_index < len(self.intervals) - 1
-                and s + self.intervals[interval_index].length < start_in_region
+                idx < len(self.intervals) - 1
+                and s + self.intervals[idx].length < start_in_region
             ):
-                s += self.intervals[interval_index].length
-                interval_index += 1
-            region_starts.append(
-                self.intervals[interval_index].start + start_in_region - s
-            )
+                s += self.intervals[idx].length
+                idx += 1
+            region_starts.append(self.intervals[idx].start + start_in_region - s)
 
             while (
-                interval_index < len(self.intervals) - 1
-                and s + self.intervals[interval_index].length < end_in_region
+                idx < len(self.intervals) - 1
+                and s + self.intervals[idx].length < end_in_region
             ):
-                region_ends.append(self.intervals[interval_index].end)
-                s += self.intervals[interval_index].length
-                interval_index += 1
-                region_starts.append(self.intervals[interval_index].start)
-            region_ends.append(self.intervals[interval_index].start + end_in_region - s)
+                region_ends.append(self.intervals[idx].end)
+                s += self.intervals[idx].length
+                idx += 1
+                region_starts.append(self.intervals[idx].start)
+            region_ends.append(self.intervals[idx].start + end_in_region - s)
 
             ivs = zip(region_starts, region_ends)
 
         elif self.strand == "-":
             s = 0
-            interval_index = 0
-            region_length = end_in_region - start_in_region
+            idx = 0
             region_starts = []
             region_ends = []
 
             while (
-                interval_index < len(self.intervals) - 1
-                and s + self.intervals[interval_index].length < start_in_region
+                idx < len(self.intervals) - 1
+                and s + self.intervals[idx].length < start_in_region
             ):
-                s += self.intervals[interval_index].length
-                interval_index += 1
-            region_start = self.intervals[interval_index].end - (start_in_region - s)
-            region_starts.append(region_start)
+                s += self.intervals[idx].length
+                idx += 1
+            region_starts.append(self.intervals[idx].end - (start_in_region - s))
 
             while (
-                interval_index < len(self.intervals) - 1
-                and s + self.intervals[interval_index].length < end_in_region
+                idx < len(self.intervals) - 1
+                and s + self.intervals[idx].length < end_in_region
             ):
-                region_ends.append(self.intervals[interval_index].start)
-                s += self.intervals[interval_index].length
-                interval_index += 1
-                region_starts.append(self.intervals[interval_index].end)
-            region_ends.append(self.intervals[interval_index].end - (end_in_region - s))
+                region_ends.append(self.intervals[idx].start)
+                s += self.intervals[idx].length
+                idx += 1
+                region_starts.append(self.intervals[idx].end)
+            region_ends.append(self.intervals[idx].end - (end_in_region - s))
 
             ivs = zip(region_ends, region_starts)
 
         region_intervals = [
             HTSeq.GenomicInterval(self.chrom, rs, re, self.strand)
             for rs, re in ivs
-            if not rs == re
+            if rs != re
         ]
         return GenomicRegion(
-            intervals=region_intervals, strand=self.strand, chrom=self.chrom
+            intervals=region_intervals,
+            strand=self.strand,
+            chrom=self.chrom,
         )
 
-    def get_sequence(self, genome: dict[str : HTSeq._HTSeq.Sequence]) -> str:
-        sequence = ""
-        if self.strand == "+":
-            for interval in self.intervals:
-                sequence += str(genome[self.chrom][interval.start : interval.end])
-        elif self.strand == "-":
-            for interval in self.intervals:
-                sequence += str(
-                    genome[self.chrom][
-                        interval.start : interval.end
-                    ].get_reverse_complement()
-                )
-        return sequence
+    def get_sequence(self, genome: dict[str, HTSeq._HTSeq.Sequence]) -> str:
+        """Extract the nucleotide sequence for this region.
 
-    # check if genomic region 'other' is contained in 'self' and they end in the same stop
-    def contains_to_stop(self, other: "GenomicRegion") -> bool:
+        On the negative strand each exon is reverse-complemented so
+        that the returned string is in 5'->3' (translation) order.
+
+        Parameters
+        ----------
+        genome : dict[str, HTSeq._HTSeq.Sequence]
+            Mapping of chromosome names to genome sequences.
+
+        Returns
+        -------
+        str
+            Spliced nucleotide sequence.
+        """
+        parts: list[str] = []
+        if self.strand == "+":
+            for iv in self.intervals:
+                parts.append(str(genome[self.chrom][iv.start : iv.end]))
+        elif self.strand == "-":
+            for iv in self.intervals:
+                parts.append(
+                    str(genome[self.chrom][iv.start : iv.end].get_reverse_complement())
+                )
+        return "".join(parts)
+
+    def contains_to_stop(self, other: GenomicRegion) -> bool:
+        """Check whether *other* is contained in *self* sharing the same stop end.
+
+        The two regions must share the same 3'-most exon
+        boundaries; *other* may start later (for ``+``) or
+        earlier (for ``-``) than *self*.
+
+        Parameters
+        ----------
+        other : GenomicRegion
+            Candidate sub-region.
+
+        Returns
+        -------
+        bool
+            ``True`` if *other* is contained in *self* and they
+            share the same stop-codon end.
+        """
         if self.strand != other.strand or self.chrom != other.chrom:
             return False
         if len(self.intervals) < len(other.intervals):
             return False
-        # if self.strand == '+':
-        #    s_ivs = self.intervals
-        #    o_ivs = other.intervals
-        # else:
+
         s_ivs = self.intervals[::-1]
         o_ivs = other.intervals[::-1]
 
@@ -247,9 +363,8 @@ class GenomicRegion:
             o_iv = o_ivs[i]
             if s_iv == o_iv:
                 continue
-            else:
-                if i + 1 < len(o_ivs):
-                    return False
+            if i + 1 < len(o_ivs):
+                return False
             if self.strand == "-":
                 if s_iv.start != o_iv.start or s_iv.end < o_iv.end:
                     return False
@@ -258,16 +373,32 @@ class GenomicRegion:
                     return False
         return True
 
-    def truncate(self, length, end) -> "GenomicRegion":
-        # end is "5'" or "3'"
-        # length is how much should be cut off
+    def truncate(self, length: int, end: str) -> GenomicRegion:
+        """Remove nucleotides from the 5' or 3' end.
+
+        Parameters
+        ----------
+        length : int
+            Number of nucleotides to remove.
+        end : str
+            Which end to truncate: ``"5'"`` or ``"3'"``.
+
+        Returns
+        -------
+        GenomicRegion
+            Truncated region.
+
+        Raises
+        ------
+        ValueError
+            If *length* is non-positive, exceeds the region
+            length, or *end* is invalid.
+        """
         if length <= 0:
-            raise ValueError("Length must be positive")
-
+            raise ValueError("Length must be positive.")
         if length >= self.length:
-            raise ValueError("Cannot truncate more than the total length")
+            raise ValueError("Cannot truncate more than the total length.")
 
-        # Calculate new start and end positions in region coordinates
         if end == "5'":
             new_start = length
             new_end = self.length
@@ -275,24 +406,38 @@ class GenomicRegion:
             new_start = 0
             new_end = self.length - length
         else:
-            raise ValueError("end must be '5'' or '3''")
+            raise ValueError('end must be "5\'" or "3\'".')
 
         return self.map((new_start, new_end))
 
 
-def cut_intervals(interval_list, start, end) -> list:
-    l = []
+def cut_intervals(
+    interval_list: list[GenomicInterval],
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    """Clip a list of intervals to ``[start, end)``.
+
+    Parameters
+    ----------
+    interval_list : list[GenomicInterval]
+        Intervals to clip.
+    start : int
+        Inclusive lower bound.
+    end : int
+        Exclusive upper bound.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Clipped ``(start, end)`` tuples for intervals that overlap
+        ``[start, end)``.
+    """
+    result: list[tuple[int, int]] = []
     for iv in interval_list:
-        if iv.end <= start:
-            pass
-        elif end <= iv.start:
-            pass
-        elif start <= iv.start <= iv.end <= end:
-            l.append((iv.start, iv.end))
-        elif iv.start < start < iv.end <= end:
-            l.append((start, iv.end))
-        elif start <= iv.start < end < iv.end:
-            l.append((iv.start, end))
-        elif iv.start < start < end < iv.end:
-            l.append((start, end))
-    return l
+        if iv.end <= start or end <= iv.start:
+            continue
+        clipped_start = max(iv.start, start)
+        clipped_end = min(iv.end, end)
+        result.append((clipped_start, clipped_end))
+    return result
