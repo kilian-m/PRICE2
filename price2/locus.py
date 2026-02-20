@@ -1,44 +1,92 @@
-from pickle import loads
-import sqlite3 as sql
-import zlib
-import HTSeq
-import pandas as pd
-import numpy as np
+"""Locus-level ORF deconvolution for PRICE2.
+
+Defines the :class:`Locus` class that aggregates overlapping transcripts
+into a single genomic unit, generates ORF candidates, runs group-LASSO
+penalised maximum-likelihood estimation, and applies filtering steps
+(coverage, deconvolution, likelihood-ratio) to identify actively
+translated regions.
+
+Standalone helper functions for ORF detection, Numba-accelerated
+objective functions, and the optimisation :class:`Callback` are also
+provided.
+"""
+
+from __future__ import annotations
+
 import math
-from scipy.stats import chi2
-import numba as nb
-
-from filelock import FileLock
-
-from scipy.optimize import minimize
-from numba import jit
-from numba.typed import List
-
-from collections import defaultdict
-
-
-from numba.core.errors import NumbaTypeSafetyWarning
+import sqlite3 as sql
+import time
 import warnings
+import zlib
+from collections import defaultdict
+from pickle import loads
 
-warnings.simplefilter("ignore", category=NumbaTypeSafetyWarning)
+import HTSeq
+import numpy as np
+import pandas as pd
+from filelock import FileLock
+from numba import jit
+from numba.core.errors import NumbaTypeSafetyWarning
+from numba.typed import List
+from scipy.optimize import minimize
+from scipy.stats import chi2
 
+from price2.config import Config
+from price2.coverage_model import CoveragePosition
+from price2.equivalence_groups import EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
-from price2.coverage_model import CoveragePosition
-from price2.equivalence_groups import EquivalenceGroup
+
+warnings.simplefilter("ignore", category=NumbaTypeSafetyWarning)
 
 
 class Locus:
-    # permanent properties
-    iv: HTSeq.GenomicInterval
-    read_count: int
-    read_counts: dict[RiboSeqRun, int]
-    rgr_set = set[ReadGeneratingRegion]
-    transcript_intervals: HTSeq.GenomicArrayOfSets
-    transcripts: set[Transcript]
+    """A genomic locus containing overlapping transcripts and ORF candidates.
 
-    egs: dict[EquivalenceGroup, EquivalenceGroup]
+    A locus aggregates one or more transcripts whose exons overlap on the
+    same strand into a single unit of analysis.  It generates candidate
+    :class:`ReadGeneratingRegion` objects (ORFs and noise regions),
+    constructs equivalence groups from mapped Ribo-seq reads, and runs
+    group-LASSO penalised Poisson-likelihood optimisation to identify
+    actively translated ORFs.
+
+    Attributes
+    ----------
+    iv : HTSeq.GenomicInterval
+        Genomic interval spanning the locus.
+    id : str
+        Unique identifier of the form ``"loc_<N>"``.
+    transcripts : set[Transcript]
+        Transcripts assigned to this locus.
+    transcript_intervals : HTSeq.GenomicArrayOfSets
+        Stranded genomic array mapping positions to overlapping
+        transcripts.
+    rgr_set : set[ReadGeneratingRegion]
+        Current set of ORF and noise RGR candidates.
+    rgr_intervals : HTSeq.GenomicArrayOfSets
+        Stranded genomic array mapping positions to overlapping RGRs.
+    egs : dict[RiboSeqRun, dict]
+        Per-run equivalence groups built during read assignment.
+    read_counts : dict[RiboSeqRun, int]
+        Number of reads assigned to this locus per run.
+    exon_length : int
+        Total exonic length (bp) covered by the locus.
+    result : np.ndarray | None
+        Activity matrix of shape ``(n_rgrs, n_runs)`` after
+        deconvolution, or ``None`` before estimation.
+    """
+
+    iv: HTSeq.GenomicInterval
+    id: str
+    transcripts: set[Transcript]
+    transcript_intervals: HTSeq.GenomicArrayOfSets
+    rgr_set: set[ReadGeneratingRegion]
+    rgr_intervals: HTSeq.GenomicArrayOfSets
+    egs: dict[RiboSeqRun, dict]
+    read_counts: dict[RiboSeqRun, int]
+    exon_length: int
+    result: np.ndarray | None
 
     def __init__(
         self,
@@ -46,11 +94,21 @@ class Locus:
         transcript_intervals: HTSeq.GenomicArrayOfSets,
         loci_number: int,
     ) -> None:
-        self.iv = iv
-        self.read_counts = dict()
+        """Initialise a Locus from a genomic interval.
 
+        Parameters
+        ----------
+        iv : HTSeq.GenomicInterval
+            Genomic interval spanning all transcripts in the locus.
+        transcript_intervals : HTSeq.GenomicArrayOfSets
+            Genome-wide stranded array mapping positions to transcript
+            sets; only the portion overlapping *iv* is retained.
+        loci_number : int
+            Sequential counter used to build :attr:`id`.
+        """
+        self.iv = iv
+        self.read_counts: dict[RiboSeqRun, int] = {}
         self.uncounted_reads = 0
-        self.times = dict()
         self.id = f"loc_{loci_number}"
 
         self.transcript_intervals = HTSeq.GenomicArrayOfSets(
@@ -60,7 +118,7 @@ class Locus:
         for iv, val in transcript_intervals[self.iv].steps():
             self.transcript_intervals[iv] = val
 
-        self.transcripts = set()
+        self.transcripts: set[Transcript] = set()
 
         self.exon_length = 0
         for iv, value in self.transcript_intervals.steps():
@@ -68,20 +126,37 @@ class Locus:
             if value:
                 self.exon_length += iv.length
 
-        self.lls = []  # for plotting
-
     def __repr__(self) -> str:
         return f"Locus({self.iv})"
 
     def make_rgrs(
         self,
-        genome: dict[str : HTSeq._HTSeq.Sequence],
-        config,
+        genome: dict[str, HTSeq.Sequence],
+        config: Config,
         min_length_to_end: int = 30,
     ) -> None:
-        self.rgr_set = set()
-        orf_dict = dict()
-        noise_dict = dict()
+        """Generate ORF and noise ReadGeneratingRegions for this locus.
+
+        For each transcript, noise regions are created upstream and
+        downstream of the annotated CDS (if present) or spanning the
+        full transcript otherwise.  ORF candidates are found by scanning
+        the spliced transcript sequence for start/stop codon pairs.
+        Duplicate RGRs (identical genomic footprint) are deduplicated,
+        keeping the copy with the longest flanking context.
+
+        Parameters
+        ----------
+        genome : dict[str, HTSeq.Sequence]
+            Chromosome-keyed genome sequences.
+        config : Config
+            Configuration providing ``start_codons`` and ``stop_codons``.
+        min_length_to_end : int
+            Minimum combined length of ORF plus flanking transcript
+            distance (in nucleotides) for an ORF to be retained.
+        """
+        self.rgr_set: set[ReadGeneratingRegion] = set()
+        orf_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
+        noise_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
 
         for transcript in self.transcripts:
             if (
@@ -104,20 +179,19 @@ class Locus:
                 )
 
                 for noise in [noise1, noise2]:
-                    if not noise in noise_dict:
+                    if noise not in noise_dict:
                         noise_dict[noise] = noise
                     else:
-                        alt_noise = noise_dict[noise]
-                        tmp1 = (
-                            alt_noise.dist_to_transcript_end
-                            + alt_noise.dist_to_transcript_start
+                        existing = noise_dict[noise]
+                        existing_span = (
+                            existing.dist_to_transcript_end
+                            + existing.dist_to_transcript_start
                         )
-
-                        tmp2 = (
+                        new_span = (
                             noise.dist_to_transcript_end
                             + noise.dist_to_transcript_start
                         )
-                        if tmp2 > tmp1:
+                        if new_span > existing_span:
                             noise_dict[noise] = noise
 
             else:
@@ -150,17 +224,16 @@ class Locus:
                     continue
                 if len(orf) + orf.dist_to_transcript_start < min_length_to_end:
                     continue
-                if not orf in orf_dict:
+                if orf not in orf_dict:
                     orf_dict[orf] = orf
                 else:
-                    alt_orf = orf_dict[orf]
-                    tmp1 = (
-                        alt_orf.dist_to_transcript_end
-                        + alt_orf.dist_to_transcript_start
+                    existing = orf_dict[orf]
+                    existing_span = (
+                        existing.dist_to_transcript_end
+                        + existing.dist_to_transcript_start
                     )
-
-                    tmp2 = orf.dist_to_transcript_end + orf.dist_to_transcript_start
-                    if tmp2 > tmp1:
+                    new_span = orf.dist_to_transcript_end + orf.dist_to_transcript_start
+                    if new_span > existing_span:
                         orf_dict[orf] = orf
 
         for noise in noise_dict.values():
@@ -173,76 +246,41 @@ class Locus:
         self.rgr_intervals = HTSeq.GenomicArrayOfSets(
             "auto", stranded=True, storage="step"
         )
-        l = list(self.rgr_set)
-        for i, rgr in enumerate(l):
+        for rgr in self.rgr_set:
             for iv in rgr.genomic_region.intervals:
                 self.rgr_intervals[iv] += rgr
 
         self.rgr_set_complete = self.rgr_set
-
-    def make_equivalence_groups_precise(self, runs: list[RiboSeqRun]) -> None:
-        # keep because this is definitely correct
-        warnings.warn(
-            "make_equivalence_groups_precise is deprecated", DeprecationWarning
-        )
-        self.egs = dict()
-
-        for run in runs:
-            self.egs[run] = dict()
-            lengths = dict()
-            steps = list(self.transcript_intervals.steps())
-            if self.iv.strand == "-":
-                steps = steps[::-1]
-            for step_iv, transcripts in steps:
-                if not transcripts:
-                    continue
-                for i in range(step_iv.length):
-                    reads = set()
-                    for transcript in transcripts:
-                        if not transcript in lengths:
-                            lengths[transcript] = 0
-                        for read_length in run.cleavage_model.non_zero_lengths:
-                            for oua in [True, False]:
-                                iv_on_transcript = (
-                                    lengths[transcript],
-                                    lengths[transcript] + read_length,
-                                )
-                                if iv_on_transcript[0] < 0 or iv_on_transcript[1] > len(
-                                    transcript
-                                ):
-                                    continue
-                                read_gr = transcript.exons.map(iv_on_transcript)
-                                rsa = RiboSeqAlignment(
-                                    {
-                                        "mapping_positions": 1,
-                                        "genomic_region": read_gr,
-                                        "untemplated_addition": oua,
-                                    }
-                                )
-                                reads.add(rsa)
-                        lengths[transcript] += 1
-
-                    for rsa in reads:
-                        rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
-                        if not rgr_frame_covpos:
-                            continue
-                        if (
-                            not (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
-                            in self.egs[run]
-                        ):
-                            self.egs[run][
-                                (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
-                            ] = EquivalenceGroup()
-                        self.egs[run][
-                            (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
-                        ].length += 1
 
     def get_rgr_frame_covpos(
         self,
         rsa: RiboSeqAlignment,
         run: RiboSeqRun,
         overlap_likelihood_ratio_threshold: float = 0.2,
-    ) -> frozenset[tuple[ReadGeneratingRegion, int | None]]:
+    ) -> frozenset[tuple[ReadGeneratingRegion, int | None, CoveragePosition]] | None:
+        """Determine which RGRs a read alignment is compatible with.
+
+        For each RGR overlapping the read, compute the reading frame and
+        coverage-profile position (start / middle / stop).  Partial
+        overlaps are kept only when the cleavage-model probability ratio
+        exceeds *overlap_likelihood_ratio_threshold*.
+
+        Parameters
+        ----------
+        rsa : RiboSeqAlignment
+            A single Ribo-seq read alignment.
+        run : RiboSeqRun
+            The Ribo-seq run that produced *rsa*.
+        overlap_likelihood_ratio_threshold : float
+            Minimum ratio of partial-overlap cleavage probability to
+            full-overlap probability for a partial overlap to be accepted.
+
+        Returns
+        -------
+        frozenset[tuple[ReadGeneratingRegion, int | None, CoveragePosition]] or None
+            Set of ``(rgr, frame, coverage_position)`` tuples, or
+            ``None`` when no compatible RGR is found.
+        """
 
         overlap_transcripts = set(self.transcripts)
 
@@ -410,86 +448,8 @@ class Locus:
         rgr_frame_covpos = frozenset(rgr_frame_covpos)
         return rgr_frame_covpos
 
-    def get_rgr_frames_alt(
-        self,
-        rsa: RiboSeqAlignment,
-        run: RiboSeqRun,
-        overlap_likelihood_ratio_threshold: float = 0.5,
-    ) -> frozenset[tuple[ReadGeneratingRegion, int | None]]:
-        overlap_transcripts = set(self.transcripts)
-
-        rgr_frame = set()
-
-        for query_iv in rsa.genomic_region.intervals:
-            for subject_iv, tr_set in self.transcript_intervals[query_iv].steps():
-                overlap_transcripts &= tr_set
-
-        for tr in overlap_transcripts:
-            try:
-                rsa_iv_on_tr = tr.exons.induce(rsa.genomic_region)
-            except ValueError:
-                continue
-            rgr_frame.add((tr.noise, None))
-
-            rsa_iv = HTSeq.GenomicInterval(
-                ".",
-                rsa_iv_on_tr[0],
-                rsa_iv_on_tr[1],
-                ".",
-            )
-            for phase in range(3):
-
-                step_sets = [
-                    step_set for _, step_set in tr.orf_intervals[phase][rsa_iv].steps()
-                ]
-
-                full_overlap = set.intersection(*step_sets)
-                if full_overlap:
-                    orf = next(iter(full_overlap))
-                    frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
-                    if (
-                        run.cleavage_model.pmf(
-                            len(rsa.genomic_region), rsa.untemplated_addition, frame
-                        )
-                        > 0
-                    ):
-                        for orf in full_overlap:
-                            rgr_frame.add((orf, frame))
-                processed_orfs = full_overlap
-
-                for step_set in step_sets:
-                    orfs = step_set - processed_orfs
-                    if not orfs:
-                        continue
-                    orf = next(iter(orfs))
-                    frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
-                    region_start = orf.iv_on_transcript[0] - rsa_iv_on_tr[0]
-                    region_end = orf.iv_on_transcript[1] - rsa_iv_on_tr[0]
-
-                    if (
-                        ol := run.cleavage_model.pmf(
-                            len(rsa),
-                            rsa.untemplated_addition,
-                            frame,
-                            region_start=region_start,
-                            region_end=region_end,
-                        )
-                    ) > 0:
-                        cl = run.cleavage_model.pmf(
-                            len(rsa), rsa.untemplated_addition, frame
-                        )
-                        if ol / cl > overlap_likelihood_ratio_threshold:
-                            for orf in orfs:
-                                rgr_frame.add((orf, frame))
-                    processed_orfs |= orfs
-
-        if not rgr_frame:
-            return
-
-        rgr_frame = frozenset(rgr_frame)
-        return rgr_frame
-
-    def gtf_line(self):
+    def gtf_line(self) -> str:
+        """Return a single GTF line describing this locus."""
         seq_id = self.iv.chrom
         source = "PRICE2"
         typ = "locus"
@@ -503,8 +463,29 @@ class Locus:
         return f"{seq_id}\t{source}\t{typ}\t{start}\t{end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
 
     def to_gtf(
-        self, prefix, write_loci=False, write_transcripts=False, write_orfs=True
-    ):
+        self,
+        prefix: str,
+        write_loci: bool = False,
+        write_transcripts: bool = False,
+        write_orfs: bool = True,
+    ) -> None:
+        """Append locus features to GTF files.
+
+        Files are created or appended to with file-lock protection for
+        concurrent writes from multiple worker processes.
+
+        Parameters
+        ----------
+        prefix : str
+            Path prefix; files are named ``<prefix>_loci.gtf``,
+            ``<prefix>_transcripts.gtf``, and ``<prefix>_orfs.gtf``.
+        write_loci : bool
+            Write the locus interval.
+        write_transcripts : bool
+            Write noise (transcript-level) RGRs.
+        write_orfs : bool
+            Write ORF-type RGRs.
+        """
         if write_loci:
             path = f"{prefix}_loci.gtf"
             lock = FileLock(path + ".lock")
@@ -530,7 +511,14 @@ class Locus:
                         if rgr.type == "ORF":
                             f.write(rgr.to_gtf(self.id))
 
-    def to_tsv(self, prefix):
+    def to_tsv(self, prefix: str) -> None:
+        """Append ORF results to a TSV file.
+
+        Parameters
+        ----------
+        prefix : str
+            Path prefix; the file is named ``<prefix>_orfs.tsv``.
+        """
         path = f"{prefix}_orfs.tsv"
         lock = FileLock(path + ".lock")
         with lock:
@@ -539,7 +527,23 @@ class Locus:
                     if rgr.type == "ORF":
                         f.write(rgr.to_tsv_line(self.id))
 
-    def to_fasta(self, prefix, genome):
+    def to_fasta(
+        self,
+        prefix: str,
+        genome: dict[str, HTSeq.Sequence],
+    ) -> None:
+        """Append ORF sequences (with flanking context) to a FASTA file.
+
+        Each ORF is extended by up to 14 nt upstream and 20 nt downstream
+        on its parent transcript before extracting the spliced sequence.
+
+        Parameters
+        ----------
+        prefix : str
+            Directory prefix; the file is ``<prefix>/orfs.fasta``.
+        genome : dict[str, HTSeq.Sequence]
+            Chromosome-keyed genome sequences.
+        """
 
         path = f"{prefix}/orfs.fasta"
         for rgr in self.rgr_set:
@@ -567,12 +571,21 @@ class Locus:
                     for i in range(0, len(seq), 60):
                         f.write(seq[i : i + 60] + "\n")
 
-    #############################################
-    ### functions for orf activity estimation ###
-    #############################################
+    # ------------------------------------------------------------------ #
+    # ORF activity estimation                                              #
+    # ------------------------------------------------------------------ #
 
-    # get reads from database
-    def get_reads_from_db(self, db_path) -> dict[str : list[RiboSeqAlignment]]:
+    def get_reads_from_db(self, db_path: str) -> None:
+        """Load reads for this locus from the SQLite database.
+
+        Populates :attr:`rsas_dict` (mapping run id to a list of
+        :class:`RiboSeqAlignment` objects) and :attr:`run_read_count`.
+
+        Parameters
+        ----------
+        db_path : str
+            Path to the ``price.db`` SQLite database.
+        """
         db = sql.connect(db_path)
         cur = db.cursor()
         reads_dfs = cur.execute(
@@ -599,7 +612,19 @@ class Locus:
                 "count"
             ].sum()
 
-    def make_well_fitting_reads(self, runs):
+    def make_well_fitting_reads(self, runs: list[RiboSeqRun]) -> None:
+        """Count well-fitting reads per RGR and run.
+
+        A read is *well-fitting* when its length and untemplated-addition
+        status match a high-probability entry in the run's cleavage
+        model.  Results are stored in :attr:`wfr_df` (a DataFrame
+        indexed by RGR id with one column per run) and :attr:`wfr_count`.
+
+        Parameters
+        ----------
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to process.
+        """
         well_fitting_rcs = {}
         for run in runs:
             well_fitting_rcs[run.id] = {}
@@ -634,10 +659,18 @@ class Locus:
             pd.DataFrame.from_dict(well_fitting_rcs).replace(np.nan, 0).astype(np.int32)
         )
 
-    # filter RGRs based on coverage
-    # compute coverage with well fitting reads for each RGR and each run
-    # remove RGRs max coverage below threshold
-    def coverage_filter_rgrs(self, config):
+    def coverage_filter_rgrs(self, config: Config) -> None:
+        """Remove ORFs with insufficient well-fitting read coverage.
+
+        For each ORF RGR the per-nucleotide well-fitting read count is
+        computed across all runs.  ORFs whose maximum across runs falls
+        below ``config.min_well_fitting_reads_per_length`` are removed.
+
+        Parameters
+        ----------
+        config : Config
+            Configuration providing the coverage threshold.
+        """
 
         rgr_lengths = {rgr.id: len(rgr.genomic_region) for rgr in self.rgr_set}
 
@@ -657,7 +690,20 @@ class Locus:
 
         self.remove_rgrs(rgrs_to_remove)
 
-    def deconvolution_filter_rgrs(self, config):
+    def deconvolution_filter_rgrs(self, config: Config) -> None:
+        """Remove ORFs that are inactive within their stop-codon group.
+
+        ORFs sharing the same stop codon are grouped, split into
+        compatible optimisation groups, and each group is deconvolved.
+        ORFs with estimated activity below
+        ``config.deconvolution_filter_min_activity`` in every run are
+        removed.
+
+        Parameters
+        ----------
+        config : Config
+            Configuration providing filter thresholds.
+        """
 
         tmp = self.make_stop_groups()
         optimization_groups = self.split_stop_groups(tmp)
@@ -674,9 +720,20 @@ class Locus:
 
         self.remove_rgrs(rgrs_to_remove)
 
-    # assign rgrs to groups corresponding to one stop codon
-    # do not consider NOISE rgrs and groups with a single rgr
-    def make_stop_groups(self):
+    def make_stop_groups(
+        self,
+    ) -> dict[int, list[ReadGeneratingRegion]]:
+        """Group ORF RGRs by their stop-codon position.
+
+        Noise RGRs are excluded.  Groups with a single member are
+        dropped since they cannot be deconvolved.
+
+        Returns
+        -------
+        dict[int, list[ReadGeneratingRegion]]
+            Mapping from stop-codon genomic position to the list of
+            ORF RGRs ending there.
+        """
         stop_groups = {}
         for rgr in self.rgr_set:
             if rgr.type == "NOISE":
@@ -694,67 +751,97 @@ class Locus:
 
         return stop_groups
 
-    # a stop group (a set of RGRs ending in one stop) can be incompatible if the RGRs contain different intron-exon boundaries
-    # this function splits stop groups into optimization groups (sets of compatible RGRs)
-    def split_stop_groups(self, stop_groups):
-        optimization_groups = []
-        for stop_group in stop_groups.values():
-            l = list(stop_group)
-            containment_dict = {}
-            for rgr in l:
-                containment_dict[rgr] = set()
-                for other_rgr in l:
-                    if rgr.genomic_region.contains_to_stop(other_rgr.genomic_region):
-                        containment_dict[rgr].add(other_rgr)
+    def split_stop_groups(
+        self,
+        stop_groups: dict[int, list[ReadGeneratingRegion]],
+    ) -> list[set[ReadGeneratingRegion]]:
+        """Split stop groups into splice-compatible optimisation groups.
 
-            l = list(containment_dict.values())
-            while l:
-                # get biggest set from list
-                big_set = max(l, key=len)
+        RGRs sharing a stop codon may have incompatible exon–intron
+        structures.  This method partitions each stop group into
+        maximal subsets of mutually compatible RGRs.
+
+        Parameters
+        ----------
+        stop_groups : dict[int, list[ReadGeneratingRegion]]
+            Stop groups produced by :meth:`make_stop_groups`.
+
+        Returns
+        -------
+        list[set[ReadGeneratingRegion]]
+            Each element is a set of compatible RGRs to deconvolve
+            together.
+        """
+        optimization_groups: list[set[ReadGeneratingRegion]] = []
+        for stop_group in stop_groups.values():
+            rgrs = list(stop_group)
+            containment_dict: dict[ReadGeneratingRegion, set[ReadGeneratingRegion]] = {}
+            for rgr in rgrs:
+                containment_dict[rgr] = {
+                    other
+                    for other in rgrs
+                    if rgr.genomic_region.contains_to_stop(other.genomic_region)
+                }
+
+            remaining = list(containment_dict.values())
+            while remaining:
+                big_set = max(remaining, key=len)
                 optimization_groups.append(big_set)
-                new_l = []
-                for s in l:
-                    if not s.issubset(big_set):
-                        new_l.append(s)
-                l = new_l
+                remaining = [s for s in remaining if not s.issubset(big_set)]
 
         return optimization_groups
 
     def deconvolute_opt_group(
         self,
-        opt_group,
-        config,
-    ):
-        # rgr_indices_to_remove = []
-        rgr_indices_to_keep = []
-        rgr_read_counts = dict(self.wfr_df.sum(axis=1))
-        l = list(opt_group)
-        l.sort(key=len, reverse=True)
-        rgr_indices = {rgr.id: i for i, rgr in enumerate(l)}
+        opt_group: set[ReadGeneratingRegion],
+        config: Config,
+    ) -> set[str]:
+        """Deconvolve a single optimisation group and return ORF ids to remove.
+
+        Each run is independently optimised using L-BFGS-B.  An ORF is
+        kept if its estimated activity exceeds
+        ``config.deconvolution_filter_min_activity`` in at least one run.
+
+        Parameters
+        ----------
+        opt_group : set[ReadGeneratingRegion]
+            Set of compatible RGRs to deconvolve together.
+        config : Config
+            Configuration providing filter thresholds.
+
+        Returns
+        -------
+        set[str]
+            RGR identifiers that should be removed.
+        """
+        rgr_indices_to_keep: list[set[int]] = []
+        sorted_rgrs = sorted(opt_group, key=len, reverse=True)
+        rgr_indices = {rgr.id: i for i, rgr in enumerate(sorted_rgrs)}
 
         min_reads = self.wfr_df.sum().sum() / self.wfr_df.shape[1] * 0.1
 
         number_of_runs = self.wfr_df.shape[1]
 
-        # iterate over runs
-        for i in range(number_of_runs):  # len(self.wfr_df.iloc[0])):
-
-            rgr_read_counts = self.wfr_df.iloc[:, i].to_dict()
+        for run_idx in range(number_of_runs):
+            rgr_read_counts = self.wfr_df.iloc[:, run_idx].to_dict()
 
             # skip if the locus is probably not expressed in this run
             if sum(rgr_read_counts.values()) < min_reads:
                 continue
-            egs = {}
-            s = set()
-            for j in range(len(l) - 1):
-                s.add(l[j].id)
-                length = len(l[j]) - len(l[j + 1])
-                rc = rgr_read_counts[l[j].id] - rgr_read_counts[l[j + 1].id]
+            egs: dict[frozenset[str], tuple[int, int]] = {}
+            s: set[str] = set()
+            for j in range(len(sorted_rgrs) - 1):
+                s.add(sorted_rgrs[j].id)
+                length = len(sorted_rgrs[j]) - len(sorted_rgrs[j + 1])
+                rc = (
+                    rgr_read_counts[sorted_rgrs[j].id]
+                    - rgr_read_counts[sorted_rgrs[j + 1].id]
+                )
                 egs[frozenset(s)] = (length, rc)
 
-            s.add(l[-1].id)
-            length = len(l[-1])
-            rc = rgr_read_counts[l[-1].id]
+            s.add(sorted_rgrs[-1].id)
+            length = len(sorted_rgrs[-1])
+            rc = rgr_read_counts[sorted_rgrs[-1].id]
             egs[frozenset(s)] = (length, rc)
 
             bounds = [(config.pseudo_min, None) for _ in range(len(egs))]
@@ -782,13 +869,25 @@ class Locus:
             rgr_indices_to_keep.append(rgr_indices_to_keep_one_run)
 
         try:
-            rgr_indices_to_keep = set.union(*rgr_indices_to_keep)
+            all_kept = set.union(*rgr_indices_to_keep)
         except TypeError:
-            rgr_indices_to_remove = set(rgr_indices.keys())
+            all_kept = set()
 
-        return set([k for k, v in rgr_indices.items() if v not in rgr_indices_to_keep])
+        return {k for k, v in rgr_indices.items() if v not in all_kept}
 
-    def assign_reads_to_egs(self, runs):
+    def assign_reads_to_egs(self, runs: list[RiboSeqRun]) -> None:
+        """Assign reads to their equivalence groups.
+
+        Each read is matched to its ``(rgr_frame_covpos, length, oua)``
+        key and added to the corresponding :class:`EquivalenceGroup`.
+        Reads whose key is absent (due to earlier filtering) are counted
+        in :attr:`uncounted_reads`.
+
+        Parameters
+        ----------
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to process.
+        """
         for run in runs:
             run_id = run.id
 
@@ -820,7 +919,29 @@ class Locus:
             for v in self.egs[run].values():
                 self.counted_reads[run.id] += v.read_count
 
-    def to_deconvolution_args(self, runs):
+    def to_deconvolution_args(
+        self,
+        runs: list[RiboSeqRun],
+    ) -> dict:
+        """Build argument dictionary for the Numba objective functions.
+
+        Assembles cleavage-model look-up tables, coverage-model parameters,
+        equivalence groups, and an initial-guess vector into a single
+        dictionary consumed by :func:`objective_function` and related
+        functions.
+
+        Parameters
+        ----------
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to include.
+
+        Returns
+        -------
+        dict
+            Keys: ``cleavage_model``, ``coverage_model``, ``egs``,
+            ``num_rgrs``, ``rgr_lengths``, ``num_runs``,
+            ``initial_guess``.
+        """
         rgrs = list(self.rgr_set)
 
         num_runs = len(runs)
@@ -853,7 +974,7 @@ class Locus:
                     continue
                 temp = List()
                 for rgr, frame, covpos in rgr_frame_covpos:
-                    if frame == None:
+                    if frame is None:
                         frame = 3
                     temp.append((rgr.index, frame, covpos.value))
                 l.append((eg.length, eg.read_count, read_length, int(oua), temp))
@@ -872,13 +993,31 @@ class Locus:
 
     def deconvolve(
         self,
-        config,
-        runs,
-    ):
-        import time
+        config: Config,
+        runs: list[RiboSeqRun],
+    ) -> tuple[float, float]:
+        """Run group-LASSO penalised Poisson-likelihood deconvolution.
 
-        opt_time = 0
-        data_time = 0
+        Iteratively optimises ORF activities.  Between iterations, ORFs
+        whose activity falls below the canonical-ORF-relative threshold
+        are removed to speed convergence.
+
+        Parameters
+        ----------
+        config : Config
+            Configuration providing regularisation and convergence
+            parameters.
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to deconvolve jointly.
+
+        Returns
+        -------
+        tuple[float, float]
+            ``(opt_time, data_time)`` — wall-clock seconds spent in
+            optimisation vs. data preparation.
+        """
+        opt_time = 0.0
+        data_time = 0.0
 
         while True:
             s1 = time.time()
@@ -978,52 +1117,24 @@ class Locus:
 
         return opt_time, data_time
 
-    def deconvolve_unregularized(self, config, runs):
-        deconvolution_args = self.to_deconvolution_args(runs)
-        run_read_counts = deconvolution_args["run_read_counts"]
-        cm_lut = deconvolution_args["cleavage_model"]
-        coverage_params = deconvolution_args["coverage_model"]
-        egs = deconvolution_args["egs"]
-        num_rgrs = deconvolution_args["num_rgrs"]
-        initial_guess = deconvolution_args["initial_guess"]
-        num_runs = deconvolution_args["num_runs"]
+    def remove_rgrs(
+        self,
+        rgrs_to_remove: set[ReadGeneratingRegion],
+        runs: list[RiboSeqRun] | None = None,
+    ) -> None:
+        """Remove a set of RGRs and update all dependent data structures.
 
-        bounds = [(config.pseudo_min, None)] * len(initial_guess)
+        Updates :attr:`rgr_set`, re-indexes remaining RGRs, rebuilds
+        :attr:`rgr_intervals`, collapses equivalence groups (if present),
+        and re-slices :attr:`result` (if present).
 
-        cb = Callback(initial_guess, num_runs, config)
-
-        result = minimize(
-            objective_function_wo_regularization,
-            initial_guess,
-            args=(
-                run_read_counts,
-                cm_lut,
-                coverage_params,
-                egs,
-            ),
-            method="L-BFGS-B",
-            jac=True,
-            bounds=bounds,
-            callback=cb,
-            options={"maxiter": 10_000, "ftol": config.ftol, "gtol": config.gtol},
-        )
-
-        result.x = result.x.reshape(num_rgrs, len(self.counted_reads))
-        result.x[result.x <= config.pseudo_min] = 0
-
-        self.result = result.x
-
-        keep_rgr_indices = set(np.where(self.result > 0)[0])
-        keep_rgr_indices |= set(
-            [rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"]
-        )
-        rgrs_to_remove = set(
-            [rgr for rgr in self.rgr_set if rgr.index not in keep_rgr_indices]
-        )
-        self.remove_rgrs(rgrs_to_remove, runs=runs)
-
-    def remove_rgrs(self, rgrs_to_remove, runs=None):
-        # rgr_set
+        Parameters
+        ----------
+        rgrs_to_remove : set[ReadGeneratingRegion]
+            RGRs to discard.
+        runs : list[RiboSeqRun] or None
+            Required when equivalence groups need collapsing.
+        """
         old_rgr_set = self.rgr_set
         self.rgr_set = self.rgr_set - rgrs_to_remove
 
@@ -1051,8 +1162,19 @@ class Locus:
 
     def collapse_egs(
         self,
-        runs,
-    ):
+        runs: list[RiboSeqRun],
+    ) -> None:
+        """Collapse equivalence groups after RGR removal.
+
+        Rebuilds the per-run equivalence-group dictionaries, merging
+        entries whose keys become identical after removed RGRs are
+        dropped from the key's ``rgr_frame_covpos`` frozenset.
+
+        Parameters
+        ----------
+        runs : list[RiboSeqRun]
+            Ribo-seq runs whose EGs should be rebuilt.
+        """
         new_egs = {}
         for run in runs:
             new_egs[run] = defaultdict(EquivalenceGroup)
@@ -1075,193 +1197,28 @@ class Locus:
 
         self.egs = new_egs
 
-    def likelihood_ratio_filtering_depracated(
-        self,
-        config,
-        runs,
-    ):
-        deconvolution_args = self.to_deconvolution_args(runs)
-
-        cm_lut = deconvolution_args["cleavage_model"]
-        coverage_params = deconvolution_args["coverage_model"]
-        egs = deconvolution_args["egs"]
-        num_rgrs = deconvolution_args["num_rgrs"]
-        initial_guess = deconvolution_args["initial_guess"]
-        num_runs = deconvolution_args["num_runs"]
-
-        def run_likelihood_optimization(initial_guess, bounds, optim_args):
-            num_runs, cm_lut, cov_params, egs, ftol, gtol = optim_args
-
-            cb = Callback(initial_guess, num_runs, config)
-            optimization_result = minimize(
-                objective_function_wo_regularization,
-                initial_guess,
-                args=(
-                    num_runs,
-                    cm_lut,
-                    cov_params,
-                    egs,
-                ),
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                callback=cb,
-                options={
-                    "maxiter": 10_000,
-                    "ftol": ftol,
-                    "gtol": gtol,
-                    "maxls": config.maxls,
-                },
-            )
-            if cb.success:
-                optimization_result.success = True
-            if not optimization_result.success:
-                print(optimization_result.message)
-                raise RuntimeError(
-                    f"Likelihood ratio filtering failed to converge. {optimization_result.message}"
-                )
-
-            ll = log_likelihood(
-                optimization_result.x,
-                num_runs,
-                cm_lut,
-                cov_params,
-                egs,
-            )
-            return optimization_result, ll
-
-        noise_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"}
-        test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
-        keep_rgr_indices = noise_rgr_indices | test_rgr_indices
-
-        self.rgr_dict = {rgr.index: rgr for rgr in self.rgr_set}
-
-        shape = initial_guess.reshape(num_rgrs, -1).shape
-
-        t = np.empty((), dtype=object)
-        t[()] = (config.pseudo_min, None)
-        bounds = list(np.full(initial_guess.shape, t))
-
-        optim_args = (
-            num_runs,
-            cm_lut,
-            coverage_params,
-            egs,
-            config.ftol,
-            config.gtol,
-        )
-
-        optimization_result, log_likelihood_all = run_likelihood_optimization(
-            initial_guess, bounds, optim_args
-        )
-
-        opt_up_to_date = True
-
-        self.final_result = optimization_result
-
-        initial_guess = optimization_result.x
-
-        rgr_ind_list = list(test_rgr_indices)
-        try:
-            # sort by activity
-            act_sum = self.result[np.array(rgr_ind_list)].sum(axis=1)
-            rgr_ind_list = np.array(rgr_ind_list)[np.argsort(act_sum)]
-        except IndexError:
-            rgr_ind_list = []
-
-        for rgr_ind in rgr_ind_list:
-            free_rgr_ind = keep_rgr_indices - {rgr_ind}
-            initial_guess_int = initial_guess.copy().reshape(num_rgrs, -1)
-
-            initial_guess_int[rgr_ind] = config.pseudo_min
-            initial_guess_int = initial_guess_int.flatten()
-
-            # test if removing the does not significantly decrease the likelihood even without optimization
-            log_likelihood_int = log_likelihood(
-                initial_guess_int,
-                num_runs,
-                cm_lut,
-                coverage_params,
-                egs,
-            )
-
-            log_p = wilks_test_p(
-                log_likelihood_all,
-                log_likelihood_int,
-                df_diff=num_runs,
-            )
-
-            self.rgr_dict[rgr_ind].log_p_value = log_p
-            if log_p > np.log(config.likelihood_ratio_alpha):
-                # remove rgr
-                keep_rgr_indices.remove(rgr_ind)
-                initial_guess = initial_guess_int
-                log_likelihood_all = log_likelihood_int
-                opt_up_to_date = False
-                continue
-
-            else:
-                if not opt_up_to_date:
-                    t = np.empty((), dtype=object)
-                    t[()] = (config.pseudo_min, config.pseudo_min)
-                    bounds = np.full(shape, t)
-                    t[()] = (config.pseudo_min, None)
-                    for index in keep_rgr_indices:
-                        bounds[index] = t
-                    bounds = list(bounds.flatten())
-                    optimization_result, log_likelihood_all = (
-                        run_likelihood_optimization(initial_guess, bounds, optim_args)
-                    )
-                    opt_up_to_date = True
-                    self.final_result = optimization_result
-                    initial_guess = optimization_result.x
-
-                t = np.empty((), dtype=object)
-                t[()] = (config.pseudo_min, config.pseudo_min)
-                bounds = np.full(shape, t)
-                t[()] = (config.pseudo_min, None)
-                for index in free_rgr_ind:
-                    bounds[index] = t
-                bounds = list(bounds.flatten())
-
-                optimization_result_int, log_likelihood_int = (
-                    run_likelihood_optimization(initial_guess_int, bounds, optim_args)
-                )
-
-                log_p = wilks_test_p(
-                    log_likelihood_all,
-                    log_likelihood_int,
-                    df_diff=num_runs,
-                )
-
-                self.rgr_dict[rgr_ind].log_p_value = log_p
-                if log_p > np.log(config.likelihood_ratio_alpha):
-                    keep_rgr_indices.remove(rgr_ind)
-                    initial_guess = optimization_result_int.x
-                    log_likelihood_all = log_likelihood_int
-                    self.final_result = optimization_result_int
-
-        tmp = self.final_result.x.reshape(num_rgrs, num_runs)
-        tmp[tmp <= config.pseudo_min] = 0
-        self.result = tmp
-        with np.errstate(invalid="ignore"):
-            tmp = tmp / tmp.sum(axis=0)
-            tmp[np.isnan(tmp)] = 0
-
-        rgrs_to_remove = set()
-        for rgr in self.rgr_set:
-            if rgr.index not in keep_rgr_indices and rgr.type != "NOISE":
-                rgrs_to_remove.add(rgr)
-
-        self.remove_rgrs(rgrs_to_remove, runs=runs)
-
-        self.runs = runs
-
     def likelihood_ratio_filtering(
         self,
-        config,
-        runs,
-    ):
+        config: Config,
+        runs: list[RiboSeqRun],
+    ) -> None:
+        """Apply likelihood-ratio test filtering to remove non-significant ORFs.
+
+        For each ORF, a Wilks test compares the full log-likelihood with
+        the log-likelihood obtained when that ORF's activity is clamped
+        to ``config.pseudo_min``.  If the drop is not significant at
+        level ``config.likelihood_ratio_alpha``, the ORF is removed.
+        ORFs are tested in order of ascending total activity so that the
+        weakest candidates are evaluated first.
+
+        Parameters
+        ----------
+        config : Config
+            Configuration providing convergence tolerances and
+            significance threshold.
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to include.
+        """
 
         def run_likelihood_optimization(initial_guess, bounds, optim_args):
             num_runs, cm_lut, cov_params, egs, ftol, gtol = optim_args
@@ -1287,14 +1244,12 @@ class Locus:
                     "maxls": config.maxls,
                 },
             )
-            # print(optimization_result.message, flush=True)
-            # print(optimization_result.nit, flush=True)
             if cb.success:
                 optimization_result.success = True
             if not optimization_result.success:
-                print(optimization_result.message)
                 raise RuntimeError(
-                    f"Likelihood ratio filtering failed to converge. {optimization_result.message}"
+                    f"Likelihood ratio filtering failed to converge. "
+                    f"{optimization_result.message}"
                 )
 
             ll = log_likelihood(
@@ -1376,11 +1331,6 @@ class Locus:
                 df_diff=num_runs,
             )
             if log_p > np.log(config.likelihood_ratio_alpha):
-                # print(
-                #     f"Removing rgr {self.rgr_dict[rgr_ind].id} without re-optimization",
-                #     flush=True,
-                # )
-                # remove rgr
                 full_rgr_ind.remove(rgr_ind)
                 full_activities = reduced_activities
                 full_log_likelihood = reduced_log_likelihood
@@ -1418,15 +1368,9 @@ class Locus:
                     df_diff=num_runs,
                 )
                 if log_p > np.log(config.likelihood_ratio_alpha):
-                    # print(
-                    #     f"Removing rgr {self.rgr_dict[rgr_ind].id} after re-optimization",
-                    #     flush=True,
-                    # )
                     full_rgr_ind.remove(rgr_ind)
                     full_activities = optimization_result_reduced.x
                     full_log_likelihood = reduced_log_likelihood
-                # else:
-                #     print(f"Keeping rgr {self.rgr_dict[rgr_ind].id}", flush=True)
 
         t = np.empty((), dtype=object)
         t[()] = (config.pseudo_min, config.pseudo_min)
@@ -1459,92 +1403,26 @@ class Locus:
 
         self.runs = runs
 
-    #         free_rgr_ind = keep_rgr_indices - {rgr_ind}
-    #         initial_guess_int = initial_guess.copy().reshape(num_rgrs, -1)
-    #
-    #         initial_guess_int[rgr_ind] = config.pseudo_min
-    #         initial_guess_int = initial_guess_int.flatten()
-    #
-    #         # test if removing the rgr does not significantly decrease the likelihood even without optimization
-    #         log_likelihood_int = log_likelihood(
-    #             initial_guess_int,
-    #             num_runs,
-    #             cm_lut,
-    #             coverage_params,
-    #             egs,
-    #         )
-    #
-    #         log_p = wilks_test_p(
-    #             log_likelihood_all,
-    #             log_likelihood_int,
-    #             df_diff=num_runs,
-    #         )
-    #
-    #         self.rgr_dict[rgr_ind].log_p_value = log_p
-    #         if log_p > np.log(config.likelihood_ratio_alpha):
-    #             # remove rgr
-    #             keep_rgr_indices.remove(rgr_ind)
-    #             initial_guess = initial_guess_int
-    #             log_likelihood_all = log_likelihood_int
-    #
-    #         else:
-    #             # optimize current model
-    #             t = np.empty((), dtype=object)
-    #             t[()] = (config.pseudo_min, config.pseudo_min)
-    #             bounds = np.full(shape, t)
-    #             t[()] = (config.pseudo_min, None)
-    #             for index in keep_rgr_indices:
-    #                 bounds[index] = t
-    #             bounds = list(bounds.flatten())
-    #             optimization_result, log_likelihood_all = run_likelihood_optimization(
-    #                 initial_guess, bounds, optim_args
-    #             )
-    #             self.final_result = optimization_result
-    #             initial_guess = optimization_result.x
-    #
-    #             # optimize reduced model
-    #             t = np.empty((), dtype=object)
-    #             t[()] = (config.pseudo_min, config.pseudo_min)
-    #             bounds = np.full(shape, t)
-    #             t[()] = (config.pseudo_min, None)
-    #             for index in free_rgr_ind:
-    #                 bounds[index] = t
-    #             bounds = list(bounds.flatten())
-    #
-    #             optimization_result_int, log_likelihood_int = (
-    #                 run_likelihood_optimization(initial_guess_int, bounds, optim_args)
-    #             )
-    #
-    #             log_p = wilks_test_p(
-    #                 log_likelihood_all,
-    #                 log_likelihood_int,
-    #                 df_diff=num_runs,
-    #             )
-    #
-    #             self.rgr_dict[rgr_ind].log_p_value = log_p
-    #             if log_p > np.log(config.likelihood_ratio_alpha):
-    #                 keep_rgr_indices.remove(rgr_ind)
-    #                 initial_guess = optimization_result_int.x
-    #                 log_likelihood_all = log_likelihood_int
-    #                 self.final_result = optimization_result_int
-    #
-    #     tmp = self.final_result.x.reshape(num_rgrs, num_runs)
-    #     tmp[tmp <= config.pseudo_min] = 0
-    #     self.result = tmp
-    #     with np.errstate(invalid="ignore"):
-    #         tmp = tmp / tmp.sum(axis=0)
-    #         tmp[np.isnan(tmp)] = 0
-    #
-    #     rgrs_to_remove = set()
-    #     for rgr in self.rgr_set:
-    #         if rgr.index not in keep_rgr_indices and rgr.type != "NOISE":
-    #             rgrs_to_remove.add(rgr)
-    #
-    #     self.remove_rgrs(rgrs_to_remove, runs=runs)
-    #
-    #     self.runs = runs
+    def estimate_activities(
+        self,
+        runs: list[RiboSeqRun],
+        config: Config,
+    ) -> None:
+        """Estimate final ORF activities without regularisation.
 
-    def estimate_activities(self, runs, config):
+        Iteratively optimises the unregularised Poisson log-likelihood.
+        After each round, ORFs whose activity is below
+        ``config.rgr_min_activity`` in every run are removed.  The loop
+        continues until no more ORFs are removed.  Results are stored
+        in :attr:`result` and :attr:`result_df`.
+
+        Parameters
+        ----------
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to estimate activities for.
+        config : Config
+            Configuration providing convergence and threshold parameters.
+        """
         rgrs_removed = True
         while rgrs_removed:
             deconvolution_args = self.to_deconvolution_args(runs)
@@ -1610,20 +1488,100 @@ class Locus:
         self.result_df = pd.DataFrame(self.result, index=rgr_ids, columns=run_ids)
 
 
-# reject null if true
-def wilks_test(log_likelihood_full, log_likelihood_reduced, df_diff=1, α=1e-5) -> bool:
-    # reject null hypothesis if the test statistic is greater than the critical value
+# ------------------------------------------------------------------ #
+# Statistical tests                                                    #
+# ------------------------------------------------------------------ #
+
+
+def wilks_test(
+    log_likelihood_full: float,
+    log_likelihood_reduced: float,
+    df_diff: int = 1,
+    α: float = 1e-5,
+) -> bool:
+    """Perform a Wilks likelihood-ratio test.
+
+    Returns ``True`` when the null hypothesis (that the reduced model
+    is sufficient) should be rejected.
+
+    Parameters
+    ----------
+    log_likelihood_full : float
+        Log-likelihood of the full (unrestricted) model.
+    log_likelihood_reduced : float
+        Log-likelihood of the reduced (restricted) model.
+    df_diff : int
+        Difference in degrees of freedom between the two models.
+    α : float
+        Significance level.
+
+    Returns
+    -------
+    bool
+        ``True`` if the full model is significantly better.
+    """
     return 2 * (log_likelihood_full - log_likelihood_reduced) > chi2.ppf(1 - α, df_diff)
 
 
-def wilks_test_p(log_likelihood_full, log_likelihood_reduced, df_diff=1) -> float:
+def wilks_test_p(
+    log_likelihood_full: float,
+    log_likelihood_reduced: float,
+    df_diff: int = 1,
+) -> float:
+    """Compute the log p-value for a Wilks likelihood-ratio test.
+
+    Parameters
+    ----------
+    log_likelihood_full : float
+        Log-likelihood of the full model.
+    log_likelihood_reduced : float
+        Log-likelihood of the reduced model.
+    df_diff : int
+        Difference in degrees of freedom.
+
+    Returns
+    -------
+    float
+        Log p-value (use ``np.exp(result)`` for the p-value).
+    """
     λ = -2 * (log_likelihood_reduced - log_likelihood_full)
-    log_p_value = chi2.logsf(λ, df_diff)
-    return log_p_value
+    return chi2.logsf(λ, df_diff)
+
+
+# ------------------------------------------------------------------ #
+# Numba-accelerated objective functions                                #
+# ------------------------------------------------------------------ #
 
 
 @jit(nopython=True, cache=True, parallel=False)
-def filter_objective_numba(x, eg_lengths, eg_read_counts, eg_rgr_ids):
+def filter_objective_numba(
+    x: np.ndarray,
+    eg_lengths: np.ndarray,
+    eg_read_counts: np.ndarray,
+    eg_rgr_ids: List,
+) -> tuple[float, np.ndarray]:
+    """Poisson negative log-likelihood for the deconvolution filter.
+
+    Used by :meth:`Locus.deconvolute_opt_group` to quickly evaluate
+    stop-codon group deconvolution per run.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Activity vector, shape ``(n_egs,)``.
+    eg_lengths : np.ndarray
+        Equivalence-group lengths, shape ``(n_egs,)``.
+    eg_read_counts : np.ndarray
+        Observed read counts per EG, shape ``(n_egs,)``.
+    eg_rgr_ids : numba.typed.List
+        Each element is an ``np.ndarray`` of RGR indices belonging to
+        that equivalence group.
+
+    Returns
+    -------
+    tuple[float, np.ndarray]
+        ``(loss, gradient)``.
+    """
 
     loss = 0
     grads = np.zeros_like(x)
@@ -1647,46 +1605,107 @@ def filter_objective_numba(x, eg_lengths, eg_read_counts, eg_rgr_ids):
     return loss, grads
 
 
-# find ORFs based on transcript sequence
-# return list of intervals of all ORFs with min length
+# ------------------------------------------------------------------ #
+# ORF detection                                                        #
+# ------------------------------------------------------------------ #
+
+
 def find_orfs(
     seq: str,
-    start_codons: list = ["ATG"],
-    stop_codons: list = ["TAA", "TAG", "TGA"],
+    start_codons: list[str] | tuple[str, ...] = ("ATG",),
+    stop_codons: list[str] | tuple[str, ...] = ("TAA", "TAG", "TGA"),
     min_length: int = 0,
 ) -> list[tuple[int, int]]:
-    start_codons = set(start_codons)
-    stop_codons = set(stop_codons)
-    orf_iv_on_transcript = []
+    """Find all ORFs in a transcript sequence.
+
+    Scans all three reading frames for start/stop codon pairs and
+    returns 0-based, half-open intervals **including** the stop codon.
+
+    Parameters
+    ----------
+    seq : str
+        Spliced transcript nucleotide sequence.
+    start_codons : list[str] or tuple[str, ...]
+        Codons accepted as translation initiation sites.
+    stop_codons : list[str] or tuple[str, ...]
+        Codons accepted as translation termination sites.
+    min_length : int
+        Minimum ORF length (nt, excluding stop codon) to report.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        ``(start, end)`` intervals in transcript coordinates.  *end*
+        includes the 3-nt stop codon.
+    """
+    start_codons_set = set(start_codons)
+    stop_codons_set = set(stop_codons)
+    orf_iv_on_transcript: list[tuple[int, int]] = []
     for i in range(3):
-        starts = []
+        starts: list[int] = []
         for j in range(i, len(seq), 3):
-            if seq[j : j + 3] in start_codons:
+            codon = seq[j : j + 3]
+            if codon in start_codons_set:
                 starts.append(j)
-            if seq[j : j + 3] in stop_codons:
+            if codon in stop_codons_set:
                 for start in starts:
                     if j - start >= min_length:
-                        orf_iv_on_transcript.append(
-                            (start, j + 3)
-                        )  # with +3 including stop codon
+                        orf_iv_on_transcript.append((start, j + 3))
                 starts = []
     return orf_iv_on_transcript
 
 
+# ------------------------------------------------------------------ #
+# Optimisation callback                                                #
+# ------------------------------------------------------------------ #
+
+
 class Callback:
+    """Convergence callback for L-BFGS-B optimisation.
+
+    Monitors the relative change in activity estimates between
+    iterations and raises ``StopIteration`` when all active parameters
+    have converged according to ``config.stop_factor_relative``.
+    Optionally identifies low-activity RGRs for early removal.
+
+    Attributes
+    ----------
+    success : bool
+        ``True`` when convergence was reached.
+    rgr_indices_to_remove : set[int]
+        Indices of RGRs flagged for removal (only populated when
+        *remove_rgrs* is ``True``).
+    """
+
+    success: bool
+    rgr_indices_to_remove: set[int]
+
     def __init__(
-        self, initial_guess, number_samples, config, rgr_lengths=None, remove_rgrs=False
-    ):
+        self,
+        initial_guess: np.ndarray,
+        number_samples: int,
+        config: Config,
+        rgr_lengths: np.ndarray | None = None,
+        remove_rgrs: bool = False,
+    ) -> None:
         self.config = config
         self.previous = initial_guess
         self.initial_guess = initial_guess
         self.success = False
         self.number_samples = number_samples
         self.rgr_lengths = rgr_lengths
-        self.rgr_indices_to_remove = set()
+        self.rgr_indices_to_remove: set[int] = set()
         self.remove_rgrs = remove_rgrs
 
-    def __call__(self, new):
+    def __call__(self, new: np.ndarray) -> None:
+        """Evaluate convergence after an L-BFGS-B iteration.
+
+        Raises
+        ------
+        StopIteration
+            When convergence is detected or enough RGRs are flagged
+            for removal.
+        """
         tmp = self.previous / new
         if not np.any(
             (
@@ -1727,16 +1746,39 @@ class Callback:
 # and the gradient with respect to each activity parameter
 @jit(nopython=True, cache=True, parallel=False)
 def objective_function(
-    x,
-    num_runs,
-    cm_lut,
-    coverage_params,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
-    num_rgrs,
+    x: np.ndarray,
+    num_runs: int,
+    cm_lut: np.ndarray,
+    coverage_params: np.ndarray,
+    egs,
+    num_rgrs: int,
     λ: float,
-) -> float:
+) -> tuple[float, np.ndarray]:
+    """Negative Poisson log-likelihood with group-LASSO penalty.
 
-    # num_runs = len(run_read_counts)
+    Parameters
+    ----------
+    x : np.ndarray
+        Flattened activity vector, shape ``(num_rgrs * num_runs,)``.
+    num_runs : int
+        Number of Ribo-seq runs.
+    cm_lut : np.ndarray
+        Cleavage model look-up table, shape
+        ``(num_runs, max_read_length, 4, 2)``.
+    coverage_params : np.ndarray
+        Coverage model parameters, shape ``(num_runs, 3)``.
+    egs : numba.typed.List
+        Per-run equivalence groups.
+    num_rgrs : int
+        Number of RGRs.
+    λ : float
+        Group-LASSO regularisation strength.
+
+    Returns
+    -------
+    tuple[float, np.ndarray]
+        ``(loss, gradient)``.
+    """
 
     loss = 0
     grads = np.zeros_like(x)
@@ -1782,16 +1824,38 @@ def objective_function(
     return loss + λ * penalty, grads
 
 
-# compute the negative log likelihood
-# and the gradient regarding each activity parameter
 @jit(nopython=True, cache=True, parallel=False)
 def objective_function_wo_regularization(
-    x,
-    num_runs,
-    cm_lut,
-    coverage_params,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
-) -> float:
+    x: np.ndarray,
+    num_runs: int,
+    cm_lut: np.ndarray,
+    coverage_params: np.ndarray,
+    egs,
+) -> tuple[float, np.ndarray]:
+    """Negative Poisson log-likelihood without regularisation.
+
+    Same as :func:`objective_function` but omits the group-LASSO
+    penalty term.  Used during likelihood-ratio filtering and final
+    activity estimation.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Flattened activity vector.
+    num_runs : int
+        Number of Ribo-seq runs.
+    cm_lut : np.ndarray
+        Cleavage model look-up table.
+    coverage_params : np.ndarray
+        Coverage model parameters.
+    egs : numba.typed.List
+        Per-run equivalence groups.
+
+    Returns
+    -------
+    tuple[float, np.ndarray]
+        ``(loss, gradient)``.
+    """
 
     loss = 0
     grads = np.zeros_like(x)
@@ -1825,16 +1889,38 @@ def objective_function_wo_regularization(
     return loss, grads
 
 
-# compute the negative log likelihood + a penalty term
-# and the gradient regarding each activity parameter
 @jit(nopython=True, cache=True, parallel=False)
 def log_likelihood(
-    x,
-    num_runs,
-    cm_lut,
-    coverage_params,
-    egs,  # egs: length, read_count, read_length, oua, rgr_frame_covpos
+    x: np.ndarray,
+    num_runs: int,
+    cm_lut: np.ndarray,
+    coverage_params: np.ndarray,
+    egs,
 ) -> float:
+    """Compute the Poisson log-likelihood (without penalty).
+
+    Unlike :func:`objective_function_wo_regularization`, this returns
+    the *positive* log-likelihood and does not compute the gradient.
+    Used for likelihood-ratio tests.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Flattened activity vector.
+    num_runs : int
+        Number of Ribo-seq runs.
+    cm_lut : np.ndarray
+        Cleavage model look-up table.
+    coverage_params : np.ndarray
+        Coverage model parameters.
+    egs : numba.typed.List
+        Per-run equivalence groups.
+
+    Returns
+    -------
+    float
+        Log-likelihood value.
+    """
 
     ll = 0
 
@@ -1855,54 +1941,6 @@ def log_likelihood(
             if y == 0 and δ == 0:
                 continue
 
-            # ll += y * np.log(δ) - δ - math.log(math.factorial(y))
             ll += y * np.log(δ) - δ - math.lgamma(y + 1)
 
     return ll
-
-
-# def run_likelihood_optimization(
-#     initial_guess,
-#     bounds,
-#     num_runs,
-#     cm_lut,
-#     cov_params,
-#     egs,
-#     config,
-# ):
-#
-#     cb = Callback(initial_guess, num_runs, config)
-#     optimization_result = minimize(
-#         objective_function_wo_regularization,
-#         initial_guess,
-#         args=(
-#             num_runs,
-#             cm_lut,
-#             cov_params,
-#             egs,
-#         ),
-#         method="L-BFGS-B",
-#         jac=True,
-#         bounds=bounds,
-#         callback=cb,
-#         options={
-#             "maxiter": 10_000,
-#             "ftol": config.ftol,
-#             "gtol": config.gtol,
-#             "maxls": config.maxls,
-#         },
-#     )
-#     if cb.success:
-#         optimization_result.success = True
-#     if not optimization_result.success:
-#         raise RuntimeError(f"Likelihood ratio filtering failed to converge")
-#
-#     ll = log_likelihood(
-#         optimization_result.x,
-#         num_runs,
-#         cm_lut,
-#         cov_params,
-#         egs,
-#     )
-#     return optimization_result, ll
-#

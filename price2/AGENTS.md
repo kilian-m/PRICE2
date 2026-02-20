@@ -32,7 +32,7 @@
     - equivalence_groups.py ✔
     - orf_activity_estimator.py ✔
     - data_collector.py ✔
-    - locus.py
+    - locus.py ✔
 
 2. **Deconvolution algorithm:** Improve the core ORF deconvolution algorithm.
 3. **New features:** Add new functionality after the algorithm is solid.
