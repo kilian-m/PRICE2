@@ -29,9 +29,9 @@
     - genomic_features.py ✔
     - ribo_seq_alignment.py ✔
     - ribo_seq_run.py ✔
-    - equivalence_groups.py
-    - orf_activity_estimator.py
-    - data_collector.py
+    - equivalence_groups.py ✔
+    - orf_activity_estimator.py ✔
+    - data_collector.py ✔
     - locus.py
 
 2. **Deconvolution algorithm:** Improve the core ORF deconvolution algorithm.

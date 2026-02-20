@@ -1,37 +1,57 @@
-import os
-import shutil
+"""Parallel ORF activity estimation across genomic loci.
+
+This module orchestrates the per-locus deconvolution pipeline:
+loading data from SQLite, filtering ORF candidates, constructing
+equivalence groups, running group-LASSO optimisation and writing
+results.  Each locus is processed in an isolated worker process via
+``pebble.ProcessPool`` so that timeouts and crashes are isolated.
+"""
+
 import glob
+import os
 import sqlite3 as sql
-import numpy as np
-import pandas as pd
-import numba as nb
-import psutil
+import time
+import traceback
+from concurrent.futures import TimeoutError
+from pickle import loads
+
 import multiprocessing as mp
-
-from pickle import loads, dumps
-import zlib
+import pandas as pd
+import psutil
 from filelock import FileLock
-
-from price2.locus import Locus
-from price2.ribo_seq_alignment import RiboSeqAlignment
-from price2.equivalence_groups import make_equivalence_groups
-
+from pebble import ProcessPool
 from tqdm import tqdm
 
-import time
+from price2.equivalence_groups import make_equivalence_groups
 
-from pebble import ProcessPool
-import multiprocessing as mp
-
+# Must be set before any ProcessPool is created.  ``forkserver`` is
+# required because numba JIT state and SQLite handles are not safe to
+# fork directly.
 mp.set_start_method("forkserver", force=True)
-from concurrent.futures import TimeoutError
-import traceback
-import resource
 
 
 class ORFActivityEstimator:
+    """Orchestrate parallel ORF deconvolution over all genomic loci.
 
-    def __init__(self, config):
+    Each locus stored in the PRICE SQLite database is dispatched to an
+    isolated worker process.  Results are accumulated in
+    ``self.loci`` and performance statistics in
+    ``self.performance_df``.
+
+    Parameters
+    ----------
+    config : Config
+        Parsed PRICE configuration object.
+    """
+
+    def __init__(self, config) -> None:
+        """Initialise estimator and load locus IDs from the database.
+
+        Parameters
+        ----------
+        config : Config
+            Parsed PRICE configuration object.
+        """
         self.config = config
         self.db_path = f"{config.w_dir}/price.db"
 
@@ -43,8 +63,22 @@ class ORFActivityEstimator:
         if config.loci_subset > 0:
             self.loci_ids = self.loci_ids[: config.loci_subset]
 
-    def run_orf_deconvolution(self):
+    def run_orf_deconvolution(self) -> None:
+        """Run the full per-locus ORF deconvolution pipeline.
 
+        Dispatches each locus to a worker process via
+        :class:`pebble.ProcessPool`.  Already-processed loci (detected
+        via ``performance_measurements.tsv``) are skipped so that the
+        run can be resumed after a crash.
+
+        Results are written incrementally to
+        ``<o_dir>/results.tsv``.  Failed loci are logged to
+        ``<o_dir>/failed_loci.txt``.
+
+        When ``config.save_memory`` is ``False`` the in-memory
+        attributes ``self.loci`` and ``self.performance_df`` are
+        populated after the pool finishes.
+        """
         self.loci = {}
         loci_ids = set(self.loci_ids)
 
@@ -120,10 +154,6 @@ class ORFActivityEstimator:
                     pbar.update(1)
                     i += 1
 
-                # except Exception as e:
-                #     results.append(e)
-                #     pbar.update(1)
-                #     i += 1
         if not self.config.save_memory:
             self.loci = {}
             self.failed_loci = {}
@@ -141,36 +171,45 @@ class ORFActivityEstimator:
             os.remove(lock_file)
 
 
-def process_loc(arguments):
+def process_loc(arguments: tuple):
+    """Process a single locus: filter ORFs, deconvolve, write output.
 
-    (
-        loc_id,
-        config,
-    ) = arguments
+    This function is executed in a separate worker process by
+    :meth:`ORFActivityEstimator.run_orf_deconvolution`.
 
-    # make file in working directory that shows that locus processing has started
+    Parameters
+    ----------
+    arguments : tuple
+        A ``(locus_id, config)`` pair where *locus_id* is the string
+        identifier stored in the SQLite database and *config* is the
+        :class:`~price2.config.Config` instance.
+
+    Returns
+    -------
+    tuple[Locus, dict] or None
+        ``(locus, performance_measurements)`` when
+        ``config.save_memory`` is ``False``, otherwise ``None``.
+    """
+    loc_id, config = arguments
+
+    # Create a sentinel file so that interrupted loci can be detected.
     filename = f"{config.w_dir}/processing_loci/{loc_id}"
     with open(filename, "w") as f:
         pass
 
-    # memory_limit = int(config.memory_limit_gb * 1024 * 1024 * 1024)
-    # resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-
-    performance_measurements = {}  # performance measurement
-    performance_measurements["loc_id"] = loc_id  # performance measurement
-    t_start = time.time()  # performance measurement
-    t1 = time.time()  # performance measurement
+    performance_measurements: dict = {}
+    performance_measurements["loc_id"] = loc_id
+    t_start = time.time()
+    t1 = time.time()
 
     if not hasattr(config, "base_o_dir"):
         config.base_o_dir = config.o_dir
 
-    ###############################
-    ### get data from databases ###
-    ###############################
+    # --- Load locus and runs from database ---
     db_path = f"{config.w_dir}/price.db"
     db = sql.connect(db_path)
     cur = db.cursor()
-    cur.execute("""SELECT * FROM loci WHERE locus_id = ?""", (loc_id,))
+    cur.execute("SELECT * FROM loci WHERE locus_id = ?", (loc_id,))
     loc = loads(cur.fetchone()[1])
     performance_measurements["chrom"] = loc.iv.chrom
     performance_measurements["strand"] = loc.iv.strand
@@ -181,52 +220,33 @@ def process_loc(arguments):
     runs = [loads(blob) for id, blob in cur.fetchall()]
     db.close()
 
-    t2 = time.time()  # performance measurement
-    performance_measurements["db_time"] = t2 - t1  # performance measurement
+    t2 = time.time()
+    performance_measurements["db_time"] = t2 - t1
 
     if config.verbose_gtf:
         loc.to_gtf(f"{config.base_o_dir}/all")
         loc.to_tsv(f"{config.base_o_dir}/all")
     loc.rgr_filter_sets = {}
 
-    # from pyfaidx import Fasta
-    #
-    # genome = Fasta(config.fasta_path)
-    # loc.to_fasta(f"{config.base_o_dir}", genome)
-
-    ##########################
-    ### load reads to list ###
-    ##########################
-
-    t1 = time.time()  # performance measurement
-
+    # --- Load reads ---
+    t1 = time.time()
     loc.get_reads_from_db(db_path)
+    t2 = time.time()
+    performance_measurements["load_reads_time"] = t2 - t1
 
-    t2 = time.time()  # performance measurement
-    performance_measurements["load_reads_time"] = t2 - t1  # performance measurement
-
-    ######################################
-    ### assign reads to ORF candidates ###
-    ######################################
-
-    t1 = time.time()  # performance measurement
-    unfiltered_rgr_count = len(loc.rgr_set)  # performance measurement
-    performance_measurements["unfiltered_rgr_count"] = (
-        unfiltered_rgr_count  # performance measurement
-    )
+    # --- Assign reads to ORF candidates ---
+    t1 = time.time()
+    performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
     loc.rgr_filter_sets["unfiltered"] = loc.rgr_set
 
     if config.coverage_filter or config.deconvolution_filter:
         loc.make_well_fitting_reads(runs)
 
-    t2 = time.time()  # performance measurement
-    performance_measurements["assign_reads_time"] = t2 - t1  # performance measurement
+    t2 = time.time()
+    performance_measurements["assign_reads_time"] = t2 - t1
 
-    ###############################################
-    ### filter ORF candidates based on coverage ###
-    ###############################################
-
-    t1 = time.time()  # performance measurement
+    # --- Coverage filter ---
+    t1 = time.time()
 
     if config.coverage_filter:
         loc.coverage_filter_rgrs(config)
@@ -236,37 +256,25 @@ def process_loc(arguments):
         loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
     loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
 
-    performance_measurements["filtered_coverage_rgr_count"] = len(
-        loc.rgr_set
-    )  # performance measurement
-    t2 = time.time()  # performance measurement
-    performance_measurements["coverage_filter_time"] = (
-        t2 - t1
-    )  # performance measurement
+    performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
+    t2 = time.time()
+    performance_measurements["coverage_filter_time"] = t2 - t1
 
-    ##############################################################
-    ### deconvolution filter ORF candidates ending in one stop ###
-    ##############################################################
-
-    t1 = time.time()  # performance measurement
+    # --- Deconvolution filter ---
+    t1 = time.time()
     if config.deconvolution_filter:
         loc.deconvolution_filter_rgrs(config)
 
     loc.rgr_filter_sets["deconvolution_filtered"] = loc.rgr_set
-    performance_measurements["filtered_deconvolution_rgr_count"] = len(
-        loc.rgr_set
-    )  # performance measurement
-    t2 = time.time()  # performance measurement
-    performance_measurements["filter_2_time"] = t2 - t1  # performance measurement
+    performance_measurements["filtered_deconvolution_rgr_count"] = len(loc.rgr_set)
+    t2 = time.time()
+    performance_measurements["filter_2_time"] = t2 - t1
 
     if config.verbose_gtf:
         loc.to_gtf(f"{config.base_o_dir}/deconvolution_filtered")
         loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
 
-    ###################################
-    ### generate equivalence groups ###
-    ###################################
-
+    # --- Equivalence groups ---
     performance_measurements["mem_before_egs"] = (
         psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
     )
@@ -274,110 +282,65 @@ def process_loc(arguments):
     for tr in loc.transcripts:
         tr.update_with_filtered_orfs(loc.rgr_set)
 
-    t1 = time.time()  # performance measurement
+    t1 = time.time()
     loc.egs = make_equivalence_groups(loc, runs)
-    t2 = time.time()  # performance measurement
+    t2 = time.time()
 
     performance_measurements["mem_after_egs"] = (
         psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
     )
+    performance_measurements["eg_time"] = t2 - t1
 
-    performance_measurements["eg_time"] = t2 - t1  # performance measurement
-
-    ##########################################
-    ### assign reads to equivalence groups ###
-    ##########################################
-
-    t1 = time.time()  # performance measurement
+    # --- Assign reads to equivalence groups ---
+    t1 = time.time()
     loc.assign_reads_to_egs(runs)
-    t2 = time.time()  # performance measurement
-    performance_measurements["proc_reads_2_time"] = t2 - t1  # performance measurement
+    t2 = time.time()
+    performance_measurements["proc_reads_2_time"] = t2 - t1
     performance_measurements["read_count"] = sum(
-        [rc for _, rc in loc.counted_reads.items()]
+        rc for _, rc in loc.counted_reads.items()
     )
 
-    ############################
-    ### run the optimization ###
-    ############################
-    loc.deconvolve(
-        config,
-        runs=runs,
-    )
-
-    # performance_measurements["opt_time"] = opt_time  # performance measurement
-    # performance_measurements["data_time"] = data_time  # performance measurement
+    # --- Group-LASSO optimisation ---
+    loc.deconvolve(config, runs=runs)
 
     loc.rgr_filter_sets["deconvoluted"] = loc.rgr_set
     performance_measurements["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
-    # performance_measurements["iterations"] = loc.optimization_result.nit
-    t2 = time.time()  # performance measurement
-    performance_measurements["optimization_time"] = t2 - t1  # performance measurement
-
-    ####################################
-    ### filter with likelihood ratio ###
-    ####################################
+    t2 = time.time()
+    performance_measurements["optimization_time"] = t2 - t1
 
     if config.verbose_gtf:
         loc.to_gtf(f"{config.base_o_dir}/deconvoluted")
         loc.to_tsv(f"{config.base_o_dir}/deconvoluted")
 
+    # --- Likelihood-ratio filter ---
     if config.likelihood_ratio_filter:
-        t1 = time.time()  # performance measurement
-
-        loc.likelihood_ratio_filtering(
-            config,
-            runs,
-        )
-
+        t1 = time.time()
+        loc.likelihood_ratio_filtering(config, runs)
         loc.rgr_filter_sets["likelihood_ratio_filtered"] = loc.rgr_set
-        t2 = time.time()  # performance measurement
-        performance_measurements["likelihood_ratio_time"] = (
-            t2 - t1
-        )  # performance measurement
-
+        t2 = time.time()
+        performance_measurements["likelihood_ratio_time"] = t2 - t1
         performance_measurements["filtered_lrt_rgr_count"] = len(loc.rgr_set)
-        performance_measurements["orf_count"] = len(
-            [1 for rgr in loc.rgr_set if rgr.type == "ORF"]
+        performance_measurements["orf_count"] = sum(
+            1 for rgr in loc.rgr_set if rgr.type == "ORF"
         )
 
-    ##########################
-    ### estimate activites ###
-    ##########################
-
-    t1 = time.time()  # performance measurement
+    # --- Estimate activities ---
+    t1 = time.time()
     loc.estimate_activities(runs, config)
+    t2 = time.time()
+    performance_measurements["activity_time"] = t2 - t1
 
-    t2 = time.time()  # performance measurement
-    performance_measurements["activity_time"] = t2 - t1  # performance measurement
-
-    ######################
-    ### return results ###
-    ######################
-
-    # compute number of genes and transcripts
+    # --- Collect final statistics ---
     performance_measurements["gene_number"] = len(
         {rgr.transcript.gene_id for rgr in loc.rgr_set_complete}
-    )  # performance measurement
-
-    performance_measurements["transcripts_number"] = (
-        loc.transcripts_number
-    )  # performance measurement
-
+    )
+    performance_measurements["transcripts_number"] = loc.transcripts_number
     performance_measurements["occupied_memory_mb"] = (
         psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
     )
-
-    end_memory = psutil.Process(os.getpid()).memory_full_info().rss / 1024 / 1024
-
-    # del loc.egs
-    # del loc.rsas_dict
-
-    t_end = time.time()  # performance measurement
-    performance_measurements["overall_time"] = (
-        t_end - t_start
-    )  # performance measurement
-
-    performance_measurements["exon_length"] = loc.exon_length  # performance measurement
+    t_end = time.time()
+    performance_measurements["overall_time"] = t_end - t_start
+    performance_measurements["exon_length"] = loc.exon_length
 
     if not loc.result_df.empty:
         lock = FileLock(f"{config.base_o_dir}/results.tsv.lock")

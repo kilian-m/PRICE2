@@ -1,3 +1,12 @@
+"""Data collection orchestration for PRICE2.
+
+This module provides the DataCollector class, which drives the multi-step
+process of collecting Ribo-seq run statistics, mapping reads to loci, and
+assembling locus-level data structures for downstream deconvolution.
+Intermediate results are persisted in an SQLite database located in the
+working directory (``price.db``).
+"""
+
 import os
 import HTSeq
 import sqlite3 as sql
@@ -16,29 +25,59 @@ from price2.config import Config
 
 
 class DataCollector:
+    """Orchestrate data collection for PRICE2 deconvolution.
+
+    Builds loci from a reference annotation, persists Ribo-seq run
+    statistics and read mappings to an SQLite database, and assembles
+    per-locus data structures ready for ORF deconvolution.
+
+    Attributes
+    ----------
+    loci_intervals : HTSeq.GenomicArray
+        Stranded genomic array mapping intervals to their :class:`Locus`.
+    loci_set : set[Locus]
+        Full set of loci constructed from the reference annotation.
+    chr_order : list[str] or None
+        Chromosome names in BAM header order; ``None`` if no BAM found.
+    """
+
     loci_intervals: HTSeq.GenomicArray
     loci_set: set[Locus]
-    chr_order: list[str]
-    read_db: sql.Connection
+    chr_order: list[str] | None
 
     def __init__(
         self,
         reference_annotation: ReferenceAnnotation,
-        genome: dict[str : HTSeq.Sequence],
+        genome: dict[str, HTSeq.Sequence],
         config: Config,
-    ):
+    ) -> None:
+        """Initialise the DataCollector.
 
-        self.bam_dir = config.bam_dir
-        self.get_chromosome_order()
-
-        self.reference_annotation = reference_annotation
-        self.db_path = f"{config.w_dir}/price.db"
-        self.make_loci(self.reference_annotation)
+        Parameters
+        ----------
+        reference_annotation : ReferenceAnnotation
+            Parsed reference annotation used to define loci.
+        genome : dict[str, HTSeq.Sequence]
+            Mapping from chromosome name to its nucleotide sequence.
+        config : Config
+            Run configuration.
+        """
         self.config = config
         self.genome = genome
+        self.reference_annotation = reference_annotation
+        self.bam_dir = config.bam_dir
+        self.db_path = f"{config.w_dir}/price.db"
+        self.get_chromosome_order()
+        self.make_loci(self.reference_annotation)
 
-    def collect_runs(self):
+    def collect_runs(self) -> None:
+        """Collect and persist Ribo-seq run statistics.
 
+        Discovers BAM files in ``config.bam_dir`` (or uses the explicit
+        list from ``config.bam_ids``), computes per-run statistics for any
+        run not already stored in the database, and appends them to
+        ``self.runs``.
+        """
         if self.config.bam_ids:
             bam_ids = set(self.config.bam_ids)
         else:
@@ -51,9 +90,9 @@ class DataCollector:
             db = sql.connect(self.db_path, timeout=60)
             cur = db.cursor()
             cur.execute("SELECT * FROM runs")
-            tmp = [(run_id, run) for run_id, run in cur.fetchall()]
-            run_ids = {run_id for run_id, _ in tmp}
-            self.runs = [loads(run) for _, run in tmp]
+            stored_runs = cur.fetchall()
+            run_ids = {run_id for run_id, _ in stored_runs}
+            self.runs = [loads(run_blob) for _, run_blob in stored_runs]
             bam_ids = bam_ids - run_ids
         else:
             self.runs = []
@@ -82,9 +121,14 @@ class DataCollector:
         db.commit()
         db.close()
 
-    def collect_mappings(
-        self,
-    ):
+    def collect_mappings(self) -> None:
+        """Map reads from all runs to loci and persist results.
+
+        Creates the ``reads`` and ``transcript_read_counts`` tables in the
+        database if they do not already exist, then dispatches
+        :func:`collect_mappings_run` in parallel for any run whose mappings
+        have not yet been stored.
+        """
         db = sql.connect(self.db_path)
         cur = db.cursor()
         cur.execute(
@@ -137,18 +181,43 @@ class DataCollector:
                     )
                 )
 
-    def get_chromosome_order(self):
+    def get_chromosome_order(self) -> None:
+        """Set ``self.chr_order`` from the first BAM file found in ``bam_dir``.
+
+        Reads the ``SQ`` header records of the first ``.bam`` file in
+        ``self.bam_dir``.  ``self.chr_order`` is set to ``None`` when no BAM
+        file is present.
+        """
         self.chr_order = None
         for bam_file in os.listdir(self.bam_dir):
             if bam_file.endswith(".bam"):
-                if not self.chr_order:
-                    bam_reader = HTSeq.BAM_Reader(os.path.join(self.bam_dir, bam_file))
-                    self.chr_order = [
-                        x["SN"] for x in bam_reader.get_header_dict()["SQ"]
-                    ]
+                bam_reader = HTSeq.BAM_Reader(os.path.join(self.bam_dir, bam_file))
+                self.chr_order = [
+                    x["SN"] for x in bam_reader.get_header_dict()["SQ"]
+                ]
                 return
 
-    def make_loci(self, reference_annotation: ReferenceAnnotation, distance: int = 50):
+    def make_loci(
+        self,
+        reference_annotation: ReferenceAnnotation,
+        distance: int = 50,
+    ) -> None:
+        """Build loci by merging nearby transcript intervals.
+
+        Iterates over transcripts in ``reference_annotation``, marks their
+        genomic intervals in a binary step-array, and then merges
+        consecutive occupied intervals on the same strand that are at most
+        ``distance`` bases apart into a single :class:`~price2.locus.Locus`.
+        Populates ``self.loci_intervals`` and ``self.loci_set``.
+
+        Parameters
+        ----------
+        reference_annotation : ReferenceAnnotation
+            Parsed annotation whose transcripts define the locus boundaries.
+        distance : int, optional
+            Maximum gap (in bases) between two transcript intervals that are
+            still merged into the same locus.  Default is 50.
+        """
         loci_intervals_binary = HTSeq.GenomicArray(
             "auto", stranded=True, storage="step", typecode="b"
         )
@@ -206,8 +275,16 @@ class DataCollector:
             except IndexError:
                 pass
 
-    def collect_loci(self):
+    def collect_loci(self) -> None:
+        """Filter transcripts per locus and build read-generating regions.
 
+        Loads transcript read-count data from the database, greedily selects
+        transcripts that explain the most reads (above
+        ``config.min_explained_reads_per_run`` per run), prunes the transcript
+        set of each locus accordingly, and calls
+        :meth:`~price2.locus.Locus.make_rgrs` to construct read-generating
+        regions.  Serialises each non-empty locus to the ``loci`` table.
+        """
         db = sql.connect(self.db_path)
         cur = db.cursor()
         r = cur.execute("""SELECT * FROM runs""")
@@ -235,23 +312,24 @@ class DataCollector:
                 (locus.id,),
             )
 
-            d = {}
+            # Aggregate transcript read counts across all runs.
+            transcript_read_counts: dict = {}
             for entry in cur.fetchall():
                 for k, v in loads(zlib.decompress(entry[2])).items():
                     try:
-                        d[k] += v
+                        transcript_read_counts[k] += v
                     except KeyError:
-                        d[k] = v
+                        transcript_read_counts[k] = v
 
             tr_ids = [t.id for t in locus.transcripts]
 
-            l = []
-            for k, v in d.items():
-                l1 = [True if tr.id in k else False for tr in locus.transcripts]
-                l1.append(v)
-                l.append(l1)
+            rows = []
+            for read_set, count in transcript_read_counts.items():
+                row = [tr.id in read_set for tr in locus.transcripts]
+                row.append(count)
+                rows.append(row)
 
-            df = pd.DataFrame(l, columns=tr_ids + ["count"])
+            df = pd.DataFrame(rows, columns=tr_ids + ["count"])
 
             explaining_transcripts_reads_list = []
 
@@ -284,16 +362,6 @@ class DataCollector:
 
             locus.transcript_intervals = new_tr_intervals
 
-            # ti = locus.transcript_intervals
-            # locus.transcript_intervals = HTSeq.GenomicArrayOfSets(
-            #     "auto", stranded=True, storage="step"
-            # )
-            # for iv, val in ti.steps():
-            #     if val:
-            #         for tr in val:
-            #             if tr in locus.keep_transcripts:
-            #                 locus.transcript_intervals[iv] = val
-
             if locus.transcripts:
                 locus.make_rgrs(self.genome, self.config)
                 cur.execute("INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus)))
@@ -302,24 +370,31 @@ class DataCollector:
         db.close()
 
 
-def collect_mappings_run(data):
+def collect_mappings_run(
+    data: tuple,
+) -> None:
+    """Map reads from a single BAM run to all loci and persist results.
 
+    Designed to be called via :class:`multiprocessing.Pool`.  Accepts a
+    single tuple argument so it is compatible with ``Pool.map``.
+
+    Parameters
+    ----------
+    data : tuple
+        A 4-tuple of ``(run_id, bam_dir, db_path, loci_set)`` where
+
+        * ``run_id`` – identifier of the Ribo-seq run (BAM filename stem).
+        * ``bam_dir`` – directory containing BAM files.
+        * ``db_path`` – path to the SQLite database.
+        * ``loci_set`` – set of :class:`~price2.locus.Locus` objects to map
+          reads against.
+    """
     run_id, bam_dir, db_path, loci_set = data
 
     br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
 
-    # db = sql.connect(db_path)
-    # cur = db.cursor()
-    #
-    # cur.execute("SELECT locus_id FROM reads WHERE run_id = ?", (run_id,))
-    #
-    # processed_loc_ids = {loc_id for loc_id, in cur.fetchall()}
-    # db.close()
-
-    # loci_set = {loc for loc in loci_set if loc.id not in processed_loc_ids}
-
-    l_reads = []
-    l_transcript_read_counts = []
+    reads_rows: list = []
+    transcript_count_rows: list = []
 
     for locus in loci_set:
         transcripts_counts = defaultdict(int)
@@ -387,8 +462,8 @@ def collect_mappings_run(data):
         df["unique"] = df["unique"].astype(bool)
         df["count"] = df["count"].astype(np.uint16)
 
-        l_reads.append((locus.id, run_id, zlib.compress(dumps(df))))
-        l_transcript_read_counts.append(
+        reads_rows.append((locus.id, run_id, zlib.compress(dumps(df))))
+        transcript_count_rows.append(
             (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
         )
 
@@ -400,7 +475,7 @@ def collect_mappings_run(data):
                      run_id,
                      reads_blob
                      ) VALUES (?, ?, ?)""",
-        l_reads,
+        reads_rows,
     )
 
     cur.executemany(
@@ -409,7 +484,7 @@ def collect_mappings_run(data):
                      run_id,
                      transcript_read_counts_blob
                      ) VALUES (?, ?, ?)""",
-        l_transcript_read_counts,
+        transcript_count_rows,
     )
     db.commit()
     db.close()
