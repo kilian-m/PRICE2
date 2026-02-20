@@ -30,10 +30,10 @@
     - ribo_seq_alignment.py ✔
     - ribo_seq_run.py ✔
     - equivalence_groups.py
+    - orf_activity_estimator.py
     - data_collector.py
     - locus.py
-    - orf_activity_estimator.py
-    - job_scheduler.py
+
 2. **Deconvolution algorithm:** Improve the core ORF deconvolution algorithm.
 3. **New features:** Add new functionality after the algorithm is solid.
 4. **Performance:** Optimize after features are stable.
