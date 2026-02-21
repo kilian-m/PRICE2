@@ -339,6 +339,7 @@ class CleavageModel:
             0.05,
             fill=True,
             facecolor="tab:red",
+            label=f"UTA prob = {self.pu:.3f}",
         )
         border = Rectangle(
             (-5, 0.9),
@@ -350,6 +351,7 @@ class CleavageModel:
         )
         ax.add_patch(fill)
         ax.add_patch(border)
+        ax.legend(loc="upper right")
         ax.set_xlabel("position relative to p-site")
         ax.set_ylabel("cleavage probability")
 
@@ -752,22 +754,32 @@ class CleavageEstimator:
     def compute_shift(self, range_start: int = -25, range_end: int = -5) -> int:
         """Compute the shift to align pl with the start-distance histogram.
 
+        Uses cross-correlation (via convolution) to find the offset that
+        best aligns the reversed left-cleavage distribution with the
+        observed read-start-to-ORF-start distance histogram.
+
+        Parameters
+        ----------
+        range_start : int, optional
+            Start of the search range relative to the ORF start (default -25).
+        range_end : int, optional
+            End of the search range relative to the ORF start (default -5).
+
         Returns
         -------
         int
             Shift that aligns the cleavage model to the P-site.
         """
-        pl_rev = self.best_pl[::-1]
-        pl_maxpos = pl_rev.argmax()
+        # pl_rev = self.best_pl[::-1]
+        dist_starts = self.dist_starts[100 + range_start : 100 + range_end]
 
-        overlayed = np.zeros(range_end - range_start)
-        for i in range(range_start, range_end):
-            start = 100 + i - pl_maxpos
-            end = start + len(pl_rev)
-            overlayed[i - range_start] = np.dot(pl_rev, self.dist_starts[start:end])
+        # Index within dist_starts that corresponds to the expected peak position
+        expected_peak = -range_start
 
-        overlayed_diff = overlayed[3:] - overlayed[:-3]
-        return -(overlayed_diff.argmax() - pl_maxpos + range_start + len(pl_rev) + 2)
+        # Best alignment offset from cross-correlation
+        conv_offset = np.convolve(dist_starts, self.best_pl, mode="full").argmax()
+
+        return expected_peak - conv_offset
 
     def correct_max_pos(self, shift: int) -> None:
         """Shift pl and pr arrays and re-normalise.

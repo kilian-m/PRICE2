@@ -14,9 +14,14 @@ is the reverse of translation order.  The project convention is
 
 from __future__ import annotations
 
+from typing import Literal
+
 import HTSeq
 import pandas as pd
 from HTSeq import GenomicInterval
+
+Strand = Literal["+", "-"]
+"""Genomic strand: either ``'+'`` (forward) or ``'-'`` (reverse)."""
 
 
 class GenomicRegion:
@@ -29,7 +34,7 @@ class GenomicRegion:
     ----------
     chrom : str
         Chromosome / reference sequence name.
-    strand : str
+    strand : Strand
         ``'+'`` or ``'-'``.
     intervals : list[GenomicInterval]
         Exonic intervals in chromosome order.
@@ -38,7 +43,7 @@ class GenomicRegion:
     """
 
     chrom: str
-    strand: str
+    strand: Strand
     intervals: list[GenomicInterval]
     length: int
 
@@ -46,7 +51,7 @@ class GenomicRegion:
         self,
         intervals: list[GenomicInterval] | None = None,
         chrom: str | None = None,
-        strand: str | None = None,
+        strand: Strand | None = None,
         df: pd.DataFrame | None = None,
         gi_string: str | None = None,
     ) -> None:
@@ -60,7 +65,7 @@ class GenomicRegion:
             Pre-built HTSeq ``GenomicInterval`` objects.
         chrom : str | None
             Chromosome name (inferred from *intervals* if omitted).
-        strand : str | None
+        strand : Strand | None
             Strand (inferred from *intervals* if omitted).
         df : pd.DataFrame | None
             DataFrame with columns ``chrom``, ``start``, ``end``,
@@ -116,10 +121,8 @@ class GenomicRegion:
         return self.hash
 
     def __str__(self) -> str:
-        s = f"{self.chrom}{self.strand}"
-        for iv in self.intervals:
-            s += f":[{iv.start},{iv.end})"
-        return s
+        intervals_str = "|".join(f"{iv.start}-{iv.end}" for iv in self.intervals)
+        return f"{self.chrom}{self.strand}:{intervals_str}"
 
     def __repr__(self) -> str:
         return str(self)

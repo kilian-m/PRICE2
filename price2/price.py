@@ -18,6 +18,7 @@ import HTSeq
 
 from price2.config import Config
 from price2.data_collector import DataCollector
+from price2.dataset_models import save_dataset_models
 from price2.orf_activity_estimator import ORFActivityEstimator
 from price2.reference_annotation import ReferenceAnnotation
 
@@ -146,6 +147,13 @@ def run_pipeline(config: Config) -> None:
     _timed(
         "compute cleavage and coverage models... ",
         data_collector.collect_runs,
+    )
+
+    _timed(
+        "save dataset model summaries... ",
+        save_dataset_models,
+        data_collector.runs,
+        config.o_dir,
     )
 
     _timed(

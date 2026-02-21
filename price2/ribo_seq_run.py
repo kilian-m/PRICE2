@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import subprocess
 
+import numpy as np
 import pysam
 
 from price2.cleavage_model import CleavageEstimator, CleavageModel
@@ -35,6 +36,14 @@ class RiboSeqRun:
         Coverage scale-factor model estimated from this run.
     read_count : int, optional
         Total number of mapped reads in the original BAM file.
+    cleavage_counted_reads : int, optional
+        Number of reads used for cleavage model estimation.
+    cleavage_dist_starts : np.ndarray or None, optional
+        Histogram of read-start distances to CDS start, shape (200,).
+        Index ``i`` corresponds to distance ``i - 100``.
+    cleavage_table : np.ndarray or None, optional
+        Read-count table by (length, frame, UTA, condition) used for
+        cleavage model estimation.
     """
 
     def __init__(
@@ -43,11 +52,17 @@ class RiboSeqRun:
         cleavage_model: CleavageModel,
         coverage_model: CoverageModel,
         read_count: int = 0,
+        cleavage_counted_reads: int = 0,
+        cleavage_dist_starts: "np.ndarray | None" = None,
+        cleavage_table: "np.ndarray | None" = None,
     ) -> None:
         self.id = run_id
         self.cleavage_model = cleavage_model
         self.coverage_model = coverage_model
         self.read_count = read_count
+        self.cleavage_counted_reads = cleavage_counted_reads
+        self.cleavage_dist_starts = cleavage_dist_starts
+        self.cleavage_table = cleavage_table
 
     def __repr__(self) -> str:
         return f"RiboSeqRun(id={self.id!r}, read_count={self.read_count})"
@@ -101,10 +116,7 @@ def ribo_seq_runs_from_bams(
         with ctx.Pool(processes) as pool:
             ribo_seq_runs: list[RiboSeqRun] = pool.starmap(
                 ribo_seq_run_from_bam,
-                [
-                    (bam_dir, bam_file, wdir, ref_annotation)
-                    for bam_file in bam_files
-                ],
+                [(bam_dir, bam_file, wdir, ref_annotation) for bam_file in bam_files],
             )
     else:
         ribo_seq_runs = []
@@ -154,10 +166,13 @@ def ribo_seq_run_from_bam(
     sample_bam_file = f"{wdir}/sample_bam/{bam_file}"
     subprocess.run(
         [
-            "samtools", "view",
+            "samtools",
+            "view",
             "-b",
-            "-s", str(fraction_of_reads),
-            "-o", sample_bam_file,
+            "-s",
+            str(fraction_of_reads),
+            "-o",
+            sample_bam_file,
             bam_file_path,
         ],
         check=True,
@@ -178,4 +193,12 @@ def ribo_seq_run_from_bam(
 
     os.remove(sample_bam_file)
 
-    return RiboSeqRun(run_id, cleavage_model, coverage_model, read_count=read_count)
+    return RiboSeqRun(
+        run_id,
+        cleavage_model,
+        coverage_model,
+        read_count=read_count,
+        cleavage_counted_reads=ce.counted_alns,
+        cleavage_dist_starts=ce.dist_starts.copy(),
+        cleavage_table=ce.table.copy(),
+    )

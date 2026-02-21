@@ -206,6 +206,8 @@ class CoverageModel:
     ) -> None:
         start_hist = self._build_start_histogram(ra, sample_bam_path, cm)
         stop_hist = self._build_stop_histogram(ra, sample_bam_path, cm)
+        self.start_hist = start_hist
+        self.stop_hist = stop_hist
         self.start_factor = self._compute_start_factor(start_hist, sample_bam_path)
         self.stop_factor = self._compute_stop_factor(stop_hist, sample_bam_path)
 
