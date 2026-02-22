@@ -4,7 +4,7 @@
 
 **PRICE2** is a bioinformatics tool that detects translated regions (translons) from multiple mapped Ribo-seq samples (BAM files). It implements a generative model of Ribo-seq data and uses group-LASSO penalized maximum likelihood estimation to find active translons, similar to isoform deconvolution from RNA-seq data.
 
-**Python:** 3.10+  
+**Python:** 3.12+  
 **Package Manager:** conda (environment defined in `price2.yml`)
 
 ## Development Strategy
@@ -188,6 +188,7 @@ All parameters are managed via a `Config` dataclass loaded from a JSON file. Key
 - Use pytest fixtures to share resources between tests
 
 ### Running Tests
+before running any tests activate the conda environment 'price2'
 ```bash
 pytest tests/
 pytest tests/test_cleavage_model.py -v

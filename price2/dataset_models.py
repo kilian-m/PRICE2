@@ -260,15 +260,16 @@ def _write_coverage_pdf(
             x_start = np.arange(_HIST_SIZE) - _START_CODON_IDX
             colors_start = np.where(x_start == 0, "red", "steelblue")
             ax_start.bar(
-                x_start, start_hist, width=1, color=colors_start,
+                x_start,
+                start_hist,
+                width=1,
+                color=colors_start,
             )
             # Invisible artist for the legend entry
-            ax_start.bar([], [], width=1, color="red", label="start codon")
             ax_start.set_xlabel("CDS position relative to start codon")
             ax_start.set_ylabel("P-site read count")
             ax_start.set_title(f"{run.id} – CDS start")
             ax_start.set_xlim(-35, 205)
-            ax_start.legend()
 
             # Annotate the start factor
             ax_start.text(
@@ -285,17 +286,18 @@ def _write_coverage_pdf(
             # --- Stop-codon histogram ---
             # x-axis: CDS position relative to CDS end
             x_stop = np.arange(_HIST_SIZE) - _STOP_HIST_OFFSET
-            colors_stop = np.where(x_stop == -3, "red", "coral")
+            colors_stop = np.where(x_stop == -3, "red", "steelblue")
             ax_stop.bar(
-                x_stop, stop_hist, width=1, color=colors_stop,
+                x_stop,
+                stop_hist,
+                width=1,
+                color=colors_stop,
             )
             # Invisible artist for the legend entry
-            ax_stop.bar([], [], width=1, color="red", label="last sense codon")
             ax_stop.set_xlabel("CDS position relative to CDS end")
             ax_stop.set_ylabel("P-site read count")
             ax_stop.set_title(f"{run.id} – CDS stop")
             ax_stop.set_xlim(-205, 35)
-            ax_stop.legend()
 
             # Annotate the stop factor
             ax_stop.text(
@@ -303,7 +305,7 @@ def _write_coverage_pdf(
                 0.95,
                 f"stop factor = {cov.stop_factor:.2f}",
                 transform=ax_stop.transAxes,
-                ha="right",
+                ha="left",
                 va="top",
                 fontsize=10,
                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),

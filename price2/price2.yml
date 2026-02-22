@@ -1,0 +1,32 @@
+name: price2
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  - python=3.12
+  # Core scientific stack
+  - numpy
+  - scipy
+  - pandas
+  - numba
+  # Genomics
+  - htseq
+  - pysam
+  - samtools             # called via subprocess for BAM downsampling
+  # Parallelism & system
+  - pebble
+  - filelock
+  - psutil
+  - tqdm
+  # Plotting
+  - matplotlib-base
+  # Testing
+  - pytest
+  # pip-only packages
+
+variables:
+  OMP_NUM_THREADS: "1"         # prevent thread oversubscription with process-level parallelism
+  MKL_NUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"

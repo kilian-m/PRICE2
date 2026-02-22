@@ -78,7 +78,9 @@ class Node:
     downstream: dict[Node, set[Transcript]]
     typ: NodeType
 
-    def __init__(self, iv: HTSeq.GenomicInterval, typ: NodeType = NodeType.INTERNAL) -> None:
+    def __init__(
+        self, iv: HTSeq.GenomicInterval, typ: NodeType = NodeType.INTERNAL
+    ) -> None:
         self.iv = iv
         self.transcripts_positions: dict[Transcript, int] = {}
         self.upstream: dict[Node, set[Transcript]] = defaultdict(set)
