@@ -147,8 +147,6 @@ class GenomicRegion:
         self.intervals.append(interval)
         self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
-
-
     def map_to_local(self, other: GenomicRegion) -> tuple[int, int] | None:
         """Map *other* into the local spliced coordinate system of *self*.
 
@@ -232,76 +230,68 @@ class GenomicRegion:
 
         return (local_start, local_end)
 
-    def map(self, iv_in_region: tuple[int, int]) -> GenomicRegion:
+    def map_to_global(self, iv: tuple[int, int]) -> GenomicRegion:
         """Map region-local coordinates back to genomic coordinates.
 
         Parameters
         ----------
-        iv_in_region : tuple[int, int]
+        iv : tuple[int, int]
             ``(start, end)`` in spliced region-local coordinates
             (0-based, half-open).
 
         Returns
         -------
         GenomicRegion
-            New ``GenomicRegion`` covering the mapped genomic
-            intervals.
+            New ``GenomicRegion`` covering the mapped genomic intervals.
+
+        Raises
+        ------
+        ValueError
+            If *start* is negative or *end* exceeds the region length.
         """
-        start_in_region, end_in_region = iv_in_region
+        start, end = iv
+        if start < 0:
+            raise ValueError(
+                f"Interval start {start} is before the reference (must be >= 0)."
+            )
+        if end > len(self):
+            raise ValueError(
+                f"Interval end {end} exceeds the reference length {len(self)}."
+            )
+        result_ivs: list[tuple[int, int]] = []
+        cumulative = 0
+
         if self.strand == "+":
-            s = 0  # cumulative exon length from transcript start
-            idx = 0
-            region_starts: list[int] = []
-            region_ends: list[int] = []
-            while (
-                idx < len(self.intervals) - 1
-                and s + self.intervals[idx].length < start_in_region
-            ):
-                s += self.intervals[idx].length
-                idx += 1
-            region_starts.append(self.intervals[idx].start + start_in_region - s)
+            for interval in self.intervals:
+                iv_len = interval.length
+                local_end = cumulative + iv_len
+                overlap_start = max(start, cumulative)
+                overlap_end = min(end, local_end)
+                if overlap_start < overlap_end:
+                    global_start = interval.start + (overlap_start - cumulative)
+                    global_end = interval.start + (overlap_end - cumulative)
+                    result_ivs.append((global_start, global_end))
+                cumulative += iv_len
+                if cumulative >= end:
+                    break
 
-            while (
-                idx < len(self.intervals) - 1
-                and s + self.intervals[idx].length < end_in_region
-            ):
-                region_ends.append(self.intervals[idx].end)
-                s += self.intervals[idx].length
-                idx += 1
-                region_starts.append(self.intervals[idx].start)
-            region_ends.append(self.intervals[idx].start + end_in_region - s)
-
-            ivs = zip(region_starts, region_ends)
-
-        elif self.strand == "-":
-            s = 0
-            idx = 0
-            region_starts = []
-            region_ends = []
-
-            while (
-                idx < len(self.intervals) - 1
-                and s + self.intervals[idx].length < start_in_region
-            ):
-                s += self.intervals[idx].length
-                idx += 1
-            region_starts.append(self.intervals[idx].end - (start_in_region - s))
-
-            while (
-                idx < len(self.intervals) - 1
-                and s + self.intervals[idx].length < end_in_region
-            ):
-                region_ends.append(self.intervals[idx].start)
-                s += self.intervals[idx].length
-                idx += 1
-                region_starts.append(self.intervals[idx].end)
-            region_ends.append(self.intervals[idx].end - (end_in_region - s))
-
-            ivs = zip(region_ends, region_starts)
+        else:  # strand == "-"
+            for interval in self.intervals:
+                iv_len = interval.length
+                local_end = cumulative + iv_len
+                overlap_start = max(start, cumulative)
+                overlap_end = min(end, local_end)
+                if overlap_start < overlap_end:
+                    global_high = interval.end - (overlap_start - cumulative)
+                    global_low = interval.end - (overlap_end - cumulative)
+                    result_ivs.append((global_low, global_high))
+                cumulative += iv_len
+                if cumulative >= end:
+                    break
 
         region_intervals = [
             HTSeq.GenomicInterval(self.chrom, rs, re, self.strand)
-            for rs, re in ivs
+            for rs, re in result_ivs
             if rs != re
         ]
         return GenomicRegion(
@@ -413,5 +403,4 @@ class GenomicRegion:
         else:
             raise ValueError('end must be "5\'" or "3\'".')
 
-        return self.map((new_start, new_end))
-
+        return self.map_to_global((new_start, new_end))

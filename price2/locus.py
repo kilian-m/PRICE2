@@ -550,7 +550,7 @@ class Locus:
                 max(0, iv_on_transcript[0] - 14),
                 min(len(rgr.transcript), iv_on_transcript[1] + 20),
             )
-            gr = rgr.transcript.exons.map(iv_on_transcript)
+            gr = rgr.transcript.exons.map_to_global(iv_on_transcript)
             seqs = []
             if gr.strand == "+":
                 for iv in gr.intervals:
