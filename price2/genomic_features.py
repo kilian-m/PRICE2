@@ -12,10 +12,23 @@ intervals stored in **chromosome order**.
 
 from __future__ import annotations
 
+import enum
+
 import HTSeq
 from HTSeq import GenomicInterval
 
 from price2.genomic_region import GenomicRegion
+
+
+class RGRType(str, enum.Enum):
+    """Type of a :class:`ReadGeneratingRegion`.
+
+    Inherits from ``str`` so that comparisons with plain string
+    literals (e.g. ``rgr.type == "ORF"``) keep working.
+    """
+
+    ORF = "ORF"
+    NOISE = "NOISE"
 
 
 class Transcript:
@@ -214,8 +227,8 @@ class ReadGeneratingRegion:
 
     Attributes
     ----------
-    type : str
-        ``"ORF"`` or ``"NOISE"``.
+    type : RGRType
+        ``RGRType.ORF`` or ``RGRType.NOISE``.
     id : str
         Unique identifier for this RGR.
     transcript : Transcript
@@ -240,7 +253,7 @@ class ReadGeneratingRegion:
 
     def __init__(
         self,
-        type: str,
+        type: RGRType | str,
         transcript: Transcript,
         id: str,
         iv_on_transcript: tuple[int, int] | None = None,
@@ -254,8 +267,9 @@ class ReadGeneratingRegion:
 
         Parameters
         ----------
-        type : str
-            ``"ORF"`` or ``"NOISE"``.
+        type : RGRType | str
+            ``RGRType.ORF`` or ``RGRType.NOISE`` (plain strings are
+            also accepted for backward compatibility).
         transcript : Transcript
             The parent transcript.
         id : str
@@ -275,7 +289,7 @@ class ReadGeneratingRegion:
             raise ValueError(
                 "Either iv_on_transcript or genomic_region must be provided."
             )
-        self.type: str = type
+        self.type: RGRType = RGRType(type)
         self.read_count: int = 0
         self.id: str = id
         self.transcript: Transcript = transcript

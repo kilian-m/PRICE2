@@ -249,45 +249,6 @@ class RiboSeqAlignment:
             return False
         return True
 
-    # def dist_to_cds_start(self, transcript: Transcript) -> int | None:
-    #     """Return distance from the alignment to the CDS start in transcript coordinates.
-    #
-    #     Parameters
-    #     ----------
-    #     transcript : Transcript
-    #         Transcript whose CDS is used as the reference.
-    #
-    #     Returns
-    #     -------
-    #     int or None
-    #         0-based distance in spliced transcript coordinates, or
-    #         ``None`` if the alignment does not overlap the CDS.
-    #     """
-    #     interval = transcript.cds.induce(self.genomic_region)
-    #     if not interval:
-    #         return None
-    #     return interval[0]
-
-    # def dist_to_cds_end(self, transcript: Transcript) -> int | None:
-    #     """Return distance from the alignment to the CDS end in transcript coordinates.
-    #
-    #     Parameters
-    #     ----------
-    #     transcript : Transcript
-    #         Transcript whose CDS is used as the reference.
-    #
-    #     Returns
-    #     -------
-    #     int or None
-    #         Remaining CDS bases after the alignment in spliced
-    #         transcript coordinates, or ``None`` if the alignment does
-    #         not overlap the CDS.
-    #     """
-    #     interval = transcript.cds.induce(self.genomic_region)
-    #     if not interval:
-    #         return None
-    #     return transcript.cds.length - interval[1]
-
     def get_frames(
         self, reference_annotation: ReferenceAnnotation
     ) -> tuple[int, int, int] | None:
