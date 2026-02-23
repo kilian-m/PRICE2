@@ -83,9 +83,7 @@ class RiboSeqAlignment:
         elif isinstance(data, dict):
             self._init_from_dict(data)
         else:
-            raise TypeError(
-                f"Unsupported data type for RiboSeqAlignment: {type(data)}"
-            )
+            raise TypeError(f"Unsupported data type for RiboSeqAlignment: {type(data)}")
 
     def _init_from_dataframe(self, df: pd.DataFrame) -> None:
         """Initialise from a collapsed-alignment DataFrame."""
@@ -95,9 +93,7 @@ class RiboSeqAlignment:
         self.read_count = int(first["count"])
 
         intervals = [
-            HTSeq.GenomicInterval(
-                row["chrom"], row["start"], row["end"], row["strand"]
-            )
+            HTSeq.GenomicInterval(row["chrom"], row["start"], row["end"], row["strand"])
             for _, row in df.iterrows()
         ]
         self.genomic_region = GenomicRegion(intervals)
@@ -253,44 +249,44 @@ class RiboSeqAlignment:
             return False
         return True
 
-    def dist_to_cds_start(self, transcript: Transcript) -> int | None:
-        """Return distance from the alignment to the CDS start in transcript coordinates.
+    # def dist_to_cds_start(self, transcript: Transcript) -> int | None:
+    #     """Return distance from the alignment to the CDS start in transcript coordinates.
+    #
+    #     Parameters
+    #     ----------
+    #     transcript : Transcript
+    #         Transcript whose CDS is used as the reference.
+    #
+    #     Returns
+    #     -------
+    #     int or None
+    #         0-based distance in spliced transcript coordinates, or
+    #         ``None`` if the alignment does not overlap the CDS.
+    #     """
+    #     interval = transcript.cds.induce(self.genomic_region)
+    #     if not interval:
+    #         return None
+    #     return interval[0]
 
-        Parameters
-        ----------
-        transcript : Transcript
-            Transcript whose CDS is used as the reference.
-
-        Returns
-        -------
-        int or None
-            0-based distance in spliced transcript coordinates, or
-            ``None`` if the alignment does not overlap the CDS.
-        """
-        interval = transcript.cds.induce(self.genomic_region)
-        if not interval:
-            return None
-        return interval[0]
-
-    def dist_to_cds_end(self, transcript: Transcript) -> int | None:
-        """Return distance from the alignment to the CDS end in transcript coordinates.
-
-        Parameters
-        ----------
-        transcript : Transcript
-            Transcript whose CDS is used as the reference.
-
-        Returns
-        -------
-        int or None
-            Remaining CDS bases after the alignment in spliced
-            transcript coordinates, or ``None`` if the alignment does
-            not overlap the CDS.
-        """
-        interval = transcript.cds.induce(self.genomic_region)
-        if not interval:
-            return None
-        return transcript.cds.length - interval[1]
+    # def dist_to_cds_end(self, transcript: Transcript) -> int | None:
+    #     """Return distance from the alignment to the CDS end in transcript coordinates.
+    #
+    #     Parameters
+    #     ----------
+    #     transcript : Transcript
+    #         Transcript whose CDS is used as the reference.
+    #
+    #     Returns
+    #     -------
+    #     int or None
+    #         Remaining CDS bases after the alignment in spliced
+    #         transcript coordinates, or ``None`` if the alignment does
+    #         not overlap the CDS.
+    #     """
+    #     interval = transcript.cds.induce(self.genomic_region)
+    #     if not interval:
+    #         return None
+    #     return transcript.cds.length - interval[1]
 
     def get_frames(
         self, reference_annotation: ReferenceAnnotation
@@ -317,7 +313,11 @@ class RiboSeqAlignment:
             return None
         frames = [0, 0, 0]
         for transcript in transcript_candidates:
-            frame = transcript.cds.induce(self.genomic_region)[0] % 3
+            # frame = transcript.cds.induce(self.genomic_region)[0] % 3
+            iv_on_transcript = transcript.exons.map_to_local(self.genomic_region)
+            iv_on_cds = iv_on_transcript[0] - transcript.annotated_cds_iv[0]
+            frame = iv_on_cds % 3
+
             frames[frame] += 1
         return tuple(frames)
 

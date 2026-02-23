@@ -103,8 +103,12 @@ def _try_assign_p_site(
     transcript = None
     for tr in transcript_candidates:
         try:
-            iv_on_cds = tr.cds.induce(aln.genomic_region)
-        except ValueError:
+            iv_on_exons = tr.exons.map_to_local(aln.genomic_region)
+            iv_on_cds = (
+                iv_on_exons[0] - tr.annotated_cds_iv[0],
+                iv_on_exons[1] - tr.annotated_cds_iv[0],
+            )
+        except (ValueError, TypeError):
             continue
         cds_intervals.add(iv_on_cds)
         transcript = tr
@@ -253,7 +257,7 @@ class CoverageModel:
                 continue
 
             # Exclude reads whose matching range spans the CDS end.
-            if iv_on_cds[0] < len(transcript.cds) < iv_on_cds[1]:
+            if iv_on_cds[0] < transcript.coding_length < iv_on_cds[1]:
                 continue
 
             hist[p_site + _START_CODON_IDX] += 1
@@ -293,7 +297,7 @@ class CoverageModel:
                 continue
             transcript, iv_on_cds, p_site = result
 
-            dist_to_end = iv_on_cds[1] - len(transcript.cds)
+            dist_to_end = iv_on_cds[1] - transcript.coding_length
             lo, hi = _STOP_WINDOW
             if not (lo < dist_to_end < hi):
                 continue
@@ -302,7 +306,7 @@ class CoverageModel:
             if iv_on_cds[0] < 0 < iv_on_cds[1]:
                 continue
 
-            hist[p_site - len(transcript.cds) + _STOP_HIST_OFFSET] += 1
+            hist[p_site - transcript.coding_length + _STOP_HIST_OFFSET] += 1
 
         return hist
 

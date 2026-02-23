@@ -147,88 +147,90 @@ class GenomicRegion:
         self.intervals.append(interval)
         self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
-    def induce(self, other: GenomicRegion) -> tuple[int, int]:
-        """Express *other* as region-local coordinates within *self*.
 
-        *other* must be a sub-region of *self* (same exon structure
-        in the overlapping part).
+
+    def map_to_local(self, other: GenomicRegion) -> tuple[int, int] | None:
+        """Map *other* into the local spliced coordinate system of *self*.
+
+        Computes the ``(start, end)`` position of *other* within *self*'s
+        concatenated exon space (0-based, half-open).  Local position 0
+        corresponds to the first nucleotide of *self* in chromosome order,
+        which is the 3'-most nucleotide for negative-strand regions.
+
+        *other* must be fully contained in *self*: every interval of *other*
+        must lie within exactly one interval of *self*, with no gaps (skipped
+        self-intervals) between consecutive matches.
 
         Parameters
         ----------
         other : GenomicRegion
-            Region whose coordinates should be expressed
-            relative to *self*.
+            Region to project into local coordinates.  Must share the same
+            chromosome and strand as *self*.
 
         Returns
         -------
-        tuple[int, int]
-            ``(start, end)`` in spliced region-local coordinates
-            (0-based, half-open).
-
-        Raises
-        ------
-        ValueError
-            If *other* is on a different chromosome/strand or
-            is not compatible with *self*'s exon structure.
+        tuple[int, int] or None
+            ``(local_start, local_end)`` in *self*'s spliced coordinate space,
+            or ``None`` if *other* is ``None``, is on a different chromosome /
+            strand, extends outside *self*'s exons, or spans a junction not
+            present in *self*.
         """
+        if other is None:
+            return None
+
         if self.chrom != other.chrom or self.strand != other.strand:
-            raise ValueError("Query region is not compatible with reference " "region.")
-        ref_intervals = self.intervals
-        query_intervals = other.intervals
+            return None
 
-        if self.strand == "-":
-            exons_end = ref_intervals[0].end
-            ref_intervals = [
-                HTSeq.GenomicInterval(
-                    ri.chrom,
-                    exons_end - ri.end,
-                    exons_end - ri.start,
-                    ri.strand,
-                )
-                for ri in ref_intervals
-            ]
-            query_intervals = [
-                HTSeq.GenomicInterval(
-                    qi.chrom,
-                    exons_end - qi.end,
-                    exons_end - qi.start,
-                    qi.strand,
-                )
-                for qi in query_intervals
-            ]
+        j = 0
+        cum_len = 0  # cumulative spliced length of self-intervals before index j
+        prev_j = None
+        local_start = None
+        local_end = None
+        strand = self.strand
 
-        # overlapping part
-        s = max(ref_intervals[0].start, query_intervals[0].start)
-        e = min(ref_intervals[-1].end, query_intervals[-1].end)
-        cut_query = cut_intervals(query_intervals, s, e)
-        cut_ref = cut_intervals(ref_intervals, s, e)
-        if cut_query != cut_ref:
-            raise ValueError("Query region is not compatible with reference " "region.")
+        for other_iv in other.intervals:
+            a, b = other_iv.start, other_iv.end
 
-        # upstream part
-        upstream_query = cut_intervals(query_intervals, query_intervals[0].start, s)
-        if len(upstream_query) > 1:
-            raise ValueError("Query region is not compatible with reference " "region.")
+            if strand == "+":
+                # Advance j past self-intervals that end before (are entirely
+                # left of) the current other-interval.
+                while j < len(self.intervals) and self.intervals[j].end < a:
+                    cum_len += self.intervals[j].end - self.intervals[j].start
+                    j += 1
+            else:
+                # For negative strand (chromosome order): advance j past
+                # self-intervals whose start is at or beyond b (entirely right
+                # of the current other-interval).
+                while j < len(self.intervals) and self.intervals[j].start >= b:
+                    cum_len += self.intervals[j].end - self.intervals[j].start
+                    j += 1
 
-        # downstream part
-        downstream_query = cut_intervals(query_intervals, e, query_intervals[-1].end)
-        if len(downstream_query) > 1:
-            raise ValueError("Query region is not compatible with reference " "region.")
+            if j >= len(self.intervals):
+                return None
 
-        upstream_ref = cut_intervals(ref_intervals, ref_intervals[0].start, s)
+            x, y = self.intervals[j].start, self.intervals[j].end
 
-        if len(upstream_query) == 1:
-            start = query_intervals[0].start - ref_intervals[0].start
-        elif ref_intervals[-1].end <= query_intervals[0].start:
-            start = (
-                sum(x.end - x.start for x in ref_intervals)
-                + query_intervals[0].start
-                - ref_intervals[-1].end
-            )
-        else:
-            start = sum(x[1] - x[0] for x in upstream_ref)
-        end = start + sum(iv.end - iv.start for iv in query_intervals)
-        return (start, end)
+            # other-interval must be fully contained within this self-interval.
+            if not (x <= a and b <= y):
+                return None
+
+            # Contiguity check: no self-intervals were skipped between matches.
+            if prev_j is not None and j > prev_j + 1:
+                return None
+
+            if strand == "+":
+                offset_start = cum_len + (a - x)
+                offset_end = cum_len + (b - x)
+            else:
+                offset_start = cum_len + (y - b)
+                offset_end = cum_len + (y - a)
+
+            if local_start is None:
+                local_start = offset_start
+            local_end = offset_end
+            prev_j = j
+
+        return (local_start, local_end)
 
     def map(self, iv_in_region: tuple[int, int]) -> GenomicRegion:
         """Map region-local coordinates back to genomic coordinates.
@@ -413,34 +415,3 @@ class GenomicRegion:
 
         return self.map((new_start, new_end))
 
-
-def cut_intervals(
-    interval_list: list[GenomicInterval],
-    start: int,
-    end: int,
-) -> list[tuple[int, int]]:
-    """Clip a list of intervals to ``[start, end)``.
-
-    Parameters
-    ----------
-    interval_list : list[GenomicInterval]
-        Intervals to clip.
-    start : int
-        Inclusive lower bound.
-    end : int
-        Exclusive upper bound.
-
-    Returns
-    -------
-    list[tuple[int, int]]
-        Clipped ``(start, end)`` tuples for intervals that overlap
-        ``[start, end)``.
-    """
-    result: list[tuple[int, int]] = []
-    for iv in interval_list:
-        if iv.end <= start or end <= iv.start:
-            continue
-        clipped_start = max(iv.start, start)
-        clipped_end = min(iv.end, end)
-        result.append((clipped_start, clipped_end))
-    return result

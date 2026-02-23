@@ -640,10 +640,15 @@ class CleavageEstimator:
 
             # get frame
             for tr in transcript_candidates:
+                if tr.annotated_cds_iv is None:
+                    continue
                 try:
-                    iv_on_cds = tr.cds.induce(aln.genomic_region)
-                except ValueError:
-                    self.not_countable += 1
+                    iv_on_tr = tr.exons.map_to_local(aln.genomic_region)
+                    iv_on_cds = (
+                        iv_on_tr[0] - tr.annotated_cds_iv[0],
+                        iv_on_tr[1] - tr.annotated_cds_iv[0],
+                    )
+                except (ValueError, TypeError):
                     continue
 
                 if (
@@ -672,10 +677,19 @@ class CleavageEstimator:
 
             # get dist_to_start
             for tr in transcript_candidates:
+                if not tr.annotated_cds_iv:
+                    continue
                 try:
-                    new_dist_to_start = tr.cds.induce(aln.genomic_region)[0]
-                except ValueError:
-                    new_dist_to_start = None
+                    new_dist_to_exon_start = tr.exons.map_to_local(aln.genomic_region)[
+                        0
+                    ]
+                    new_dist_to_cds_start = (
+                        new_dist_to_exon_start - tr.annotated_cds_iv[0]
+                    )
+                except (ValueError, TypeError):
+                    new_dist_to_cds_start = None
+
+                new_dist_to_start = new_dist_to_cds_start
 
                 if isinstance(new_dist_to_start, int):
                     if dist_to_start is None:

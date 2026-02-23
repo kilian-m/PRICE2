@@ -119,11 +119,11 @@ class Transcript:
                 )
             self.five_prime_utr.add_interval(region.iv)
         elif region.type == "CDS":
-            if not hasattr(self, "cds"):
-                self.cds: GenomicRegion = GenomicRegion(
+            if not hasattr(self, "_cds"):
+                self._cds: GenomicRegion = GenomicRegion(
                     [], chrom=region.iv.chrom, strand=region.iv.strand
                 )
-            self.cds.add_interval(region.iv)
+            self._cds.add_interval(region.iv)
             self.coding_length += region.iv.length
         elif region.type == "three_prime_utr":
             if not hasattr(self, "three_prime_utr"):
@@ -140,7 +140,7 @@ class Transcript:
         has been added to this transcript.
         """
         try:
-            self.annotated_cds_iv = self.exons.induce(self.cds)
+            self.annotated_cds_iv = self.exons.map_to_local(self._cds)
         except AttributeError:
             self.annotated_cds_iv = None
 
@@ -155,9 +155,7 @@ class Transcript:
         self.orf_set.add(orf)
         self.rgr_set.add(orf)
 
-    def update_with_filtered_orfs(
-        self, rgr_set: set[ReadGeneratingRegion]
-    ) -> None:
+    def update_with_filtered_orfs(self, rgr_set: set[ReadGeneratingRegion]) -> None:
         """Restrict RGRs to the given set and rebuild interval indices.
 
         After filtering, HTSeq ``GenomicArrayOfSets`` interval indices
@@ -283,9 +281,7 @@ class ReadGeneratingRegion:
         self.transcript: Transcript = transcript
 
         if genomic_region is None:
-            self.genomic_region: GenomicRegion = transcript.exons.map(
-                iv_on_transcript
-            )
+            self.genomic_region: GenomicRegion = transcript.exons.map(iv_on_transcript)
             if self.type == "ORF":
                 self.full_genomic_region: GenomicRegion = transcript.exons.map(
                     (iv_on_transcript[0], iv_on_transcript[1] + 3)

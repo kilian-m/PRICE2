@@ -159,11 +159,10 @@ class Locus:
         noise_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
 
         for transcript in self.transcripts:
-            if (
-                hasattr(transcript, "cds")
-                and (cds_start := transcript.exons.induce(transcript.cds)[0]) > 5
+            if (transcript.annotated_cds_iv is not None) and (
+                (cds_start := transcript.annotated_cds_iv[0]) > 5
             ):
-                cds_start = transcript.exons.induce(transcript.cds)[0]
+                # cds_start = transcript.exons.map_to_local(transcript.cds)[0]
                 noise1 = ReadGeneratingRegion(
                     "NOISE",
                     transcript,
@@ -291,12 +290,9 @@ class Locus:
                 overlap_transcripts &= tr_set
 
         for tr in overlap_transcripts:
-            try:
-                rsa_iv_on_tr = tr.exons.induce(rsa.genomic_region)
-            except ValueError:
+            rsa_iv_on_tr = tr.exons.map_to_local(rsa.genomic_region)
+            if rsa_iv_on_tr is None:
                 continue
-            # rgr_frame_covpos.add((tr.noise, None, CoveragePosition.middle))
-            # for orf in tr.orf_set:
             for rgr in tr.rgr_set:
                 # full overlap with orf
                 if rgr.type == "NOISE":

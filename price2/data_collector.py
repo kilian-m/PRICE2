@@ -192,9 +192,7 @@ class DataCollector:
         for bam_file in os.listdir(self.bam_dir):
             if bam_file.endswith(".bam"):
                 bam_reader = HTSeq.BAM_Reader(os.path.join(self.bam_dir, bam_file))
-                self.chr_order = [
-                    x["SN"] for x in bam_reader.get_header_dict()["SQ"]
-                ]
+                self.chr_order = [x["SN"] for x in bam_reader.get_header_dict()["SQ"]]
                 return
 
     def make_loci(
@@ -415,7 +413,7 @@ def collect_mappings_run(
             transcripts = []
             for tr in transcript_candidates:
                 try:
-                    tr.exons.induce(rsa.genomic_region)
+                    tr.exons.map_to_local(rsa.genomic_region)
                     transcripts.append(tr)
                 except ValueError:
                     continue
