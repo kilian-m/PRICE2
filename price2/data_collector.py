@@ -404,7 +404,7 @@ def collect_mappings_run(
             transcript_sets = []
             rsa = RiboSeqAlignment(alignment)
 
-            for query_iv in rsa.genomic_region.intervals_correct:
+            for query_iv in rsa.genomic_region.intervals:
                 for subject_iv, transcript_set in locus.transcript_intervals[
                     query_iv
                 ].steps():
@@ -421,7 +421,7 @@ def collect_mappings_run(
             if transcripts:
                 transcripts_ids = frozenset(tr.id for tr in transcripts)
                 ivs_tuple = tuple(
-                    (iv.start, iv.end) for iv in rsa.genomic_region.intervals_correct
+                    (iv.start, iv.end) for iv in rsa.genomic_region.intervals
                 )
                 mapping = (rsa.untemplated_addition, rsa.unique(), ivs_tuple)
                 mappings_dict[mapping] += 1

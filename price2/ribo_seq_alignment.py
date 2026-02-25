@@ -114,8 +114,6 @@ class RiboSeqAlignment:
             )
 
         intervals = [op.ref_iv for op in sa.cigar if op.type == "M"]
-        if strand == "-":
-            intervals = intervals[::-1]
 
         self.genomic_region = GenomicRegion(intervals)
 
@@ -188,9 +186,9 @@ class RiboSeqAlignment:
             order).
         """
         if self.genomic_region.strand == "+":
-            return self.genomic_region.intervals_correct[0].start
+            return self.genomic_region.intervals[0].start
         else:
-            return self.genomic_region.intervals_correct[-1].end
+            return self.genomic_region.intervals[-1].end
 
     def get_last_pos_in_genomic_coords(self) -> int:
         """Return the highest genomic end coordinate of the alignment.
@@ -205,9 +203,9 @@ class RiboSeqAlignment:
             (chromosome order).
         """
         if self.genomic_region.strand == "+":
-            return self.genomic_region.intervals_correct[-1].end
+            return self.genomic_region.intervals[-1].end
         else:
-            return self.genomic_region.intervals_correct[0].start
+            return self.genomic_region.intervals[0].start
 
     def is_countable(
         self,

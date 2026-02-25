@@ -400,9 +400,9 @@ class ReadGeneratingRegion:
             attributes += f' mean_activity "{self.mean_activity}";'
         s = ""
         if strand == "+":
-            intervals = self.full_genomic_region.intervals_correct
+            intervals = self.full_genomic_region.intervals
         else:
-            intervals = self.full_genomic_region.intervals_correct[::-1]
+            intervals = self.full_genomic_region.intervals[::-1]
         for interval in intervals:
             s += (
                 f"{seq_id}\t{source}\texon\t"

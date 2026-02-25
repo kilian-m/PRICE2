@@ -246,7 +246,7 @@ class Locus:
             "auto", stranded=True, storage="step"
         )
         for rgr in self.rgr_set:
-            for iv in rgr.genomic_region.intervals_correct:
+            for iv in rgr.genomic_region.intervals:
                 self.rgr_intervals[iv] += rgr
 
         self.rgr_set_complete = self.rgr_set
@@ -285,7 +285,7 @@ class Locus:
 
         rgr_frame_covpos = set()
 
-        for query_iv in rsa.genomic_region.intervals_correct:
+        for query_iv in rsa.genomic_region.intervals:
             for subject_iv, tr_set in self.transcript_intervals[query_iv].steps():
                 overlap_transcripts &= tr_set
 
@@ -553,14 +553,6 @@ class Locus:
             )
             gr = rgr.transcript.exons.map_to_global(iv_on_transcript)
             seq = gr.get_sequence(genome).seq.upper()
-            # seqs = []
-            # if gr.strand == "+":
-            #    for iv in gr.intervals_correct:
-            #        seqs.append(genome[iv.chrom][iv.start : iv.end].seq.upper())
-            # else:
-            #    for iv in gr.intervals_correct[::-1]:
-            #        seqs.append((-genome[iv.chrom][iv.start : iv.end]).seq.upper())
-            # seq = "".join(seqs)
 
             lock = FileLock(path + ".lock")
             with lock:
@@ -737,9 +729,9 @@ class Locus:
             if rgr.type == "NOISE":
                 continue
             if rgr.genomic_region.strand == "+":
-                stop = rgr.genomic_region.intervals_correct[-1].end
+                stop = rgr.genomic_region.intervals[-1].end
             else:
-                stop = rgr.genomic_region.intervals_correct[0].start
+                stop = rgr.genomic_region.intervals[0].start
             try:
                 stop_groups[stop].append(rgr)
             except KeyError:

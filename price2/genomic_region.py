@@ -75,7 +75,7 @@ class GenomicRegion:
             ``"chr1+:100-200|300-400"``.
         """
         if df is not None:
-            self.intervals = [
+            intervals = [
                 HTSeq.GenomicInterval(
                     row["chrom"],
                     row["start"],
@@ -84,8 +84,8 @@ class GenomicRegion:
                 )
                 for _, row in df.iterrows()
             ]
-            self.chrom = self.intervals[0].chrom
-            self.strand = self.intervals[0].strand
+            self.chrom = intervals[0].chrom
+            self.strand = intervals[0].strand
         elif gi_string is not None:
             chrom_strand, intervals_str = gi_string.split(":")
             chrom = chrom_strand[:-1]
@@ -98,22 +98,20 @@ class GenomicRegion:
                 intervals = intervals[::-1]
             self.chrom = chrom
             self.strand = strand
-            self.intervals = intervals
         else:
             self.chrom = chrom if chrom else intervals[0].chrom
             self.strand = strand if strand else intervals[0].strand
-            self.intervals = intervals
-        self.intervals_correct = sorted(self.intervals, key=lambda iv: iv.start)
+        self.intervals = intervals
 
-        self.length = sum(iv.end - iv.start for iv in self.intervals_correct)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals_correct)))
+        self.length = sum(iv.end - iv.start for iv in self.intervals)
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, GenomicRegion):
             return False
         return (
             self.chrom == other.chrom
-            and self.intervals_correct == other.intervals_correct
+            and self.intervals == other.intervals
             and self.strand == other.strand
         )
 
@@ -122,9 +120,7 @@ class GenomicRegion:
         return self.hash
 
     def __str__(self) -> str:
-        intervals_str = "|".join(
-            f"{iv.start}-{iv.end}" for iv in self.intervals_correct
-        )
+        intervals_str = "|".join(f"{iv.start}-{iv.end}" for iv in self.intervals)
         return f"{self.chrom}{self.strand}:{intervals_str}"
 
     def __repr__(self) -> str:
@@ -132,7 +128,7 @@ class GenomicRegion:
 
     def __len__(self) -> int:
         if self.length == 0:
-            self.length = sum(iv.end - iv.start for iv in self.intervals_correct)
+            self.length = sum(iv.end - iv.start for iv in self.intervals)
         return self.length
 
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
@@ -147,13 +143,13 @@ class GenomicRegion:
         -----
         Calling this method invalidates any previously stored hash.
         """
-        self.intervals.append(interval)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals_correct)))
+        # self.intervals.append(interval)
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
         self.length += interval.end - interval.start
         if self.strand == "+":
-            self.intervals_correct.append(interval)
+            self.intervals.append(interval)
         else:
-            self.intervals_correct.insert(0, interval)
+            self.intervals.insert(0, interval)
 
     def map_to_local(self, other: GenomicRegion) -> tuple[int, int]:
         """Map *other* into the local spliced coordinate system of *self*.
@@ -191,8 +187,6 @@ class GenomicRegion:
 
         # self_ivs = sorted(self.intervals, key=lambda iv: iv.start)
         # other_ivs = sorted(other.intervals, key=lambda iv: iv.start)
-        self_ivs = self.intervals_correct
-        other_ivs = other.intervals_correct
 
         j = 0
         cum_len = 0  # cumulative spliced length of self-intervals before index j
@@ -200,21 +194,21 @@ class GenomicRegion:
         local_start = None
         local_end = None
 
-        for other_iv in other_ivs:
+        for other_iv in other.intervals:
             a, b = other_iv.start, other_iv.end
 
             # Advance j past self-intervals that end at or before the start
             # of the current other-interval (no overlap possible).
-            while j < len(self_ivs) and self_ivs[j].end <= a:
-                cum_len += self_ivs[j].end - self_ivs[j].start
+            while j < len(self.intervals) and self.intervals[j].end <= a:
+                cum_len += self.intervals[j].end - self.intervals[j].start
                 j += 1
 
-            if j >= len(self_ivs):
+            if j >= len(self.intervals):
                 raise ValueError(
                     "Other region extends beyond the bounds of this region."
                 )
 
-            x, y = self_ivs[j].start, self_ivs[j].end
+            x, y = self.intervals[j].start, self.intervals[j].end
 
             # other-interval must be fully contained within this self-interval.
             if not (x <= a and b <= y):
@@ -271,36 +265,27 @@ class GenomicRegion:
             raise ValueError(
                 f"Interval end {end} exceeds the reference length {len(self)}."
             )
+
+        # For negative strand, local position 0 is the 5' end (highest
+        # genomic coordinate).  Flip to chromosome-order offsets first.
+        if self.strand == "-":
+            start, end = self.length - end, self.length - start
+
         result_ivs: list[tuple[int, int]] = []
         cumulative = 0
 
-        if self.strand == "+":
-            for interval in self.intervals:
-                iv_len = interval.length
-                local_end = cumulative + iv_len
-                overlap_start = max(start, cumulative)
-                overlap_end = min(end, local_end)
-                if overlap_start < overlap_end:
-                    global_start = interval.start + (overlap_start - cumulative)
-                    global_end = interval.start + (overlap_end - cumulative)
-                    result_ivs.append((global_start, global_end))
-                cumulative += iv_len
-                if cumulative >= end:
-                    break
-
-        else:  # strand == "-"
-            for interval in self.intervals:
-                iv_len = interval.length
-                local_end = cumulative + iv_len
-                overlap_start = max(start, cumulative)
-                overlap_end = min(end, local_end)
-                if overlap_start < overlap_end:
-                    global_high = interval.end - (overlap_start - cumulative)
-                    global_low = interval.end - (overlap_end - cumulative)
-                    result_ivs.append((global_low, global_high))
-                cumulative += iv_len
-                if cumulative >= end:
-                    break
+        for interval in self.intervals:
+            iv_len = interval.length
+            local_end = cumulative + iv_len
+            overlap_start = max(start, cumulative)
+            overlap_end = min(end, local_end)
+            if overlap_start < overlap_end:
+                global_start = interval.start + (overlap_start - cumulative)
+                global_end = interval.start + (overlap_end - cumulative)
+                result_ivs.append((global_start, global_end))
+            cumulative += iv_len
+            if cumulative >= end:
+                break
 
         region_intervals = [
             HTSeq.GenomicInterval(self.chrom, rs, re, self.strand)
@@ -331,10 +316,10 @@ class GenomicRegion:
         """
         parts: list[str] = []
         if self.strand == "+":
-            for iv in self.intervals_correct:
+            for iv in self.intervals:
                 parts.append(str(genome[self.chrom][iv.start : iv.end]))
         elif self.strand == "-":
-            for iv in self.intervals_correct[::-1]:
+            for iv in self.intervals[::-1]:
                 parts.append(
                     str(genome[self.chrom][iv.start : iv.end].get_reverse_complement())
                 )
@@ -360,15 +345,15 @@ class GenomicRegion:
         """
         if self.strand != other.strand or self.chrom != other.chrom:
             return False
-        if len(self.intervals_correct) < len(other.intervals_correct):
+        if len(self.intervals) < len(other.intervals):
             return False
 
         if self.strand == "+":
-            s_ivs = self.intervals_correct[::-1]
-            o_ivs = other.intervals_correct[::-1]
+            s_ivs = self.intervals[::-1]
+            o_ivs = other.intervals[::-1]
         else:
-            s_ivs = self.intervals_correct
-            o_ivs = other.intervals_correct
+            s_ivs = self.intervals
+            o_ivs = other.intervals
 
         for i in range(len(o_ivs)):
             s_iv = s_ivs[i]

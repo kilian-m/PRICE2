@@ -91,7 +91,7 @@ class ReferenceAnnotation:
             Transcripts whose CDS intervals overlap any exon of *region*.
         """
         transcripts = set()
-        for interval in region.intervals_correct:
+        for interval in region.intervals:
             try:
                 for iv, value in self.cds_intervals[interval].steps():
                     transcripts |= value
@@ -113,7 +113,7 @@ class ReferenceAnnotation:
             Transcripts whose exon intervals overlap any exon of *region*.
         """
         transcripts = set()
-        for interval in region.intervals_correct:
+        for interval in region.intervals:
             for iv, value in self.transcript_intervals[interval].steps():
                 transcripts |= value
         return transcripts
