@@ -108,7 +108,7 @@ def _try_assign_p_site(
                 iv_on_exons[0] - tr.annotated_cds_iv[0],
                 iv_on_exons[1] - tr.annotated_cds_iv[0],
             )
-        except (ValueError, TypeError):
+        except ValueError:
             continue
         cds_intervals.add(iv_on_cds)
         transcript = tr

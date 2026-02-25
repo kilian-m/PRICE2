@@ -103,16 +103,17 @@ class GenomicRegion:
             self.chrom = chrom if chrom else intervals[0].chrom
             self.strand = strand if strand else intervals[0].strand
             self.intervals = intervals
+        self.intervals_correct = sorted(self.intervals, key=lambda iv: iv.start)
 
-        self.length = sum(iv.end - iv.start for iv in self.intervals)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
+        self.length = sum(iv.end - iv.start for iv in self.intervals_correct)
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals_correct)))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, GenomicRegion):
             return False
         return (
             self.chrom == other.chrom
-            and self.intervals == other.intervals
+            and self.intervals_correct == other.intervals_correct
             and self.strand == other.strand
         )
 
@@ -121,7 +122,9 @@ class GenomicRegion:
         return self.hash
 
     def __str__(self) -> str:
-        intervals_str = "|".join(f"{iv.start}-{iv.end}" for iv in self.intervals)
+        intervals_str = "|".join(
+            f"{iv.start}-{iv.end}" for iv in self.intervals_correct
+        )
         return f"{self.chrom}{self.strand}:{intervals_str}"
 
     def __repr__(self) -> str:
@@ -129,7 +132,7 @@ class GenomicRegion:
 
     def __len__(self) -> int:
         if self.length == 0:
-            self.length = sum(iv.end - iv.start for iv in self.intervals)
+            self.length = sum(iv.end - iv.start for iv in self.intervals_correct)
         return self.length
 
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
@@ -145,9 +148,14 @@ class GenomicRegion:
         Calling this method invalidates any previously stored hash.
         """
         self.intervals.append(interval)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals_correct)))
+        self.length += interval.end - interval.start
+        if self.strand == "+":
+            self.intervals_correct.append(interval)
+        else:
+            self.intervals_correct.insert(0, interval)
 
-    def map_to_local(self, other: GenomicRegion) -> tuple[int, int] | None:
+    def map_to_local(self, other: GenomicRegion) -> tuple[int, int]:
         """Map *other* into the local spliced coordinate system of *self*.
 
         Computes the ``(start, end)`` position of *other* within *self*'s
@@ -167,66 +175,71 @@ class GenomicRegion:
 
         Returns
         -------
-        tuple[int, int] or None
-            ``(local_start, local_end)`` in *self*'s spliced coordinate space,
-            or ``None`` if *other* is ``None``, is on a different chromosome /
-            strand, extends outside *self*'s exons, or spans a junction not
-            present in *self*.
+        tuple[int, int]
+            ``(local_start, local_end)`` in *self*'s spliced coordinate space.
+
+        Raises
+        ------
+        ValueError
+            If *other* is ``None`` or has a different chromosome or strand or is not fully contained in *self*.
         """
         if other is None:
-            return None
+            raise ValueError("Cannot map None region to local coordinates.")
 
         if self.chrom != other.chrom or self.strand != other.strand:
-            return None
+            raise ValueError("Cannot map region with different chromosome or strand.")
+
+        # self_ivs = sorted(self.intervals, key=lambda iv: iv.start)
+        # other_ivs = sorted(other.intervals, key=lambda iv: iv.start)
+        self_ivs = self.intervals_correct
+        other_ivs = other.intervals_correct
 
         j = 0
         cum_len = 0  # cumulative spliced length of self-intervals before index j
         prev_j = None
         local_start = None
         local_end = None
-        strand = self.strand
 
-        for other_iv in other.intervals:
+        for other_iv in other_ivs:
             a, b = other_iv.start, other_iv.end
 
-            if strand == "+":
-                # Advance j past self-intervals that end before (are entirely
-                # left of) the current other-interval.
-                while j < len(self.intervals) and self.intervals[j].end < a:
-                    cum_len += self.intervals[j].end - self.intervals[j].start
-                    j += 1
-            else:
-                # For negative strand (chromosome order): advance j past
-                # self-intervals whose start is at or beyond b (entirely right
-                # of the current other-interval).
-                while j < len(self.intervals) and self.intervals[j].start >= b:
-                    cum_len += self.intervals[j].end - self.intervals[j].start
-                    j += 1
+            # Advance j past self-intervals that end at or before the start
+            # of the current other-interval (no overlap possible).
+            while j < len(self_ivs) and self_ivs[j].end <= a:
+                cum_len += self_ivs[j].end - self_ivs[j].start
+                j += 1
 
-            if j >= len(self.intervals):
-                return None
+            if j >= len(self_ivs):
+                raise ValueError(
+                    "Other region extends beyond the bounds of this region."
+                )
 
-            x, y = self.intervals[j].start, self.intervals[j].end
+            x, y = self_ivs[j].start, self_ivs[j].end
 
             # other-interval must be fully contained within this self-interval.
             if not (x <= a and b <= y):
-                return None
+                raise ValueError(
+                    "Other region is not fully contained within this region."
+                )
 
             # Contiguity check: no self-intervals were skipped between matches.
             if prev_j is not None and j > prev_j + 1:
-                return None
+                raise ValueError(
+                    "Other region spans a junction not present in this region."
+                )
 
-            if strand == "+":
-                offset_start = cum_len + (a - x)
-                offset_end = cum_len + (b - x)
-            else:
-                offset_start = cum_len + (y - b)
-                offset_end = cum_len + (y - a)
+            offset_start = cum_len + (a - x)
+            offset_end = cum_len + (b - x)
 
             if local_start is None:
                 local_start = offset_start
             local_end = offset_end
             prev_j = j
+
+        # For negative strand, local position 0 is the 5' end (highest
+        # genomic coordinate), so flip the chromosome-order offsets.
+        if self.strand == "-":
+            local_start, local_end = self.length - local_end, self.length - local_start
 
         return (local_start, local_end)
 
@@ -318,10 +331,10 @@ class GenomicRegion:
         """
         parts: list[str] = []
         if self.strand == "+":
-            for iv in self.intervals:
+            for iv in self.intervals_correct:
                 parts.append(str(genome[self.chrom][iv.start : iv.end]))
         elif self.strand == "-":
-            for iv in self.intervals:
+            for iv in self.intervals_correct[::-1]:
                 parts.append(
                     str(genome[self.chrom][iv.start : iv.end].get_reverse_complement())
                 )
@@ -347,11 +360,15 @@ class GenomicRegion:
         """
         if self.strand != other.strand or self.chrom != other.chrom:
             return False
-        if len(self.intervals) < len(other.intervals):
+        if len(self.intervals_correct) < len(other.intervals_correct):
             return False
 
-        s_ivs = self.intervals[::-1]
-        o_ivs = other.intervals[::-1]
+        if self.strand == "+":
+            s_ivs = self.intervals_correct[::-1]
+            o_ivs = other.intervals_correct[::-1]
+        else:
+            s_ivs = self.intervals_correct
+            o_ivs = other.intervals_correct
 
         for i in range(len(o_ivs)):
             s_iv = s_ivs[i]
@@ -367,40 +384,3 @@ class GenomicRegion:
                 if s_iv.end != o_iv.end or s_iv.start > o_iv.start:
                     return False
         return True
-
-    def truncate(self, length: int, end: str) -> GenomicRegion:
-        """Remove nucleotides from the 5' or 3' end.
-
-        Parameters
-        ----------
-        length : int
-            Number of nucleotides to remove.
-        end : str
-            Which end to truncate: ``"5'"`` or ``"3'"``.
-
-        Returns
-        -------
-        GenomicRegion
-            Truncated region.
-
-        Raises
-        ------
-        ValueError
-            If *length* is non-positive, exceeds the region
-            length, or *end* is invalid.
-        """
-        if length <= 0:
-            raise ValueError("Length must be positive.")
-        if length >= self.length:
-            raise ValueError("Cannot truncate more than the total length.")
-
-        if end == "5'":
-            new_start = length
-            new_end = self.length
-        elif end == "3'":
-            new_start = 0
-            new_end = self.length - length
-        else:
-            raise ValueError('end must be "5\'" or "3\'".')
-
-        return self.map_to_global((new_start, new_end))

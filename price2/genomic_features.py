@@ -399,7 +399,11 @@ class ReadGeneratingRegion:
         if hasattr(self, "mean_activity"):
             attributes += f' mean_activity "{self.mean_activity}";'
         s = ""
-        for interval in self.full_genomic_region.intervals:
+        if strand == "+":
+            intervals = self.full_genomic_region.intervals_correct
+        else:
+            intervals = self.full_genomic_region.intervals_correct[::-1]
+        for interval in intervals:
             s += (
                 f"{seq_id}\t{source}\texon\t"
                 f"{interval.start + 1}\t{interval.end}\t"

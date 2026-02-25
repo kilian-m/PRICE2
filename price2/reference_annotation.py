@@ -25,6 +25,7 @@ class ReferenceAnnotation:
         Interval index mapping genomic positions to transcripts whose exons
         overlap those positions.
     """
+
     cds_intervals: HTSeq.GenomicArrayOfSets
     transcripts: dict[str, Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
@@ -90,7 +91,7 @@ class ReferenceAnnotation:
             Transcripts whose CDS intervals overlap any exon of *region*.
         """
         transcripts = set()
-        for interval in region.intervals:
+        for interval in region.intervals_correct:
             try:
                 for iv, value in self.cds_intervals[interval].steps():
                     transcripts |= value
@@ -112,7 +113,7 @@ class ReferenceAnnotation:
             Transcripts whose exon intervals overlap any exon of *region*.
         """
         transcripts = set()
-        for interval in region.intervals:
+        for interval in region.intervals_correct:
             for iv, value in self.transcript_intervals[interval].steps():
                 transcripts |= value
         return transcripts

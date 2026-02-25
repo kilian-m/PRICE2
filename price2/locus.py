@@ -246,7 +246,7 @@ class Locus:
             "auto", stranded=True, storage="step"
         )
         for rgr in self.rgr_set:
-            for iv in rgr.genomic_region.intervals:
+            for iv in rgr.genomic_region.intervals_correct:
                 self.rgr_intervals[iv] += rgr
 
         self.rgr_set_complete = self.rgr_set
@@ -285,13 +285,14 @@ class Locus:
 
         rgr_frame_covpos = set()
 
-        for query_iv in rsa.genomic_region.intervals:
+        for query_iv in rsa.genomic_region.intervals_correct:
             for subject_iv, tr_set in self.transcript_intervals[query_iv].steps():
                 overlap_transcripts &= tr_set
 
         for tr in overlap_transcripts:
-            rsa_iv_on_tr = tr.exons.map_to_local(rsa.genomic_region)
-            if rsa_iv_on_tr is None:
+            try:
+                rsa_iv_on_tr = tr.exons.map_to_local(rsa.genomic_region)
+            except ValueError:
                 continue
             for rgr in tr.rgr_set:
                 # full overlap with orf
@@ -551,14 +552,15 @@ class Locus:
                 min(len(rgr.transcript), iv_on_transcript[1] + 20),
             )
             gr = rgr.transcript.exons.map_to_global(iv_on_transcript)
-            seqs = []
-            if gr.strand == "+":
-                for iv in gr.intervals:
-                    seqs.append(genome[iv.chrom][iv.start : iv.end].seq.upper())
-            else:
-                for iv in gr.intervals:
-                    seqs.append((-genome[iv.chrom][iv.start : iv.end]).seq.upper())
-            seq = "".join(seqs)
+            seq = gr.get_sequence(genome).seq.upper()
+            # seqs = []
+            # if gr.strand == "+":
+            #    for iv in gr.intervals_correct:
+            #        seqs.append(genome[iv.chrom][iv.start : iv.end].seq.upper())
+            # else:
+            #    for iv in gr.intervals_correct[::-1]:
+            #        seqs.append((-genome[iv.chrom][iv.start : iv.end]).seq.upper())
+            # seq = "".join(seqs)
 
             lock = FileLock(path + ".lock")
             with lock:
@@ -735,9 +737,9 @@ class Locus:
             if rgr.type == "NOISE":
                 continue
             if rgr.genomic_region.strand == "+":
-                stop = rgr.genomic_region.intervals[-1].end
+                stop = rgr.genomic_region.intervals_correct[-1].end
             else:
-                stop = rgr.genomic_region.intervals[-1].start
+                stop = rgr.genomic_region.intervals_correct[0].start
             try:
                 stop_groups[stop].append(rgr)
             except KeyError:

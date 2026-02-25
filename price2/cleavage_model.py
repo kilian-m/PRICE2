@@ -648,7 +648,7 @@ class CleavageEstimator:
                         iv_on_tr[0] - tr.annotated_cds_iv[0],
                         iv_on_tr[1] - tr.annotated_cds_iv[0],
                     )
-                except (ValueError, TypeError):
+                except ValueError:
                     continue
 
                 if (
@@ -686,7 +686,7 @@ class CleavageEstimator:
                     new_dist_to_cds_start = (
                         new_dist_to_exon_start - tr.annotated_cds_iv[0]
                     )
-                except (ValueError, TypeError):
+                except ValueError:
                     new_dist_to_cds_start = None
 
                 new_dist_to_start = new_dist_to_cds_start
