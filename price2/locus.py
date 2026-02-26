@@ -14,6 +14,7 @@ provided.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3 as sql
 import time
 import warnings
@@ -39,6 +40,108 @@ from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 
 warnings.simplefilter("ignore", category=NumbaTypeSafetyWarning)
+
+# Priority-ordered levels for ORF type assignment.  Within each level,
+# having more than one matching label across compatible transcripts yields
+# "other ORF"; the first level with exactly one match wins.
+ORF_TYPES_LEVELS: list[set[str]] = [
+    {"cORF"},
+    {"N terminal extended cORF", "N terminal truncated cORF"},
+    {
+        "+1 uoORF",
+        "+2 uoORF",
+        "+1 doORF",
+        "+2 doORF",
+        "+1 iORF",
+        "+2 iORF",
+    },
+    {"uORF", "dORF"},
+    {"pcRNA-ORF", "lincRNA-ORF", "varRNA-ORF"},
+]
+
+
+def get_orf_type(
+    orf: ReadGeneratingRegion,
+    transcripts: set[Transcript],
+) -> str:
+    """Classify an ORF relative to the annotated CDSs of compatible transcripts.
+
+    For each transcript in *transcripts* that contains the ORF's genomic
+    footprint, the relationship between the ORF interval and the annotated
+    CDS (in spliced transcript coordinates) is determined.  When an ORF is
+    compatible with multiple transcripts the assignments are reconciled
+    using :data:`ORF_TYPES_LEVELS`: the highest-priority level that has
+    exactly one matching label is used; conflicting labels at the same
+    level yield ``"other ORF"``.
+
+    Parameters
+    ----------
+    orf : ReadGeneratingRegion
+        An ORF-type RGR whose type should be classified.
+    transcripts : set[Transcript]
+        All transcripts belonging to the locus.
+
+    Returns
+    -------
+    str
+        ORF type label, e.g. ``'cORF'``, ``'uORF'``, ``'+0 iORF'``, or
+        ``'other ORF'``.
+    """
+    assignments: dict[Transcript, str] = {}
+
+    for tr in transcripts:
+        try:
+            orf_interval = tr.exons.map_to_local(orf.genomic_region)
+        except ValueError:
+            continue
+
+        if tr.annotated_cds_iv is not None:
+            cds_interval = tr.annotated_cds_iv
+            orf_start, orf_end = orf_interval
+            cds_start, cds_end = cds_interval
+
+            if orf_interval == cds_interval:
+                label = "cORF"
+            elif orf_end == cds_end and orf_start < cds_start:
+                label = "N terminal extended cORF"
+            elif orf_end == cds_end and orf_start > cds_start:
+                label = "N terminal truncated cORF"
+            elif orf_end <= cds_start:
+                label = "uORF"
+            elif orf_start >= cds_end:
+                label = "dORF"
+            else:
+                frame = (orf_start - cds_start) % 3
+                if orf_start < cds_start < orf_end < cds_end:
+                    label = f"+{frame} uoORF"
+                elif cds_start < orf_start < cds_end < orf_end:
+                    label = f"+{frame} doORF"
+                elif cds_start < orf_start and orf_end < cds_end:
+                    label = f"+{frame} iORF"
+                else:
+                    label = "other ORF"
+
+        elif tr.biotype == "protein_coding":
+            label = "pcRNA-ORF"
+        elif tr.biotype == "lincRNA":
+            label = "lincRNA-ORF"
+        else:
+            label = "varRNA-ORF"
+
+        assignments[tr] = label
+
+    if not assignments:
+        return "other ORF"
+
+    label_set = set(assignments.values())
+    for level in ORF_TYPES_LEVELS:
+        matches = label_set & level
+        if len(matches) > 1:
+            return "other ORF"
+        if len(matches) == 1:
+            return matches.pop()
+
+    return "other ORF"
 
 
 class Locus:
@@ -239,6 +342,7 @@ class Locus:
             noise.transcript.rgr_set.add(noise)
         self.rgr_set |= set(noise_dict.values())
         for orf in orf_dict.values():
+            orf.orf_type = get_orf_type(orf, self.transcripts)
             orf.transcript.add_orf(orf)
         self.rgr_set |= set(orf_dict.values())
 
@@ -508,20 +612,60 @@ class Locus:
                         if rgr.type == "ORF":
                             f.write(rgr.to_gtf(self.id))
 
-    def to_tsv(self, prefix: str) -> None:
-        """Append ORF results to a TSV file.
+    def to_tsv(
+        self,
+        prefix: str,
+        runs: list | None = None,
+        include_noise: bool = False,
+    ) -> None:
+        """Append region results to a TSV file.
+
+        When *runs* is provided the output includes a header row
+        (written only once) and per-run activity columns taken from
+        :attr:`result_df`.  Without *runs* only the four annotation
+        columns are written (used for intermediate/verbose output).
+
+        The file is named ``<prefix>_regions.tsv`` when *include_noise*
+        is ``True``, otherwise ``<prefix>_orfs.tsv``.
 
         Parameters
         ----------
         prefix : str
-            Path prefix; the file is named ``<prefix>_orfs.tsv``.
+            Path prefix for the output file.
+        runs : list[RiboSeqRun] | None
+            Ribo-seq runs whose IDs become the activity columns.
+        include_noise : bool
+            When ``True`` NOISE regions are written alongside ORFs.
         """
-        path = f"{prefix}_orfs.tsv"
+        suffix = "regions" if include_noise else "orfs"
+        id_col = "region_id" if include_noise else "orf_id"
+        path = f"{prefix}_{suffix}.tsv"
         lock = FileLock(path + ".lock")
         with lock:
+            # Write header once when activity columns are requested.
+            if runs is not None and not os.path.exists(path):
+                run_ids = [run.id for run in runs]
+                with open(path, "w") as f:
+                    f.write(
+                        f"{id_col}\tgene_id\ttranscript_id\tlocus_id"
+                        f"\tgenomic_region\torf_type\t" + "\t".join(run_ids) + "\n"
+                    )
+
             with open(path, "a") as f:
                 for rgr in self.rgr_set:
-                    if rgr.type == "ORF":
+                    if not include_noise and rgr.type != "ORF":
+                        continue
+                    if runs is not None and hasattr(self, "result_df"):
+                        activities = self.result_df.loc[rgr.id]
+                        activity_str = "\t".join(f"{v:.2e}" for v in activities)
+                        orf_type_str = rgr.orf_type if rgr.orf_type is not None else ""
+                        f.write(
+                            f"{rgr.id}\t{rgr.transcript.gene_id}"
+                            f"\t{rgr.transcript.id}"
+                            f"\t{self.id}\t{rgr.full_genomic_region}"
+                            f"\t{orf_type_str}\t{activity_str}\n"
+                        )
+                    else:
                         f.write(rgr.to_tsv_line(self.id))
 
     def to_fasta(

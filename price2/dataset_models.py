@@ -121,7 +121,7 @@ def _write_cleavage_pdf(
 
             # --- Panel 1: cleavage distributions ---
             run.cleavage_model.plot(ax=axes[0])
-            axes[0].set_title("cleavage distributions")
+            axes[0].set_title("Cleavage distributions")
 
             # --- Panel 2: P-site distribution around CDS start ---
             dist_starts = getattr(run, "cleavage_dist_starts", None)
@@ -133,18 +133,14 @@ def _write_cleavage_pdf(
                 axes[1].set_title("P-site around CDS start")
                 axes[1].set_xlim(-50, 50)
 
-                # Mark the most likely P-site distance.
-                # pl[i] = prob of left cleavage i positions upstream of
-                # P-site, so argmax(pl) is the most likely read-start-to-
-                # P-site distance.  A read with P-site at position 0
-                # (start codon) has its 5' end at -argmax(pl).
                 pl = run.cleavage_model.pl
                 p_site_offset = int(np.argmax(pl))
-                axes[1].axvline(
+                axes[1].bar(
                     -p_site_offset,
-                    color="red",
-                    linestyle="--",
-                    label=f"P-site distance = {p_site_offset}",
+                    dist_starts[-p_site_offset + 100],
+                    width=1,
+                    color="tab:red",
+                    label="P-site at CDS start",
                 )
                 axes[1].legend()
             else:
@@ -256,16 +252,14 @@ def _write_coverage_pdf(
             fig, (ax_start, ax_stop) = plt.subplots(1, 2, figsize=(14, 5))
 
             # --- Start-codon histogram ---
-            # x-axis: CDS position (relative to start codon)
             x_start = np.arange(_HIST_SIZE) - _START_CODON_IDX
-            colors_start = np.where(x_start == 0, "red", "steelblue")
+            colors_start = np.where(x_start == 0, "tab:red", "steelblue")
             ax_start.bar(
                 x_start,
                 start_hist,
                 width=1,
                 color=colors_start,
             )
-            # Invisible artist for the legend entry
             ax_start.set_xlabel("CDS position relative to start codon")
             ax_start.set_ylabel("P-site read count")
             ax_start.set_title(f"{run.id} – CDS start")
@@ -284,16 +278,14 @@ def _write_coverage_pdf(
             )
 
             # --- Stop-codon histogram ---
-            # x-axis: CDS position relative to CDS end
             x_stop = np.arange(_HIST_SIZE) - _STOP_HIST_OFFSET
-            colors_stop = np.where(x_stop == -3, "red", "steelblue")
+            colors_stop = np.where(x_stop == -3, "tab:red", "steelblue")
             ax_stop.bar(
                 x_stop,
                 stop_hist,
                 width=1,
                 color=colors_stop,
             )
-            # Invisible artist for the legend entry
             ax_stop.set_xlabel("CDS position relative to CDS end")
             ax_stop.set_ylabel("P-site read count")
             ax_stop.set_title(f"{run.id} – CDS stop")
@@ -301,11 +293,11 @@ def _write_coverage_pdf(
 
             # Annotate the stop factor
             ax_stop.text(
-                0.95,
+                0.3,
                 0.95,
                 f"stop factor = {cov.stop_factor:.2f}",
                 transform=ax_stop.transAxes,
-                ha="left",
+                ha="right",
                 va="top",
                 fontsize=10,
                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),

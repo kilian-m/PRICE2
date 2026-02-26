@@ -94,14 +94,18 @@ class GenomicRegion:
                 HTSeq.GenomicInterval(chrom, int(start), int(end), strand)
                 for start, end in (x.split("-") for x in intervals_str.split("|"))
             ]
-            if strand == "-":
-                intervals = intervals[::-1]
             self.chrom = chrom
             self.strand = strand
         else:
             self.chrom = chrom if chrom else intervals[0].chrom
             self.strand = strand if strand else intervals[0].strand
         self.intervals = intervals
+
+        for i in range(1, len(self.intervals)):
+            if self.intervals[i - 1].end > self.intervals[i].start:
+                raise ValueError(
+                    "Intervals must be non-overlapping and in chromosome order."
+                )
 
         self.length = sum(iv.end - iv.start for iv in self.intervals)
         self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))

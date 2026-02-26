@@ -339,7 +339,6 @@ class CleavageModel:
             0.05,
             fill=True,
             facecolor="tab:red",
-            label=f"UTA prob = {self.pu:.3f}",
         )
         border = Rectangle(
             (-5, 0.9),
@@ -351,8 +350,17 @@ class CleavageModel:
         )
         ax.add_patch(fill)
         ax.add_patch(border)
-        ax.legend(loc="upper right")
-        ax.set_xlabel("position relative to p-site")
+        ax.text(
+            0.6,
+            0.85,
+            f"UTA prob = {self.pu:.3f}",
+            transform=ax.transAxes,
+            ha="center",
+            va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+        ax.set_xlabel("position relative to P-site")
         ax.set_ylabel("cleavage probability")
 
     @lru_cache(maxsize=None)

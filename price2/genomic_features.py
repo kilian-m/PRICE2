@@ -249,6 +249,9 @@ class ReadGeneratingRegion:
         Distance in nt from the RGR end to the transcript 3' end.
     read_count : int
         Observed read count (populated externally).
+    orf_type : str | None
+        ORF type classification (e.g. ``'cORF'``, ``'uORF'``), or
+        ``None`` for NOISE regions or before classification.
     """
 
     def __init__(
@@ -293,6 +296,7 @@ class ReadGeneratingRegion:
         self.read_count: int = 0
         self.id: str = id
         self.transcript: Transcript = transcript
+        self.orf_type: str | None = None
 
         if genomic_region is None:
             self.genomic_region: GenomicRegion = transcript.exons.map_to_global(
@@ -392,6 +396,8 @@ class ReadGeneratingRegion:
             f'transcript_id "{self.id}"; '
             f'loc_id "{loc_id}";'
         )
+        if self.orf_type is not None:
+            attributes += f' orf_type "{self.orf_type}";'
         if hasattr(self, "log_p_value"):
             attributes += f' log_p_value "{self.log_p_value}";'
         if hasattr(self, "mean_rpkm"):
@@ -432,7 +438,8 @@ class ReadGeneratingRegion:
         str
             Tab-separated line terminated by ``\\n``.
         """
+        orf_type_str = self.orf_type if self.orf_type is not None else ""
         return (
             f"{self.id}\t{self.transcript.gene_id}\t{loc_id}\t"
-            f"{self.genomic_region}\n"
+            f"{self.full_genomic_region}\t{orf_type_str}\n"
         )

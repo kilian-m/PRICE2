@@ -21,6 +21,7 @@ from price2.data_collector import DataCollector
 from price2.dataset_models import save_dataset_models
 from price2.orf_activity_estimator import ORFActivityEstimator
 from price2.reference_annotation import ReferenceAnnotation
+from price2.tpm import generate_tpm_output
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +180,13 @@ def run_pipeline(config: Config) -> None:
     )
 
     _timed("", orf_activity_estimator.run_orf_deconvolution)
+
+    # --- TPM output ---
+    _timed(
+        "generate TPM output... ",
+        generate_tpm_output,
+        config.o_dir,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

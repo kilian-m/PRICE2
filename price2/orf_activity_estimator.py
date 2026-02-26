@@ -72,8 +72,8 @@ class ORFActivityEstimator:
         run can be resumed after a crash.
 
         Results are written incrementally to
-        ``<o_dir>/results.tsv``.  Failed loci are logged to
-        ``<o_dir>/failed_loci.txt``.
+        ``<o_dir>/regions_activities/results.tsv``.  Failed loci are
+        logged to ``<o_dir>/regions_activities/failed_loci.txt``.
 
         When ``config.save_memory`` is ``False`` the in-memory
         attributes ``self.loci`` and ``self.performance_df`` are
@@ -90,15 +90,12 @@ class ORFActivityEstimator:
         run_ids = [id for id, in cur.fetchall()]
         db.close()
 
-        if not os.path.exists(f"{self.config.o_dir}/results.tsv"):
-            lock = FileLock(f"{self.config.o_dir}/results.tsv.lock")
-            with lock:
-                with open(f"{self.config.o_dir}/results.tsv", "a") as f:
-                    f.write("orf_id\t")
-                    f.write("\t".join(run_ids))
-                    f.write("\n")
+        ra_dir = os.path.join(self.config.o_dir, "regions_activities")
+        os.makedirs(ra_dir, exist_ok=True)
 
-        if os.path.exists(f"{self.config.o_dir}/performance_measurements.tsv"):
+        if os.path.exists(
+            f"{self.config.o_dir}/performance_measurements.tsv"
+        ):
             processed_loc_ids = set(
                 pd.read_csv(
                     f"{self.config.o_dir}/performance_measurements.tsv",
@@ -145,9 +142,9 @@ class ORFActivityEstimator:
                 except (TimeoutError, Exception) as e:
 
                     stack = traceback.format_exc()
-                    lock = FileLock(f"{self.config.o_dir}/failed_loci.txt.lock")
+                    lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
                     with lock:
-                        with open(f"{self.config.o_dir}/failed_loci.txt", "a") as f:
+                        with open(f"{ra_dir}/failed_loci.txt", "a") as f:
                             f.write(f"{loci_ids[i]}\n{str(e)}\n{stack}\n\n")
                     if not self.config.save_memory:
                         results.append(e)
@@ -166,7 +163,7 @@ class ORFActivityEstimator:
 
             self.performance_df = pd.DataFrame(performance_measurements).T
 
-        lock_files = glob.glob(os.path.join(self.config.o_dir, "*.lock"))
+        lock_files = glob.glob(os.path.join(ra_dir, "*.lock"))
         for lock_file in lock_files:
             os.remove(lock_file)
 
@@ -203,7 +200,7 @@ def process_loc(arguments: tuple):
     t1 = time.time()
 
     if not hasattr(config, "base_o_dir"):
-        config.base_o_dir = config.o_dir
+        config.base_o_dir = os.path.join(config.o_dir, "regions_activities")
 
     # --- Load locus and runs from database ---
     db_path = f"{config.w_dir}/price.db"
@@ -343,17 +340,11 @@ def process_loc(arguments: tuple):
     performance_measurements["exon_length"] = loc.exon_length
 
     if not loc.result_df.empty:
-        lock = FileLock(f"{config.base_o_dir}/results.tsv.lock")
-        with lock:
-            with open(f"{config.base_o_dir}/results.tsv", "a") as f:
-                f.write(
-                    loc.result_df.to_csv(
-                        header=False,
-                        index=True,
-                        float_format="{:.2e}".format,
-                        sep="\t",
-                    )
-                )
+        loc.to_tsv(
+            f"{config.base_o_dir}/final",
+            runs=runs,
+            include_noise=True,
+        )
     loc.to_gtf(
         f"{config.base_o_dir}/final",
         write_orfs=True,
@@ -361,15 +352,15 @@ def process_loc(arguments: tuple):
         write_transcripts=True,
     )
 
-    loc.to_tsv(f"{config.base_o_dir}/final")
+    loc.to_tsv(f"{config.base_o_dir}/final", runs=runs)
 
-    if not os.path.exists(f"{config.base_o_dir}/performance_measurements.tsv"):
+    if not os.path.exists(f"{config.o_dir}/performance_measurements.tsv"):
         header = True
     else:
         header = False
-    lock = FileLock(f"{config.base_o_dir}/performance_measurements.tsv.lock")
+    lock = FileLock(f"{config.o_dir}/performance_measurements.tsv.lock")
     with lock:
-        with open(f"{config.base_o_dir}/performance_measurements.tsv", "a") as f:
+        with open(f"{config.o_dir}/performance_measurements.tsv", "a") as f:
             f.write(
                 pd.DataFrame([performance_measurements]).to_csv(
                     header=header,
