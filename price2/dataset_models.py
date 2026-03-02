@@ -140,9 +140,17 @@ def _write_cleavage_pdf(
                     dist_starts[-p_site_offset + 100],
                     width=1,
                     color="tab:red",
-                    label="P-site at CDS start",
                 )
-                axes[1].legend()
+                axes[1].text(
+                    0.58,
+                    0.95,
+                    f"most frequent distance of\nread start to CDS start = {p_site_offset}",
+                    transform=axes[1].transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=10,
+                    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+                )
             else:
                 axes[1].set_visible(False)
 

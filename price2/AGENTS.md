@@ -16,27 +16,6 @@
 - if code in unclear to you ask me what it is supposed to do
 - **IMPORTANT:** I have not focused on testing the code before. This process needs human supervision. For now do not apply this strategy. Ignore testing.
 
-## Current Development Priorities
-
-1. **Code cleanup:** The codebase needs cleaning up — add docstrings, type hints, tests and improve structure.
-    list of files to clean up
-    - cleavage_model.py ✔
-    - coverage_model.py ✔
-    - price.py ✔
-    - config.py ✔
-    - reference_annotation.py ✔
-    - genomic_region.py ✔
-    - genomic_features.py ✔
-    - ribo_seq_alignment.py ✔
-    - ribo_seq_run.py ✔
-    - equivalence_groups.py ✔
-    - orf_activity_estimator.py ✔
-    - data_collector.py ✔
-    - locus.py ✔
-
-2. **Deconvolution algorithm:** Improve the core ORF deconvolution algorithm.
-3. **New features:** Add new functionality after the algorithm is solid.
-4. **Performance:** Optimize after features are stable.
 
 ## Module Structure
 
@@ -66,14 +45,14 @@ price2/
 ```yaml
 # Managed via conda (price2.yml)
 - htseq          # Genomic interval operations, BAM/GTF I/O
-- numba          # JIT compilation for numerical hotspots
 - numpy          # Numerical operations
-- scipy          # Optimization (L-BFGS-B), statistical tests (chi2)
+- scipy          # Optimization (L-BFGS-B), sparse matrices (csr_matrix), statistical tests (chi2)
 - pandas         # Data structuring and output
 - pebble         # Process pool with per-task timeouts
 - filelock       # File-based locking for SQLite access
 - tqdm           # Progress bars
 - psutil         # Memory monitoring
+- numba
 ```
 
 Prefer widely used packages (numpy, pandas, scipy, scikit-learn). Avoid obscure packages from GitHub.
@@ -131,8 +110,8 @@ def estimate_activities(
 ```
 
 ### Performance-Sensitive Code
-- Use **numba JIT** only when explicitly needed for numerical bottlenecks
-- Prefer pure numpy/scipy vectorized operations for most code
+- The deconvolution core (`locus.py`) uses **`scipy.sparse` CSR matrices** and BLAS-backed `X.T @ r` operations — do not reintroduce Numba here
+- Prefer pure numpy/scipy vectorized operations for all numerical code
 - Current parallelism uses pebble ProcessPool with forkserver start method; any approach that works is acceptable
 
 ### Error Handling
@@ -176,7 +155,7 @@ All parameters are managed via a `Config` dataclass loaded from a JSON file. Key
 2. **Strand handling:** Negative-strand regions are in chromosome order, not translation order. Be careful when computing reading frames.
 3. **Numerical stability:** The optimization uses pseudo-minimum values (`pseudo_min = 1e-14`) to avoid log(0). Respect this in any numerical code.
 4. **Memory:** Whole-genome processing can be memory-intensive. The project uses SQLite for intermediate storage and per-worker memory limits.
-5. **Multiprocessing start method:** The project uses `forkserver` — do not switch to `fork` as it causes issues with numba and SQLite.
+5. **Multiprocessing start method:** The project uses `forkserver` — do not switch to `fork` as it causes issues with SQLite.
 6. **SQLite concurrency:** File locks (`filelock`) are used for safe concurrent SQLite access.
 
 ## Testing

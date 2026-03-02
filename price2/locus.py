@@ -6,9 +6,8 @@ penalised maximum-likelihood estimation, and applies filtering steps
 (coverage, deconvolution, likelihood-ratio) to identify actively
 translated regions.
 
-Standalone helper functions for ORF detection, Numba-accelerated
-objective functions, and the optimisation :class:`Callback` are also
-provided.
+Standalone helper functions for ORF detection and the optimisation
+:class:`Callback` are also provided.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import math
 import os
 import sqlite3 as sql
 import time
-import warnings
 import zlib
 from collections import defaultdict
 from pickle import loads
@@ -26,10 +24,8 @@ import HTSeq
 import numpy as np
 import pandas as pd
 from filelock import FileLock
-from numba import jit
-from numba.core.errors import NumbaTypeSafetyWarning
-from numba.typed import List
 from scipy.optimize import minimize
+from scipy.sparse import csr_matrix
 from scipy.stats import chi2
 
 from price2.config import Config
@@ -38,8 +34,6 @@ from price2.equivalence_groups import EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
-
-warnings.simplefilter("ignore", category=NumbaTypeSafetyWarning)
 
 # Priority-ordered levels for ORF type assignment.  Within each level,
 # having more than one matching label across compatible transcripts yields
@@ -982,19 +976,32 @@ class Locus:
             initial_guess = np.full(len(egs), 0.1)
 
             eg_lengths = np.array([egs[eg][0] for eg in egs])
-            eg_read_counts = np.array([egs[eg][1] for eg in egs])
-            eg_rgr_ids = List(
-                [np.array([rgr_indices[rgr] for rgr in eg]) for eg in egs]
+            eg_read_counts = np.array([egs[eg][1] for eg in egs], dtype=np.float64)
+
+            # Build sparse design matrix: X[row, rgr_idx] = eg_length for each RGR in that EG
+            n_rgrs_filter = len(sorted_rgrs)
+            rows_f: list[int] = []
+            cols_f: list[int] = []
+            data_f: list[float] = []
+            for i, eg in enumerate(egs):
+                for rgr_id_str in eg:
+                    rows_f.append(i)
+                    cols_f.append(rgr_indices[rgr_id_str])
+                    data_f.append(float(eg_lengths[i]))
+            X_filter = csr_matrix(
+                (data_f, (rows_f, cols_f)),
+                shape=(len(egs), n_rgrs_filter),
+                dtype=np.float64,
             )
 
             result = minimize(
-                filter_objective_numba,
+                poisson_nll_grad,
                 initial_guess,
-                args=(eg_lengths, eg_read_counts, eg_rgr_ids),
+                args=(X_filter, eg_read_counts),
                 bounds=bounds,
                 method="L-BFGS-B",
                 jac=True,
-                options={"maxiter": 10_000, "maxfun": 1e6},
+                options={"maxiter": 10_000},
             )
 
             rgr_indices_to_keep_one_run = set(
@@ -1053,16 +1060,15 @@ class Locus:
             for v in self.egs[run].values():
                 self.counted_reads[run.id] += v.read_count
 
-    def to_deconvolution_args(
+    def to_sparse_args(
         self,
         runs: list[RiboSeqRun],
     ) -> dict:
-        """Build argument dictionary for the Numba objective functions.
+        """Build argument dictionary for the sparse-matrix objective functions.
 
         Assembles cleavage-model look-up tables, coverage-model parameters,
-        equivalence groups, and an initial-guess vector into a single
-        dictionary consumed by :func:`objective_function` and related
-        functions.
+        a CSR sparse design matrix, the response vector, and an initial-guess
+        vector.
 
         Parameters
         ----------
@@ -1072,53 +1078,40 @@ class Locus:
         Returns
         -------
         dict
-            Keys: ``cleavage_model``, ``coverage_model``, ``egs``,
-            ``num_rgrs``, ``rgr_lengths``, ``num_runs``,
-            ``initial_guess``.
+            Keys: ``X``, ``y``, ``cleavage_model``, ``coverage_model``,
+            ``num_rgrs``, ``rgr_lengths``, ``num_runs``, ``initial_guess``.
         """
-        rgrs = list(self.rgr_set)
-
         num_runs = len(runs)
 
-        cm_lut = np.zeros((len(runs), runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
+        cm_lut = np.zeros((num_runs, runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
         for i, run in enumerate(runs):
             cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut
             cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
 
-        coverage_params = np.zeros((len(runs), 3))
+        coverage_params = np.zeros((num_runs, 3))
         for i, run in enumerate(runs):
             coverage_params[i, 0] = run.coverage_model.start_factor
             coverage_params[i, 1] = 1
             coverage_params[i, 2] = run.coverage_model.stop_factor
 
-        num_rgrs = len(rgrs)
-        rgr_lengths = np.array([len(rgr) for rgr in rgrs])
+        num_rgrs = len(self.rgr_set)
+        rgr_lengths = np.array([len(rgr) for rgr in self.rgr_set])
 
         if hasattr(self, "result"):
             initial_guess = self.result
         else:
-            initial_guess = np.ones((num_rgrs, len(runs)))
+            initial_guess = np.ones((num_rgrs, num_runs))
         initial_guess = initial_guess.flatten()
 
-        egs = List()
-        for run in runs:
-            l = List()
-            for (rgr_frame_covpos, read_length, oua), eg in self.egs[run].items():
-                if not rgr_frame_covpos:
-                    continue
-                temp = List()
-                for rgr, frame, covpos in rgr_frame_covpos:
-                    if frame is None:
-                        frame = 3
-                    temp.append((rgr.index, frame, covpos.value))
-                l.append((eg.length, eg.read_count, read_length, int(oua), temp))
-            if l:
-                egs.append(l)
+        X, y = egs_to_sparse(
+            self.egs, runs, cm_lut, coverage_params, num_rgrs, num_runs
+        )
 
         return {
+            "X": X,
+            "y": y,
             "cleavage_model": cm_lut,
             "coverage_model": coverage_params,
-            "egs": egs,
             "num_rgrs": num_rgrs,
             "rgr_lengths": rgr_lengths,
             "num_runs": num_runs,
@@ -1155,14 +1148,13 @@ class Locus:
 
         while True:
             s1 = time.time()
-            deconvolution_args = self.to_deconvolution_args(runs)
-            cm_lut = deconvolution_args["cleavage_model"]
-            coverage_params = deconvolution_args["coverage_model"]
-            egs = deconvolution_args["egs"]
-            num_rgrs = deconvolution_args["num_rgrs"]
-            num_runs = deconvolution_args["num_runs"]
-            rgr_lengths = deconvolution_args["rgr_lengths"]
-            initial_guess = deconvolution_args["initial_guess"]
+            args_dict = self.to_sparse_args(runs)
+            X = args_dict["X"]
+            y = args_dict["y"]
+            num_rgrs = args_dict["num_rgrs"]
+            num_runs = args_dict["num_runs"]
+            rgr_lengths = args_dict["rgr_lengths"]
+            initial_guess = args_dict["initial_guess"]
             s2 = time.time()
             data_time += s2 - s1
             s1 = time.time()
@@ -1178,16 +1170,9 @@ class Locus:
             )
 
             optimization_result = minimize(
-                objective_function,
+                poisson_nll_grad_lasso,
                 initial_guess,
-                args=(
-                    num_runs,
-                    cm_lut,
-                    coverage_params,
-                    egs,
-                    num_rgrs,
-                    config.lam,
-                ),
+                args=(X, y, config.lam, num_rgrs, num_runs),
                 method="L-BFGS-B",
                 jac=True,
                 bounds=bounds,
@@ -1355,18 +1340,12 @@ class Locus:
         """
 
         def run_likelihood_optimization(initial_guess, bounds, optim_args):
-            num_runs, cm_lut, cov_params, egs, ftol, gtol = optim_args
-
+            X_lr, y_lr, ftol, gtol = optim_args
             cb = Callback(initial_guess, num_runs, config)
             optimization_result = minimize(
-                objective_function_wo_regularization,
+                poisson_nll_grad,
                 initial_guess,
-                args=(
-                    num_runs,
-                    cm_lut,
-                    cov_params,
-                    egs,
-                ),
+                args=(X_lr, y_lr),
                 method="L-BFGS-B",
                 jac=True,
                 bounds=bounds,
@@ -1385,31 +1364,16 @@ class Locus:
                     f"Likelihood ratio filtering failed to converge. "
                     f"{optimization_result.message}"
                 )
-
-            ll = log_likelihood(
-                optimization_result.x,
-                num_runs,
-                cm_lut,
-                cov_params,
-                egs,
-            )
+            ll = poisson_log_likelihood_sparse(optimization_result.x, X_lr, y_lr)
             return optimization_result, ll
 
-        deconvolution_args = self.to_deconvolution_args(runs)
-
-        cm_lut = deconvolution_args["cleavage_model"]
-        coverage_params = deconvolution_args["coverage_model"]
-        egs = deconvolution_args["egs"]
-        num_rgrs = deconvolution_args["num_rgrs"]
-        initial_guess = deconvolution_args["initial_guess"]
-        num_runs = deconvolution_args["num_runs"]
-
-        args = (
-            num_runs,
-            cm_lut,
-            coverage_params,
-            egs,
-        )
+        sparse_args = self.to_sparse_args(runs)
+        X_lr = sparse_args["X"]
+        y_lr = sparse_args["y"]
+        num_rgrs = sparse_args["num_rgrs"]
+        initial_guess = sparse_args["initial_guess"]
+        num_runs = sparse_args["num_runs"]
+        args = (X_lr, y_lr, config.ftol, config.gtol)
 
         noise_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"}
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
@@ -1423,14 +1387,7 @@ class Locus:
         t[()] = (config.pseudo_min, None)
         bounds = list(np.full(initial_guess.shape, t))
 
-        optim_args = (
-            num_runs,
-            cm_lut,
-            coverage_params,
-            egs,
-            config.ftol,
-            config.gtol,
-        )
+        optim_args = args
 
         optimization_result, full_log_likelihood = run_likelihood_optimization(
             initial_guess, bounds, optim_args
@@ -1457,7 +1414,9 @@ class Locus:
             reduced_activities[rgr_ind] = config.pseudo_min
             reduced_activities = reduced_activities.flatten()
 
-            reduced_log_likelihood = log_likelihood(reduced_activities, *args)
+            reduced_log_likelihood = poisson_log_likelihood_sparse(
+                reduced_activities, X_lr, y_lr
+            )
 
             log_p = wilks_test_p(
                 full_log_likelihood,
@@ -1559,27 +1518,23 @@ class Locus:
         """
         rgrs_removed = True
         while rgrs_removed:
-            deconvolution_args = self.to_deconvolution_args(runs)
+            args_dict = self.to_sparse_args(runs)
+            X_ea = args_dict["X"]
+            y_ea = args_dict["y"]
+            obj_fn = poisson_nll_grad
+            obj_args = (X_ea, y_ea)
 
-            num_runs = deconvolution_args["num_runs"]
-            cm_lut = deconvolution_args["cleavage_model"]
-            coverage_params = deconvolution_args["coverage_model"]
-            egs = deconvolution_args["egs"]
-            num_rgrs = deconvolution_args["num_rgrs"]
-            initial_guess = deconvolution_args["initial_guess"]
+            num_runs = args_dict["num_runs"]
+            num_rgrs = args_dict["num_rgrs"]
+            initial_guess = args_dict["initial_guess"]
 
             bounds = [(config.pseudo_min, None)] * len(initial_guess)
 
             cb = Callback(initial_guess, num_runs, config)
             optimization_result = minimize(
-                objective_function_wo_regularization,
+                obj_fn,
                 initial_guess,
-                args=(
-                    num_runs,
-                    cm_lut,
-                    coverage_params,
-                    egs,
-                ),
+                args=obj_args,
                 method="L-BFGS-B",
                 jac=True,
                 bounds=bounds,
@@ -1683,60 +1638,195 @@ def wilks_test_p(
 
 
 # ------------------------------------------------------------------ #
-# Numba-accelerated objective functions                                #
+# Sparse-matrix objective functions                                    #
 # ------------------------------------------------------------------ #
 
 
-@jit(nopython=True, cache=True, parallel=False)
-def filter_objective_numba(
-    x: np.ndarray,
-    eg_lengths: np.ndarray,
-    eg_read_counts: np.ndarray,
-    eg_rgr_ids: List,
-) -> tuple[float, np.ndarray]:
-    """Poisson negative log-likelihood for the deconvolution filter.
+def egs_to_sparse(
+    locus_egs: dict,
+    runs: list[RiboSeqRun],
+    cm_lut: np.ndarray,
+    coverage_params: np.ndarray,
+    num_rgrs: int,
+    num_runs: int,
+) -> tuple[csr_matrix, np.ndarray]:
+    """Convert locus equivalence groups to a sparse CSR design matrix.
 
-    Used by :meth:`Locus.deconvolute_opt_group` to quickly evaluate
-    stop-codon group deconvolution per run.
+    Builds the design matrix ``X`` and response vector ``y`` for the
+    identity-link Poisson GLM directly from the locus's native EG
+    dictionary, avoiding Numba typed-List construction entirely.
+
+    Each row corresponds to one ``(EG, run)`` pair.  Column
+    ``rgr_index * num_runs + run_index`` receives the value::
+
+        length * cm_lut[run, read_length, frame, oua] * coverage_params[run, cov_pos]
 
     Parameters
     ----------
-    x : np.ndarray
-        Activity vector, shape ``(n_egs,)``.
-    eg_lengths : np.ndarray
-        Equivalence-group lengths, shape ``(n_egs,)``.
-    eg_read_counts : np.ndarray
-        Observed read counts per EG, shape ``(n_egs,)``.
-    eg_rgr_ids : numba.typed.List
-        Each element is an ``np.ndarray`` of RGR indices belonging to
-        that equivalence group.
+    locus_egs : dict
+        ``Locus.egs`` — mapping from :class:`RiboSeqRun` to a dict of
+        ``(rgr_frame_covpos, read_length, oua) -> EquivalenceGroup``.
+    runs : list[RiboSeqRun]
+        Ordered list of runs (determines run indices).
+    cm_lut : np.ndarray, shape ``(num_runs, max_read_len, 4, 2)``
+        Cleavage-model look-up table.
+    coverage_params : np.ndarray, shape ``(num_runs, 3)``
+        Coverage-model factors.
+    num_rgrs : int
+        Number of RGRs (= number of column groups).
+    num_runs : int
+        Number of Ribo-seq runs.
 
     Returns
     -------
-    tuple[float, np.ndarray]
-        ``(loss, gradient)``.
+    X : csr_matrix, shape ``(n_EGs_total, num_rgrs * num_runs)``
+        Sparse design matrix.
+    y : np.ndarray, shape ``(n_EGs_total,)``
+        Observed read counts.
     """
+    rows_idx: list[int] = []
+    cols_idx: list[int] = []
+    data: list[float] = []
+    y_list: list[float] = []
+    row = 0
 
-    loss = 0
-    grads = np.zeros_like(x)
+    for run_index, run in enumerate(runs):
+        for (rgr_frame_covpos, read_length, oua), eg in locus_egs[run].items():
+            if not rgr_frame_covpos:
+                continue
+            y_list.append(float(eg.read_count))
+            for rgr, frame, cov_pos in rgr_frame_covpos:
+                f = 3 if frame is None else frame
+                val = (
+                    eg.length
+                    * cm_lut[run_index, read_length, f, int(oua)]
+                    * coverage_params[run_index, cov_pos.value]
+                )
+                rows_idx.append(row)
+                cols_idx.append(rgr.index * num_runs + run_index)
+                data.append(val)
+            row += 1
 
-    for eg_len, eg_rc, eg_rgrs in zip(eg_lengths, eg_read_counts, eg_rgr_ids):
-        activity = 0
-        δ_derived = np.zeros_like(x)
-        for rgr_id in eg_rgrs:
-            activity += x[rgr_id]
-            δ_derived[rgr_id] += eg_len
+    n_rows = row
+    n_cols = num_rgrs * num_runs
+    X = csr_matrix(
+        (data, (rows_idx, cols_idx)), shape=(n_rows, n_cols), dtype=np.float64
+    )
+    y = np.array(y_list, dtype=np.float64)
+    return X, y
 
-        δ = eg_len * activity
-        y = eg_rc
 
-        if y == 0 and δ == 0:
-            continue
+def poisson_nll_grad(
+    w: np.ndarray,
+    X: csr_matrix,
+    y: np.ndarray,
+) -> tuple[float, np.ndarray]:
+    """Identity-link Poisson NLL and gradient using a sparse design matrix.
 
-        loss += δ - y * np.log(δ)
-        grads += -y * δ_derived / δ + δ_derived
+    Model:  δ = X @ w
+    Loss:   Σ_i [δ_i − y_i · ln δ_i]  (zero-zero pairs excluded)
+    Grad:   X.T @ r,  r_i = 1 − y_i / δ_i
 
-    return loss, grads
+    Parameters
+    ----------
+    w : np.ndarray, shape ``(n_features,)``
+        Current activity estimate (must satisfy ``w_j > 0`` via bounds).
+    X : csr_matrix, shape ``(n_samples, n_features)``
+        Non-negative sparse design matrix.
+    y : np.ndarray, shape ``(n_samples,)``
+        Observed read counts.
+
+    Returns
+    -------
+    loss : float
+    grad : np.ndarray, shape ``(n_features,)``
+    """
+    delta = np.asarray(X @ w).ravel()
+    active = ~((delta == 0.0) & (y == 0.0))
+    d_act = delta[active]
+    y_act = y[active]
+    loss = float(d_act.sum() - (y_act * np.log(d_act)).sum())
+    r = np.zeros(len(y), dtype=np.float64)
+    r[active] = 1.0 - y_act / d_act
+    grad = np.asarray(X.T @ r).ravel()
+    return loss, grad
+
+
+def poisson_nll_grad_lasso(
+    w: np.ndarray,
+    X: csr_matrix,
+    y: np.ndarray,
+    lam: float,
+    num_rgrs: int,
+    num_runs: int,
+) -> tuple[float, np.ndarray]:
+    """Identity-link Poisson NLL with group-LASSO penalty, sparse version.
+
+    Penalty:  λ · Σ_k ‖x_k‖₂,  where ``x_k = w[k*R : (k+1)*R]``.
+
+    Parameters
+    ----------
+    w : np.ndarray, shape ``(num_rgrs * num_runs,)``
+        Current activity estimate.
+    X : csr_matrix
+        Sparse design matrix built by :func:`egs_to_sparse`.
+    y : np.ndarray
+        Observed read counts.
+    lam : float
+        Group-LASSO regularisation strength.
+    num_rgrs : int
+        Number of RGRs.
+    num_runs : int
+        Number of runs (= group size).
+
+    Returns
+    -------
+    loss : float
+    grad : np.ndarray, shape ``(num_rgrs * num_runs,)``
+    """
+    loss, grad = poisson_nll_grad(w, X, y)
+    W = w.reshape(num_rgrs, num_runs)
+    norms = np.sqrt((W**2).sum(axis=1))  # (num_rgrs,)
+    safe_norms = np.maximum(norms, 1e-300)
+    loss += lam * norms.sum()
+    grad_penalty = lam * (W / safe_norms[:, None])  # (num_rgrs, num_runs)
+    grad = grad + grad_penalty.ravel()
+    return loss, grad
+
+
+def poisson_log_likelihood_sparse(
+    w: np.ndarray,
+    X: csr_matrix,
+    y: np.ndarray,
+) -> float:
+    """Compute the Poisson log-likelihood using a sparse design matrix.
+
+    Returns the *positive* log-likelihood (without penalty).  Used for
+    likelihood-ratio tests.
+
+    Parameters
+    ----------
+    w : np.ndarray, shape ``(n_features,)``
+        Current activity estimate.
+    X : csr_matrix
+        Sparse design matrix built by :func:`egs_to_sparse`.
+    y : np.ndarray
+        Observed read counts.
+
+    Returns
+    -------
+    float
+        Log-likelihood value.
+    """
+    delta = np.asarray(X @ w).ravel()
+    active = ~((delta == 0.0) & (y == 0.0))
+    d_act = delta[active]
+    y_act = y[active]
+    return float(
+        (y_act * np.log(d_act)).sum()
+        - d_act.sum()
+        - float(np.sum([math.lgamma(yi + 1) for yi in y_act]))
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -1874,207 +1964,3 @@ class Callback:
                 self.rgr_indices_to_remove
             ):
                 raise StopIteration
-
-
-# compute the negative log likelihood + a penalty term
-# and the gradient with respect to each activity parameter
-@jit(nopython=True, cache=True, parallel=False)
-def objective_function(
-    x: np.ndarray,
-    num_runs: int,
-    cm_lut: np.ndarray,
-    coverage_params: np.ndarray,
-    egs,
-    num_rgrs: int,
-    λ: float,
-) -> tuple[float, np.ndarray]:
-    """Negative Poisson log-likelihood with group-LASSO penalty.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Flattened activity vector, shape ``(num_rgrs * num_runs,)``.
-    num_runs : int
-        Number of Ribo-seq runs.
-    cm_lut : np.ndarray
-        Cleavage model look-up table, shape
-        ``(num_runs, max_read_length, 4, 2)``.
-    coverage_params : np.ndarray
-        Coverage model parameters, shape ``(num_runs, 3)``.
-    egs : numba.typed.List
-        Per-run equivalence groups.
-    num_rgrs : int
-        Number of RGRs.
-    λ : float
-        Group-LASSO regularisation strength.
-
-    Returns
-    -------
-    tuple[float, np.ndarray]
-        ``(loss, gradient)``.
-    """
-
-    loss = 0
-    grads = np.zeros_like(x)
-
-    for run_index in range(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-            δ_derived = np.zeros_like(x)
-            for rgr_index, frame, cov_pos in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, cov_pos]
-                )
-                δ_derived[rgr_index * num_runs + run_index] += (
-                    cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, cov_pos]
-                )
-
-            δ = eg[0] * activity
-            δ_derived *= eg[0]
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-            grads += -y * δ_derived / δ + δ_derived
-
-    penalty = 0
-    for rgr_index in range(num_rgrs):
-        s = 0
-        for run_index in range(num_runs):
-            s += x[rgr_index * num_runs + run_index] ** 2
-        s_sqrt = s**0.5
-        penalty += s_sqrt
-        for run_index in range(num_runs):
-            grads[rgr_index * num_runs + run_index] += (
-                λ * x[rgr_index * num_runs + run_index] / s_sqrt
-            )
-
-    return loss + λ * penalty, grads
-
-
-@jit(nopython=True, cache=True, parallel=False)
-def objective_function_wo_regularization(
-    x: np.ndarray,
-    num_runs: int,
-    cm_lut: np.ndarray,
-    coverage_params: np.ndarray,
-    egs,
-) -> tuple[float, np.ndarray]:
-    """Negative Poisson log-likelihood without regularisation.
-
-    Same as :func:`objective_function` but omits the group-LASSO
-    penalty term.  Used during likelihood-ratio filtering and final
-    activity estimation.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Flattened activity vector.
-    num_runs : int
-        Number of Ribo-seq runs.
-    cm_lut : np.ndarray
-        Cleavage model look-up table.
-    coverage_params : np.ndarray
-        Coverage model parameters.
-    egs : numba.typed.List
-        Per-run equivalence groups.
-
-    Returns
-    -------
-    tuple[float, np.ndarray]
-        ``(loss, gradient)``.
-    """
-
-    loss = 0
-    grads = np.zeros_like(x)
-
-    for run_index in range(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-            δ_derived = np.zeros_like(x)
-            for rgr_index, frame, cov_pos in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, cov_pos]
-                )
-                δ_derived[rgr_index * num_runs + run_index] += (
-                    cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, cov_pos]
-                )
-
-            δ = eg[0] * activity
-            δ_derived *= eg[0]
-
-            y = eg[1]
-
-            if y == 0 and δ == 0:
-                continue
-
-            loss += δ - y * np.log(δ)
-            grads += -y * δ_derived / δ + δ_derived
-
-    return loss, grads
-
-
-@jit(nopython=True, cache=True, parallel=False)
-def log_likelihood(
-    x: np.ndarray,
-    num_runs: int,
-    cm_lut: np.ndarray,
-    coverage_params: np.ndarray,
-    egs,
-) -> float:
-    """Compute the Poisson log-likelihood (without penalty).
-
-    Unlike :func:`objective_function_wo_regularization`, this returns
-    the *positive* log-likelihood and does not compute the gradient.
-    Used for likelihood-ratio tests.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Flattened activity vector.
-    num_runs : int
-        Number of Ribo-seq runs.
-    cm_lut : np.ndarray
-        Cleavage model look-up table.
-    coverage_params : np.ndarray
-        Coverage model parameters.
-    egs : numba.typed.List
-        Per-run equivalence groups.
-
-    Returns
-    -------
-    float
-        Log-likelihood value.
-    """
-
-    ll = 0
-
-    for run_index in range(num_runs):
-        for eg in egs[run_index]:
-            activity = 0
-
-            for rgr_index, frame, covpos in eg[4]:
-                activity += (
-                    x[rgr_index * num_runs + run_index]
-                    * cm_lut[run_index, eg[2], frame, eg[3]]
-                    * coverage_params[run_index, covpos]
-                )
-
-            δ = eg[0] * activity
-
-            y = eg[1]
-            if y == 0 and δ == 0:
-                continue
-
-            ll += y * np.log(δ) - δ - math.lgamma(y + 1)
-
-    return ll
