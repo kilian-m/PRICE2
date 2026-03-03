@@ -101,22 +101,15 @@ class Node:
 class EquivalenceGroupIntervals:
     """Transcript positions where reads are compatible with a set of RGRs.
 
-    Stores three ``HTSeq.GenomicArrayOfSets`` — one per reading-frame phase
-    (0, 1, 2) — that map codon-coordinate positions on a transcript to the
-    set of ``(rgr, frame, CoveragePosition)`` tuples compatible with reads
-    starting at those positions.
+    Stores three lists — one per reading-frame phase (0, 1, 2) — of
+    ``(start_codon, end_codon, (rgr, frame, CoveragePosition))`` intervals.
+    Using interval lists instead of per-position dicts avoids O(interval_length)
+    inner loops: ``add_rgr`` becomes O(1) per call, and the sweep-line in
+    ``get_egs_dict`` is O(n_intervals * log(n_intervals)).
     """
 
     def __init__(self) -> None:
-        self.intervals: tuple[
-            HTSeq.GenomicArrayOfSets,
-            HTSeq.GenomicArrayOfSets,
-            HTSeq.GenomicArrayOfSets,
-        ] = (
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-        )
+        self.intervals: tuple[list, list, list] = ([], [], [])
 
     def add_rgr(
         self,
@@ -146,22 +139,25 @@ class EquivalenceGroupIntervals:
             Which part of the coverage profile this interval corresponds to.
         """
         if rgr.type == "NOISE":
-            phases = [0, 1, 2]
+            phases_to_fill = [0, 1, 2]
         else:
-            phases = [phase]
+            phases_to_fill = [phase]
         start_phase = start % 3
         end_phase = end % 3
-        for phase in phases:
-            if phase >= start_phase:
-                s = start + (phase - start_phase)
+        tup = (rgr, frame, covpos)
+        for ph in phases_to_fill:
+            if ph >= start_phase:
+                s = start + (ph - start_phase)
             else:
-                s = start + (phase - start_phase) + 3
-            if phase >= end_phase:
-                e = end + (phase - end_phase)
+                s = start + (ph - start_phase) + 3
+            if ph >= end_phase:
+                e = end + (ph - end_phase)
             else:
-                e = end + (phase - end_phase) + 3
-            iv = HTSeq.GenomicInterval(".", s // 3, e // 3, ".")
-            self.intervals[phase][iv] += (rgr, frame, covpos)
+                e = end + (ph - end_phase) + 3
+            sc = s // 3
+            ec = e // 3
+            if sc < ec:
+                self.intervals[ph].append((sc, ec, tup))
 
     def get_egs_dict(self, read_length: int, oua: bool) -> dict:
         """Convert internal intervals to a dict of EquivalenceGroups.
@@ -182,11 +178,41 @@ class EquivalenceGroupIntervals:
         """
         egs: dict = defaultdict(EquivalenceGroup)
         for phase in range(3):
-            for step_iv, step_set in self.intervals[phase].steps():
-                if not step_set:
-                    continue
-                rgr_frame_covpos = frozenset(step_set)
-                egs[(rgr_frame_covpos, read_length, oua)].length += step_iv.length
+            interval_list = self.intervals[phase]
+            if not interval_list:
+                continue
+
+            # Build events: (pos, type, tup)
+            # type=0 for interval-end (deactivate), type=1 for interval-start
+            # (activate).  Sorting puts ends before starts at the same position,
+            # preserving half-open [sc, ec) semantics.
+            events: list = []
+            for sc, ec, tup in interval_list:
+                events.append((sc, 1, tup))
+                events.append((ec, 0, tup))
+            events.sort(key=lambda x: (x[0], x[1]))
+
+            # refcount dict: tup -> number of currently-open intervals.
+            # Needed because get_sub_intervals can emit duplicate (sc, ec, tup)
+            # entries when the same RGR appears on multiple transcripts; plain
+            # set semantics would discard the tup too early on the first end
+            # event.  A tup is "active" as long as refcount > 0.
+            active: dict = {}
+            prev_pos: int | None = None
+
+            for pos, typ, tup in events:
+                if prev_pos is not None and pos != prev_pos and active:
+                    egs[(frozenset(active), read_length, oua)].length += pos - prev_pos
+                if typ == 0:  # end event
+                    cnt = active.get(tup, 1) - 1
+                    if cnt <= 0:
+                        active.pop(tup, None)
+                    else:
+                        active[tup] = cnt
+                else:  # start event
+                    active[tup] = active.get(tup, 0) + 1
+                prev_pos = pos
+
         return egs
 
 
@@ -725,42 +751,29 @@ def get_sub_intervals(
     EquivalenceGroupIntervals
         Combined equivalence-group intervals aligned to position 0.
     """
-    result_intervals = (
-        HTSeq.GenomicArrayOfSets("auto", stranded=False),
-        HTSeq.GenomicArrayOfSets("auto", stranded=False),
-        HTSeq.GenomicArrayOfSets("auto", stranded=False),
-    )
+    result_lists: tuple[list, list, list] = ([], [], [])
 
     for egi, start in zip(egis, starts):
         end = start + length
         s_q, s_r = divmod(start, 3)
         e_q, e_r = divmod(end, 3)
-        for i, egi_iv in enumerate(egi.intervals):
-            p = (i - s_r) % 3
-            s = s_q if s_r <= i else s_q + 1
-            e = e_q + 1 if e_r > i else e_q
-            iv = HTSeq.GenomicInterval(".", s, e, ".")
-            l = 0
-            try:
-                for step_iv, step_set in egi_iv[iv].steps():
-                    if not step_set:
-                        l += step_iv.length
-                        continue
-                    siv = HTSeq.GenomicInterval(
-                        ".",
-                        l,
-                        l + step_iv.length,
-                        ".",
-                    )
-                    for s in step_set:
-                        result_intervals[p][siv] += s
-                    l += step_iv.length
-            except IndexError:
-                pass
+        for i in range(3):  # source phase
+            p = (i - s_r) % 3  # output phase
+            sc = s_q if s_r <= i else s_q + 1
+            ec = e_q + 1 if e_r > i else e_q
+            if sc >= ec:
+                continue
+            src = egi.intervals[i]  # list of (interval_sc, interval_ec, tup)
+            dst = result_lists[p]
+            for interval_sc, interval_ec, tup in src:
+                clipped_sc = max(interval_sc, sc)
+                clipped_ec = min(interval_ec, ec)
+                if clipped_sc < clipped_ec:
+                    dst.append((clipped_sc - sc, clipped_ec - sc, tup))
 
-    egi = EquivalenceGroupIntervals()
-    egi.intervals = result_intervals
-    return egi
+    result = EquivalenceGroupIntervals()
+    result.intervals = result_lists
+    return result
 
 
 def make_equivalence_intervals(

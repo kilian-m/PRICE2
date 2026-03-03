@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 from filelock import FileLock
 from scipy.optimize import minimize
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, vstack as sp_vstack
 from scipy.stats import chi2
 
 from price2.config import Config
@@ -1310,7 +1310,6 @@ class Locus:
                 old_eg = self.egs[run][old_eg_key]
 
                 new_eg.length += old_eg.length
-
                 new_eg.read_count += old_eg.read_count
                 new_eg.reads |= old_eg.reads
 
@@ -1580,36 +1579,6 @@ class Locus:
 # ------------------------------------------------------------------ #
 # Statistical tests                                                    #
 # ------------------------------------------------------------------ #
-
-
-def wilks_test(
-    log_likelihood_full: float,
-    log_likelihood_reduced: float,
-    df_diff: int = 1,
-    α: float = 1e-5,
-) -> bool:
-    """Perform a Wilks likelihood-ratio test.
-
-    Returns ``True`` when the null hypothesis (that the reduced model
-    is sufficient) should be rejected.
-
-    Parameters
-    ----------
-    log_likelihood_full : float
-        Log-likelihood of the full (unrestricted) model.
-    log_likelihood_reduced : float
-        Log-likelihood of the reduced (restricted) model.
-    df_diff : int
-        Difference in degrees of freedom between the two models.
-    α : float
-        Significance level.
-
-    Returns
-    -------
-    bool
-        ``True`` if the full model is significantly better.
-    """
-    return 2 * (log_likelihood_full - log_likelihood_reduced) > chi2.ppf(1 - α, df_diff)
 
 
 def wilks_test_p(
