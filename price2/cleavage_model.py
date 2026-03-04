@@ -10,7 +10,7 @@ import warnings
 from functools import lru_cache
 from typing import Optional
 
-import HTSeq
+import pysam
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
@@ -628,85 +628,88 @@ class CleavageEstimator:
         self.not_countable = 0
         self.bad_length = 0
         self.counted_alns = 0
-        for aln in HTSeq.BAM_Reader(sample_bam_path):
-            aln = RiboSeqAlignment(aln)
-
-            if not aln.unique():
-                self.not_unique += 1
-                continue
-            if not min_considered_length <= len(aln) < max_considered_length:
-                self.bad_length += 1
-                continue
-            transcript_candidates = reference_annotation.collect_coding_transcripts(
-                aln.genomic_region
-            )
-            if len(transcript_candidates) == 0:
-                self.outside_cds += 1
-                continue
-            frame = None
-            dist_to_start = None
-
-            # get frame
-            for tr in transcript_candidates:
-                if tr.annotated_cds_iv is None:
+        with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
+            for raw_aln in bam.fetch(until_eof=True):
+                if raw_aln.is_unmapped:
                     continue
-                try:
-                    iv_on_tr = tr.exons.map_to_local(aln.genomic_region)
-                    iv_on_cds = (
-                        iv_on_tr[0] - tr.annotated_cds_iv[0],
-                        iv_on_tr[1] - tr.annotated_cds_iv[0],
-                    )
-                except ValueError:
+                aln = RiboSeqAlignment.from_pysam(raw_aln)
+
+                if not aln.unique():
+                    self.not_unique += 1
                     continue
-
-                if (
-                    iv_on_cds[0] > min_dist_to_start
-                    and tr.coding_length - iv_on_cds[1] > min_dist_to_end
-                ):
-                    new_frame = iv_on_cds[0] % 3
-
-                    if frame is None:
-                        frame = new_frame
-                    elif frame != new_frame:
-                        self.not_countable += 1
-                        break
-
-            else:
-                if frame is not None:
-                    self.table[
-                        len(aln),
-                        frame,
-                        int(aln.untemplated_addition),
-                        0,
-                    ] += 1
-                    self.counted_alns += 1
-                    if self.counted_alns >= sufficient_counted_alns:
-                        break
-
-            # get dist_to_start
-            for tr in transcript_candidates:
-                if not tr.annotated_cds_iv:
+                if not min_considered_length <= len(aln) < max_considered_length:
+                    self.bad_length += 1
                     continue
-                try:
-                    new_dist_to_exon_start = tr.exons.map_to_local(aln.genomic_region)[
-                        0
-                    ]
-                    new_dist_to_cds_start = (
-                        new_dist_to_exon_start - tr.annotated_cds_iv[0]
-                    )
-                except ValueError:
-                    new_dist_to_cds_start = None
+                transcript_candidates = reference_annotation.collect_coding_transcripts(
+                    aln.genomic_region
+                )
+                if len(transcript_candidates) == 0:
+                    self.outside_cds += 1
+                    continue
+                frame = None
+                dist_to_start = None
 
-                new_dist_to_start = new_dist_to_cds_start
+                # get frame
+                for tr in transcript_candidates:
+                    if tr.annotated_cds_iv is None:
+                        continue
+                    try:
+                        iv_on_tr = tr.exons.map_to_local(aln.genomic_region)
+                        iv_on_cds = (
+                            iv_on_tr[0] - tr.annotated_cds_iv[0],
+                            iv_on_tr[1] - tr.annotated_cds_iv[0],
+                        )
+                    except ValueError:
+                        continue
 
-                if isinstance(new_dist_to_start, int):
-                    if dist_to_start is None:
-                        dist_to_start = new_dist_to_start
-                    elif dist_to_start != new_dist_to_start:
-                        break
-            else:
-                if isinstance(dist_to_start, int) and (-100 < dist_to_start < 100):
-                    self.dist_starts[dist_to_start + 100] += 1
+                    if (
+                        iv_on_cds[0] > min_dist_to_start
+                        and tr.coding_length - iv_on_cds[1] > min_dist_to_end
+                    ):
+                        new_frame = iv_on_cds[0] % 3
+
+                        if frame is None:
+                            frame = new_frame
+                        elif frame != new_frame:
+                            self.not_countable += 1
+                            break
+
+                else:
+                    if frame is not None:
+                        self.table[
+                            len(aln),
+                            frame,
+                            int(aln.untemplated_addition),
+                            0,
+                        ] += 1
+                        self.counted_alns += 1
+                        if self.counted_alns >= sufficient_counted_alns:
+                            break
+
+                # get dist_to_start
+                for tr in transcript_candidates:
+                    if not tr.annotated_cds_iv:
+                        continue
+                    try:
+                        new_dist_to_exon_start = tr.exons.map_to_local(
+                            aln.genomic_region
+                        )[0]
+                        new_dist_to_cds_start = (
+                            new_dist_to_exon_start - tr.annotated_cds_iv[0]
+                        )
+                    except ValueError:
+                        new_dist_to_cds_start = None
+
+                    new_dist_to_start = new_dist_to_cds_start
+
+                    if isinstance(new_dist_to_start, int):
+                        if dist_to_start is None:
+                            dist_to_start = new_dist_to_start
+                        elif dist_to_start != new_dist_to_start:
+                            break
+                else:
+                    if isinstance(dist_to_start, int) and (-100 < dist_to_start < 100):
+                        self.dist_starts[dist_to_start + 100] += 1
 
         if self.counted_alns < sufficient_counted_alns:
             warnings.warn(

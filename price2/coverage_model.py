@@ -10,7 +10,7 @@ import warnings
 from enum import Enum
 from typing import Optional
 
-import HTSeq
+import pysam
 import numpy as np
 
 from price2.cleavage_model import CleavageModel, read_in_cds_likelihood
@@ -246,21 +246,26 @@ class CoverageModel:
             ``_START_CODON_IDX`` corresponds to CDS position 0.
         """
         hist = np.zeros(_HIST_SIZE)
-        for raw_aln in HTSeq.BAM_Reader(bam_path):
-            result = _try_assign_p_site(RiboSeqAlignment(raw_aln), ra, cm)
-            if result is None:
-                continue
-            transcript, iv_on_cds, p_site = result
+        with pysam.AlignmentFile(bam_path, "rb") as bam:
+            for raw_aln in bam.fetch(until_eof=True):
+                if raw_aln.is_unmapped:
+                    continue
+                result = _try_assign_p_site(
+                    RiboSeqAlignment.from_pysam(raw_aln), ra, cm
+                )
+                if result is None:
+                    continue
+                transcript, iv_on_cds, p_site = result
 
-            lo, hi = _START_WINDOW
-            if not (lo < iv_on_cds[0] < hi):
-                continue
+                lo, hi = _START_WINDOW
+                if not (lo < iv_on_cds[0] < hi):
+                    continue
 
-            # Exclude reads whose matching range spans the CDS end.
-            if iv_on_cds[0] < transcript.coding_length < iv_on_cds[1]:
-                continue
+                # Exclude reads whose matching range spans the CDS end.
+                if iv_on_cds[0] < transcript.coding_length < iv_on_cds[1]:
+                    continue
 
-            hist[p_site + _START_CODON_IDX] += 1
+                hist[p_site + _START_CODON_IDX] += 1
 
         return hist
 
@@ -291,22 +296,27 @@ class CoverageModel:
             corresponds to CDS position ``len(cds) − 3``.
         """
         hist = np.zeros(_HIST_SIZE)
-        for raw_aln in HTSeq.BAM_Reader(bam_path):
-            result = _try_assign_p_site(RiboSeqAlignment(raw_aln), ra, cm)
-            if result is None:
-                continue
-            transcript, iv_on_cds, p_site = result
+        with pysam.AlignmentFile(bam_path, "rb") as bam:
+            for raw_aln in bam.fetch(until_eof=True):
+                if raw_aln.is_unmapped:
+                    continue
+                result = _try_assign_p_site(
+                    RiboSeqAlignment.from_pysam(raw_aln), ra, cm
+                )
+                if result is None:
+                    continue
+                transcript, iv_on_cds, p_site = result
 
-            dist_to_end = iv_on_cds[1] - transcript.coding_length
-            lo, hi = _STOP_WINDOW
-            if not (lo < dist_to_end < hi):
-                continue
+                dist_to_end = iv_on_cds[1] - transcript.coding_length
+                lo, hi = _STOP_WINDOW
+                if not (lo < dist_to_end < hi):
+                    continue
 
-            # Exclude reads whose matching range spans the CDS start.
-            if iv_on_cds[0] < 0 < iv_on_cds[1]:
-                continue
+                # Exclude reads whose matching range spans the CDS start.
+                if iv_on_cds[0] < 0 < iv_on_cds[1]:
+                    continue
 
-            hist[p_site - transcript.coding_length + _STOP_HIST_OFFSET] += 1
+                hist[p_site - transcript.coding_length + _STOP_HIST_OFFSET] += 1
 
         return hist
 

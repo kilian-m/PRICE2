@@ -193,8 +193,8 @@ class DataCollector:
         self.chr_order = None
         for bam_file in os.listdir(self.bam_dir):
             if bam_file.endswith(".bam"):
-                bam_reader = HTSeq.BAM_Reader(os.path.join(self.bam_dir, bam_file))
-                self.chr_order = [x["SN"] for x in bam_reader.get_header_dict()["SQ"]]
+                with pysam.AlignmentFile(os.path.join(self.bam_dir, bam_file), "rb") as _bam:
+                    self.chr_order = [sq["SN"] for sq in _bam.header["SQ"]]
                 return
 
     def make_loci(
