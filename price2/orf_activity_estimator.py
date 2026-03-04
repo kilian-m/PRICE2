@@ -12,12 +12,11 @@ import os
 import sqlite3 as sql
 import time
 import traceback
-from concurrent.futures import TimeoutError
+from concurrent.futures import TimeoutError, as_completed
 from pickle import loads
 
 import multiprocessing as mp
 import pandas as pd
-import psutil
 from filelock import FileLock
 from pebble import ProcessPool
 from tqdm import tqdm
@@ -93,9 +92,7 @@ class ORFActivityEstimator:
         ra_dir = os.path.join(self.config.o_dir, "regions_activities")
         os.makedirs(ra_dir, exist_ok=True)
 
-        if os.path.exists(
-            f"{self.config.o_dir}/performance_measurements.tsv"
-        ):
+        if os.path.exists(f"{self.config.o_dir}/performance_measurements.tsv"):
             processed_loc_ids = set(
                 pd.read_csv(
                     f"{self.config.o_dir}/performance_measurements.tsv",
@@ -107,54 +104,40 @@ class ORFActivityEstimator:
         loci_ids = list(loci_ids)
         pbar = tqdm(total=len(loci_ids))
 
-        # make directory to indicate processing loci
-        processing_dir = f"{self.config.w_dir}/processing_loci"
-        if not os.path.exists(processing_dir):
-            os.makedirs(processing_dir)
-
         with ProcessPool(max_workers=self.config.processes, max_tasks=1) as pool:
-            future = pool.map(
-                process_loc,
-                [
-                    (
-                        locus_id,
-                        self.config,
-                    )
-                    for locus_id in loci_ids
-                ],
-                timeout=self.config.timeout,
-            )
+            futures = {
+                pool.schedule(
+                    process_loc,
+                    args=[(locus_id, self.config)],
+                    timeout=self.config.timeout,
+                ): locus_id
+                for locus_id in loci_ids
+            }
 
-            iterator = future.result()
-
-            results = []
-            i = 0
-            while True:
+            results = {}
+            for fut in as_completed(futures):
+                loc_id = futures[fut]
                 try:
-                    result = next(iterator)
+                    result = fut.result()
                     if not self.config.save_memory:
-                        results.append(result)
-                    pbar.update(1)
-                    i += 1
-                except StopIteration:
-                    pbar.close()
-                    break
+                        results[loc_id] = result
                 except (TimeoutError, Exception) as e:
-
                     stack = traceback.format_exc()
                     lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
                     with lock:
                         with open(f"{ra_dir}/failed_loci.txt", "a") as f:
-                            f.write(f"{loci_ids[i]}\n{str(e)}\n{stack}\n\n")
+                            f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
                     if not self.config.save_memory:
-                        results.append(e)
+                        results[loc_id] = e
+                finally:
                     pbar.update(1)
-                    i += 1
+
+        pbar.close()
 
         if not self.config.save_memory:
             self.loci = {}
             self.failed_loci = {}
-            for loc_id, result in zip(loci_ids, results):
+            for loc_id, result in results.items():
                 if isinstance(result, Exception):
                     self.failed_loci[loc_id] = result
                 else:
@@ -188,11 +171,6 @@ def process_loc(arguments: tuple):
         ``config.save_memory`` is ``False``, otherwise ``None``.
     """
     loc_id, config = arguments
-
-    # Create a sentinel file so that interrupted loci can be detected.
-    filename = f"{config.w_dir}/processing_loci/{loc_id}"
-    with open(filename, "w") as f:
-        pass
 
     performance_measurements: dict = {}
     performance_measurements["loc_id"] = loc_id
@@ -272,10 +250,6 @@ def process_loc(arguments: tuple):
         loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
 
     # --- Equivalence groups ---
-    performance_measurements["mem_before_egs"] = (
-        psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
-    )
-
     for tr in loc.transcripts:
         tr.update_with_filtered_orfs(loc.rgr_set)
 
@@ -283,9 +257,6 @@ def process_loc(arguments: tuple):
     loc.egs = make_equivalence_groups(loc, runs)
     t2 = time.time()
 
-    performance_measurements["mem_after_egs"] = (
-        psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
-    )
     performance_measurements["eg_time"] = t2 - t1
 
     # --- Assign reads to equivalence groups ---
@@ -332,9 +303,6 @@ def process_loc(arguments: tuple):
         {rgr.transcript.gene_id for rgr in loc.rgr_set_complete}
     )
     performance_measurements["transcripts_number"] = loc.transcripts_number
-    performance_measurements["occupied_memory_mb"] = (
-        psutil.Process(os.getpid()).memory_full_info().uss / 1024 / 1024
-    )
     t_end = time.time()
     performance_measurements["overall_time"] = t_end - t_start
     performance_measurements["exon_length"] = loc.exon_length
@@ -369,9 +337,6 @@ def process_loc(arguments: tuple):
                     sep="\t",
                 )
             )
-
-    # delete processing locus file
-    os.remove(filename)
 
     if config.save_memory:
         return
