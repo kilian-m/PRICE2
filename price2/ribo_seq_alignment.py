@@ -85,6 +85,29 @@ class RiboSeqAlignment:
         else:
             raise TypeError(f"Unsupported data type for RiboSeqAlignment: {type(data)}")
 
+    # ------------------------------------------------------------------
+    # Alternative constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pysam(cls, aln: "pysam.AlignedSegment") -> "RiboSeqAlignment":
+        """Construct a :class:`RiboSeqAlignment` from a pysam alignment.
+
+        Parameters
+        ----------
+        aln : pysam.AlignedSegment
+            A single aligned record returned by
+            :meth:`pysam.AlignmentFile.fetch`.
+
+        Returns
+        -------
+        RiboSeqAlignment
+            Fully initialised instance.
+        """
+        obj: RiboSeqAlignment = cls.__new__(cls)
+        obj._init_from_pysam_alignment(aln)
+        return obj
+
     def _init_from_dataframe(self, df: pd.DataFrame) -> None:
         """Initialise from a collapsed-alignment DataFrame."""
         first = df.iloc[0]
@@ -114,6 +137,50 @@ class RiboSeqAlignment:
             )
 
         intervals = [op.ref_iv for op in sa.cigar if op.type == "M"]
+
+        self.genomic_region = GenomicRegion(intervals)
+
+    def _init_from_pysam_alignment(self, aln: "pysam.AlignedSegment") -> None:
+        """Initialise from a pysam AlignedSegment object.
+
+        Reads the ``NH`` optional tag for multimapper count, detects a
+        1-nt 5\'-end soft-clip as an untemplated addition, and walks the
+        CIGAR string to collect ``M`` (match) intervals as
+        :class:`HTSeq.GenomicInterval` objects.
+        """
+        try:
+            self.mapping_positions = aln.get_tag("NH")
+        except KeyError:
+            self.mapping_positions = 1
+        self.read_count = 1
+
+        strand = "-" if aln.is_reverse else "+"
+        cigar = aln.cigartuples  # list of (op_code, length) or None
+
+        # Untemplated addition: 1-nt soft-clip at the 5' end of the read.
+        # On + strand the 5' end is the first cigar op; on - strand it is last.
+        if strand == "+":
+            self.untemplated_addition = bool(
+                cigar and cigar[0][0] == 4 and cigar[0][1] == 1
+            )
+        else:
+            self.untemplated_addition = bool(
+                cigar and cigar[-1][0] == 4 and cigar[-1][1] == 1
+            )
+
+        # Walk CIGAR to collect M (op=0) intervals in reference coordinates.
+        # ops that consume reference: M(0), D(2), N(3); skip I(1), S(4), H(5), P(6).
+        chrom = aln.reference_name
+        pos = aln.reference_start
+        intervals: list[HTSeq.GenomicInterval] = []
+        for op, length in (cigar or []):
+            if op == 0:  # M
+                intervals.append(
+                    HTSeq.GenomicInterval(chrom, pos, pos + length, strand)
+                )
+                pos += length
+            elif op in (2, 3):  # D / N
+                pos += length
 
         self.genomic_region = GenomicRegion(intervals)
 

@@ -7,8 +7,10 @@ Intermediate results are persisted in an SQLite database located in the
 working directory (``price.db``).
 """
 
+import bisect
 import os
 import HTSeq
+import pysam
 import sqlite3 as sql
 from pickle import dumps, loads
 import zlib
@@ -376,6 +378,9 @@ def collect_mappings_run(
     Designed to be called via :class:`multiprocessing.Pool`.  Accepts a
     single tuple argument so it is compatible with ``Pool.map``.
 
+    Uses pysam for BAM parsing (~4× faster than HTSeq) with one
+    indexed ``fetch()`` call per locus.
+
     Parameters
     ----------
     data : tuple
@@ -389,81 +394,91 @@ def collect_mappings_run(
     """
     run_id, bam_dir, db_path, loci_set = data
 
-    br = HTSeq.BAM_Reader(f"{bam_dir}/{run_id}.bam")
-
     reads_rows: list = []
     transcript_count_rows: list = []
 
-    for locus in loci_set:
-        transcripts_counts = defaultdict(int)
-        strand = locus.iv.strand
-        mappings_dict = defaultdict(int)
-        for alignment in br.fetch(locus.iv.chrom, locus.iv.start, locus.iv.end):
-            if alignment.iv.strand != strand:
-                continue
-            transcript_sets = []
-            rsa = RiboSeqAlignment(alignment)
+    with pysam.AlignmentFile(f"{bam_dir}/{run_id}.bam", "rb") as sf:
+        for locus in loci_set:
+            transcripts_counts: dict = defaultdict(int)
+            strand = locus.iv.strand
+            mappings_dict: dict = defaultdict(int)
+            bp_starts, bp_ends, bp_sets = locus.transcript_breakpoint_index
 
-            for query_iv in rsa.genomic_region.intervals:
-                for subject_iv, transcript_set in locus.transcript_intervals[
-                    query_iv
-                ].steps():
-                    transcript_sets.append(transcript_set)
-            transcript_candidates = set.intersection(*transcript_sets)
-            transcripts = []
-            for tr in transcript_candidates:
-                try:
-                    tr.exons.map_to_local(rsa.genomic_region)
-                    transcripts.append(tr)
-                except ValueError:
+            for alignment in sf.fetch(locus.iv.chrom, locus.iv.start, locus.iv.end):
+                if alignment.is_unmapped:
+                    continue
+                aln_strand = "-" if alignment.is_reverse else "+"
+                if aln_strand != strand:
                     continue
 
-            if transcripts:
-                transcripts_ids = frozenset(tr.id for tr in transcripts)
-                ivs_tuple = tuple(
-                    (iv.start, iv.end) for iv in rsa.genomic_region.intervals
-                )
-                mapping = (rsa.untemplated_addition, rsa.unique(), ivs_tuple)
-                mappings_dict[mapping] += 1
-                transcripts_counts[transcripts_ids] += 1
-        read_list = []
-        for entry, count in mappings_dict.items():
-            rsa.untemplated_addition, uniq, ivs_tuple = entry
-            is_first_iv = True
-            for iv in ivs_tuple:
-                read_list.append(
-                    (
-                        is_first_iv,
-                        iv[0],
-                        iv[1],
-                        rsa.untemplated_addition,
-                        uniq,
-                        count,
-                    )
-                )
-                is_first_iv = False
-        df = pd.DataFrame(
-            read_list,
-            columns=[
-                "is_first_iv",
-                "start",
-                "end",
-                "untemplated_addition",
-                "unique",
-                "count",
-            ],
-        )
-        df["is_first_iv"] = df["is_first_iv"].astype(bool)
-        df["start"] = df["start"].astype(np.uint32)
-        df["end"] = df["end"].astype(np.uint32)
-        df["untemplated_addition"] = df["untemplated_addition"].astype(bool)
-        df["unique"] = df["unique"].astype(bool)
-        df["count"] = df["count"].astype(np.uint16)
+                rsa = RiboSeqAlignment.from_pysam(alignment)
 
-        reads_rows.append((locus.id, run_id, zlib.compress(dumps(df))))
-        transcript_count_rows.append(
-            (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
-        )
+                transcript_sets = []
+                for query_iv in rsa.genomic_region.intervals:
+                    i = bisect.bisect_right(bp_ends, query_iv.start)
+                    while i < len(bp_starts) and bp_starts[i] < query_iv.end:
+                        transcript_sets.append(bp_sets[i])
+                        i += 1
+
+                if not transcript_sets:
+                    continue
+
+                transcript_candidates = set.intersection(*transcript_sets)
+                transcripts = []
+                for tr in transcript_candidates:
+                    try:
+                        tr.exons.map_to_local(rsa.genomic_region)
+                        transcripts.append(tr)
+                    except ValueError:
+                        continue
+
+                if transcripts:
+                    transcripts_ids = frozenset(tr.id for tr in transcripts)
+                    ivs_tuple = tuple(
+                        (iv.start, iv.end) for iv in rsa.genomic_region.intervals
+                    )
+                    mapping = (rsa.untemplated_addition, rsa.unique(), ivs_tuple)
+                    mappings_dict[mapping] += 1
+                    transcripts_counts[transcripts_ids] += 1
+
+            read_list = []
+            for entry, count in mappings_dict.items():
+                ua, uniq, ivs_tuple = entry
+                is_first_iv = True
+                for iv in ivs_tuple:
+                    read_list.append(
+                        (
+                            is_first_iv,
+                            iv[0],
+                            iv[1],
+                            ua,
+                            uniq,
+                            count,
+                        )
+                    )
+                    is_first_iv = False
+            df = pd.DataFrame(
+                read_list,
+                columns=[
+                    "is_first_iv",
+                    "start",
+                    "end",
+                    "untemplated_addition",
+                    "unique",
+                    "count",
+                ],
+            )
+            df["is_first_iv"] = df["is_first_iv"].astype(bool)
+            df["start"] = df["start"].astype(np.uint32)
+            df["end"] = df["end"].astype(np.uint32)
+            df["untemplated_addition"] = df["untemplated_addition"].astype(bool)
+            df["unique"] = df["unique"].astype(bool)
+            df["count"] = df["count"].astype(np.uint16)
+
+            reads_rows.append((locus.id, run_id, zlib.compress(dumps(df))))
+            transcript_count_rows.append(
+                (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
+            )
 
     db = sql.connect(db_path, timeout=60)
     cur = db.cursor()

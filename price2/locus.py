@@ -12,6 +12,7 @@ Standalone helper functions for ORF detection and the optimisation
 
 from __future__ import annotations
 
+import bisect
 import math
 import os
 import sqlite3 as sql
@@ -226,6 +227,47 @@ class Locus:
     def __repr__(self) -> str:
         return f"Locus({self.iv})"
 
+    @property
+    def transcript_breakpoint_index(
+        self,
+    ) -> tuple[list[int], list[int], list[set]]:
+        """Lazily built sorted breakpoint index of ``transcript_intervals``.
+
+        Iterates the step-array once and caches three parallel lists:
+        ``bp_starts``, ``bp_ends``, and ``bp_sets`` (only non-empty steps).
+        Use :func:`bisect.bisect_right` on *bp_ends* to find overlapping
+        entries for a query ``[q_start, q_end)`` interval in O(log B)
+        instead of a full step-array traversal.
+
+        The cache is excluded from pickle (``__getstate__``) so it does not
+        inflate stored locus blobs.
+
+        Returns
+        -------
+        tuple[list[int], list[int], list[set]]
+            ``(bp_starts, bp_ends, bp_sets)`` — parallel lists over
+            all non-empty breakpoints, sorted by start position.
+        """
+        try:
+            return self._transcript_breakpoint_index
+        except AttributeError:
+            bp_starts: list[int] = []
+            bp_ends: list[int] = []
+            bp_sets: list[set] = []
+            for iv, ts in self.transcript_intervals.steps():
+                if ts:
+                    bp_starts.append(iv.start)
+                    bp_ends.append(iv.end)
+                    bp_sets.append(ts)
+            self._transcript_breakpoint_index = (bp_starts, bp_ends, bp_sets)
+            return self._transcript_breakpoint_index
+
+    def __getstate__(self) -> dict:
+        """Return pickle state, excluding the breakpoint index cache."""
+        state = self.__dict__.copy()
+        state.pop("_transcript_breakpoint_index", None)
+        return state
+
     def make_rgrs(
         self,
         genome: dict[str, HTSeq.Sequence],
@@ -383,9 +425,12 @@ class Locus:
 
         rgr_frame_covpos = set()
 
+        bp_starts, bp_ends, bp_sets = self.transcript_breakpoint_index
         for query_iv in rsa.genomic_region.intervals:
-            for subject_iv, tr_set in self.transcript_intervals[query_iv].steps():
-                overlap_transcripts &= tr_set
+            i = bisect.bisect_right(bp_ends, query_iv.start)
+            while i < len(bp_starts) and bp_starts[i] < query_iv.end:
+                overlap_transcripts &= bp_sets[i]
+                i += 1
 
         for tr in overlap_transcripts:
             try:
