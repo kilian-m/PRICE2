@@ -98,6 +98,9 @@ class Config:
         Apply a likelihood-ratio test as the final filtering step.
     likelihood_ratio_alpha : float
         Significance threshold for the likelihood-ratio test.
+    high_quality_runs_only : bool
+        When ``True``, exclude Ribo-seq runs whose cleavage model failed
+        quality checks (peak not at position 12 or peak probability < 0.3).
     save_memory : bool
         When ``True``, locus objects are not stored in the master process
         to reduce peak memory usage.
@@ -178,6 +181,7 @@ class Config:
     # ------------------------------------------------------------------ #
     likelihood_ratio_filter: bool = True
     likelihood_ratio_alpha: float = 1e-10
+    high_quality_runs_only: bool = False
     save_memory: bool = True
     log_level: str = "INFO"
 

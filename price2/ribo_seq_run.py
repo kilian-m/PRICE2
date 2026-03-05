@@ -19,8 +19,15 @@ import subprocess
 import numpy as np
 import pysam
 
-from price2.cleavage_model import CleavageEstimator, CleavageModel
-from price2.coverage_model import CoverageModel
+from price2.cleavage_model import CleavageEstimator, CleavageModel, _MIN_COUNTED_ALNS
+from price2.coverage_model import (
+    CoverageModel,
+    _MIN_READS,
+    _START_CODON_IDX,
+    _START_BODY_SLICE,
+    _STOP_PEAK_IDX,
+    _STOP_BODY_SLICE,
+)
 from price2.reference_annotation import ReferenceAnnotation
 
 logger = logging.getLogger(__name__)
@@ -57,6 +64,9 @@ class RiboSeqRun:
     cleavage_table : np.ndarray or None, optional
         Read-count table by (length, frame, UTA, condition) used for
         cleavage model estimation.
+    is_high_quality : bool, optional
+        Whether the cleavage model passed quality checks (peak at position 12
+        and peak probability >= 0.3).
     """
 
     def __init__(
@@ -68,6 +78,7 @@ class RiboSeqRun:
         cleavage_counted_reads: int = 0,
         cleavage_dist_starts: "np.ndarray | None" = None,
         cleavage_table: "np.ndarray | None" = None,
+        is_high_quality: bool = True,
     ) -> None:
         self.id = run_id
         self.cleavage_model = cleavage_model
@@ -76,6 +87,7 @@ class RiboSeqRun:
         self.cleavage_counted_reads = cleavage_counted_reads
         self.cleavage_dist_starts = cleavage_dist_starts
         self.cleavage_table = cleavage_table
+        self.is_high_quality = is_high_quality
 
     def __repr__(self) -> str:
         return f"RiboSeqRun(id={self.id!r}, read_count={self.read_count})"
@@ -96,6 +108,7 @@ def ribo_seq_runs_from_bams(
     ref_annotation: ReferenceAnnotation,
     processes: int = 32,
     log_level: str = "INFO",
+    high_quality_only: bool = False,
 ) -> list[RiboSeqRun]:
     """Build :class:`RiboSeqRun` objects from a collection of BAM files.
 
@@ -116,6 +129,10 @@ def ribo_seq_runs_from_bams(
         Parsed reference annotation used during model estimation.
     processes : int, optional
         Maximum number of worker processes.  Defaults to 32.
+    high_quality_only : bool, optional
+        If True, exclude runs whose cleavage model failed quality checks
+        (peak not at position 12 or peak probability < 0.3).  Defaults to
+        False.
 
     Returns
     -------
@@ -154,6 +171,16 @@ def ribo_seq_runs_from_bams(
         ribo_seq_runs = []
 
     os.rmdir(f"{wdir}/sample_bam")
+    if high_quality_only:
+        filtered = [r for r in ribo_seq_runs if r.is_high_quality]
+        excluded = [r for r in ribo_seq_runs if not r.is_high_quality]
+        if excluded:
+            logger.warning(
+                "Excluding %d low-quality run(s): %s",
+                len(excluded),
+                ", ".join(r.id for r in excluded),
+            )
+        return filtered
     return ribo_seq_runs
 
 
@@ -225,6 +252,22 @@ def ribo_seq_run_from_bam(
 
     os.remove(sample_bam_file)
 
+    max_pos = int(np.argmax(cleavage_model.pl))
+    max_prob = float(cleavage_model.pl[max_pos])
+    cleavage_ok = (
+        (max_pos == 12) and (max_prob >= 0.3) and (ce.counted_alns >= _MIN_COUNTED_ALNS)
+    )
+
+    start_hist = coverage_model.start_hist
+    stop_hist = coverage_model.stop_hist
+    coverage_ok = (
+        start_hist[_START_CODON_IDX] >= _MIN_READS
+        and start_hist[_START_BODY_SLICE].sum() >= _MIN_READS
+        and stop_hist[_STOP_PEAK_IDX] >= _MIN_READS
+        and stop_hist[_STOP_BODY_SLICE].sum() >= _MIN_READS
+    )
+    is_high_quality = cleavage_ok and coverage_ok
+
     return RiboSeqRun(
         run_id,
         cleavage_model,
@@ -233,4 +276,5 @@ def ribo_seq_run_from_bam(
         cleavage_counted_reads=ce.counted_alns,
         cleavage_dist_starts=ce.dist_starts.copy(),
         cleavage_table=ce.table.copy(),
+        is_high_quality=is_high_quality,
     )

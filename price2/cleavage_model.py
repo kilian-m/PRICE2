@@ -7,7 +7,6 @@ learns the model parameters from mapped Ribo-seq reads.
 
 import logging
 import pickle
-import warnings
 from functools import lru_cache
 from typing import Optional
 
@@ -21,6 +20,9 @@ from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
 logger = logging.getLogger(__name__)
+
+# Minimum number of alignments required for reliable cleavage model estimation.
+_MIN_COUNTED_ALNS: int = 100_000
 
 
 class CleavageModel:
@@ -599,7 +601,7 @@ class CleavageEstimator:
         max_considered_length: int = 40,
         min_dist_to_start: int = 30,
         min_dist_to_end: int = 30,
-        sufficient_counted_alns: int = 100_000,
+        sufficient_counted_alns: int = _MIN_COUNTED_ALNS,
     ) -> None:
         """Collect read-length / frame / UTA counts from a BAM file.
 
@@ -770,6 +772,20 @@ class CleavageEstimator:
         self.correct_max_pos(shift)
         if regularize:
             self.regularize()
+
+        max_pos = int(np.argmax(self.best_pl))
+        max_prob = float(self.best_pl[max_pos])
+        if max_pos != 12:
+            logger.warning(
+                "Unusual cleavage model: Upstream cleavage peak is at position %d, expected 12. ",
+                max_pos,
+            )
+        if max_prob < 0.3:
+            logger.warning(
+                "Low quality dataset: Upstream cleavage peak probability is %.3f",
+                max_prob,
+            )
+
         return CleavageModel(self.best_pl, self.best_pr, self.best_u)
 
     def regularize(self, keep_prob: float = 0.9) -> None:

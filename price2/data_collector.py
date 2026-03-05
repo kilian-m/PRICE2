@@ -119,6 +119,7 @@ class DataCollector:
             self.reference_annotation,
             self.config.processes,
             self.config.log_level,
+            high_quality_only=self.config.high_quality_runs_only,
         )
         self.runs += new_runs
 
