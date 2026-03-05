@@ -13,6 +13,7 @@ Standalone helper functions for ORF detection and the optimisation
 from __future__ import annotations
 
 import bisect
+import logging
 import math
 import os
 import sqlite3 as sql
@@ -23,6 +24,8 @@ from pickle import loads
 
 import HTSeq
 import numpy as np
+
+logger = logging.getLogger(__name__)
 import pandas as pd
 from filelock import FileLock
 from scipy.optimize import minimize

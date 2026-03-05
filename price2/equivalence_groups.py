@@ -8,6 +8,7 @@ deconvolution optimiser.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from enum import Enum, auto
 
@@ -15,6 +16,8 @@ import HTSeq
 
 from price2.coverage_model import CoveragePosition
 from price2.genomic_features import Transcript
+
+logger = logging.getLogger(__name__)
 
 
 class EquivalenceGroup:

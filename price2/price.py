@@ -10,8 +10,10 @@ from raw Ribo-seq BAM files to a table of active translons:
 """
 
 import argparse
+import logging
 import os
 import shutil
+import sys
 import time
 
 import HTSeq
@@ -23,19 +25,48 @@ from price2.orf_activity_estimator import ORFActivityEstimator
 from price2.reference_annotation import ReferenceAnnotation
 from price2.tpm import generate_tpm_output
 
+logger = logging.getLogger("price2.price")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+def setup_logging(config: Config) -> None:
+    """Configure the ``price2`` logger.
+
+    Attaches a :class:`logging.StreamHandler` writing to *stderr* to the
+    ``price2`` root logger.  The level is taken from
+    ``config.log_level`` (standard Python level name, e.g. ``"INFO"`` or
+    ``"DEBUG"``).
+
+    Parameters
+    ----------
+    config : Config
+        Fully populated configuration object.
+    """
+    price2_logger = logging.getLogger("price2")
+    price2_logger.setLevel(config.log_level)
+    price2_logger.propagate = False
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(config.log_level)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    price2_logger.addHandler(handler)
+
+
 def _timed(label: str, fn, *args, **kwargs):
-    """Run *fn* with *args*/*kwargs*, printing *label* and elapsed time.
+    """Run *fn* with *args*/*kwargs*, logging *label* and elapsed time.
 
     Parameters
     ----------
     label : str
-        Message printed before the call (without trailing newline).
+        Message logged before the call.
     fn : callable
         Function to call.
     *args, **kwargs
@@ -46,11 +77,11 @@ def _timed(label: str, fn, *args, **kwargs):
     object
         Whatever *fn* returns.
     """
-    print(label, end="", flush=True)
     start = time.time()
     result = fn(*args, **kwargs)
     elapsed = time.time() - start
-    print(f"{elapsed:.2e} seconds", flush=True)
+    if label:
+        logger.info("%s%.2e seconds", label, elapsed)
     return result
 
 
@@ -173,10 +204,11 @@ def run_pipeline(config: Config) -> None:
     n_runs = len(data_collector.runs)
     n_loci = len(orf_activity_estimator.loci_ids)
     n_proc = config.processes
-    print(
-        f"\nrun ORF deconvolution for {n_runs} run(s) and {n_loci} loci "
-        f"in {n_proc} process(es)... ",
-        flush=True,
+    logger.info(
+        "run ORF deconvolution for %d run(s) and %d loci in %d process(es)...",
+        n_runs,
+        n_loci,
+        n_proc,
     )
 
     _timed("", orf_activity_estimator.run_orf_deconvolution)
@@ -199,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
     """
     args = parse_args(argv)
     config = Config.make_config(config=args.config)
+    setup_logging(config)
     run_pipeline(config)
 
 

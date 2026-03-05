@@ -8,6 +8,8 @@ results.  Each locus is processed in an isolated worker process via
 """
 
 import glob
+import logging
+import logging.handlers
 import os
 import sqlite3 as sql
 import time
@@ -20,6 +22,7 @@ import pandas as pd
 from filelock import FileLock
 from pebble import ProcessPool
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from price2.equivalence_groups import make_equivalence_groups
 
@@ -27,6 +30,8 @@ from price2.equivalence_groups import make_equivalence_groups
 # required because numba JIT state and SQLite handles are not safe to
 # fork directly.
 mp.set_start_method("forkserver", force=True)
+
+logger = logging.getLogger(__name__)
 
 
 class ORFActivityEstimator:
@@ -102,35 +107,49 @@ class ORFActivityEstimator:
             loci_ids = loci_ids - processed_loc_ids
 
         loci_ids = list(loci_ids)
-        pbar = tqdm(total=len(loci_ids))
+        log_level_num = logging.getLevelName(self.config.log_level)
+        pbar = tqdm(total=len(loci_ids), disable=log_level_num > logging.INFO)
 
-        with ProcessPool(max_workers=self.config.processes, max_tasks=1) as pool:
-            futures = {
-                pool.schedule(
-                    process_loc,
-                    args=[(locus_id, self.config)],
-                    timeout=self.config.timeout,
-                ): locus_id
-                for locus_id in loci_ids
-            }
+        price2_logger = logging.getLogger("price2")
+        manager = mp.Manager()
+        log_queue = manager.Queue()
+        listener = logging.handlers.QueueListener(
+            log_queue, *price2_logger.handlers, respect_handler_level=True
+        )
+        listener.start()
+        try:
+            with ProcessPool(max_workers=self.config.processes, max_tasks=1) as pool:
+                futures = {
+                    pool.schedule(
+                        process_loc,
+                        args=[(locus_id, self.config, log_queue)],
+                        timeout=self.config.timeout,
+                    ): locus_id
+                    for locus_id in loci_ids
+                }
 
-            results = {}
-            for fut in as_completed(futures):
-                loc_id = futures[fut]
-                try:
-                    result = fut.result()
-                    if not self.config.save_memory:
-                        results[loc_id] = result
-                except (TimeoutError, Exception) as e:
-                    stack = traceback.format_exc()
-                    lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
-                    with lock:
-                        with open(f"{ra_dir}/failed_loci.txt", "a") as f:
-                            f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
-                    if not self.config.save_memory:
-                        results[loc_id] = e
-                finally:
-                    pbar.update(1)
+                results = {}
+                with logging_redirect_tqdm(loggers=[price2_logger]):
+                    for fut in as_completed(futures):
+                        loc_id = futures[fut]
+                        try:
+                            result = fut.result()
+                            if not self.config.save_memory:
+                                results[loc_id] = result
+                        except (TimeoutError, Exception) as e:
+                            stack = traceback.format_exc()
+                            logger.error("locus %s failed: %s", loc_id, e)
+                            lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
+                            with lock:
+                                with open(f"{ra_dir}/failed_loci.txt", "a") as f:
+                                    f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
+                            if not self.config.save_memory:
+                                results[loc_id] = e
+                        finally:
+                            pbar.update(1)
+        finally:
+            listener.stop()
+            manager.shutdown()
 
         pbar.close()
 
@@ -160,9 +179,11 @@ def process_loc(arguments: tuple):
     Parameters
     ----------
     arguments : tuple
-        A ``(locus_id, config)`` pair where *locus_id* is the string
-        identifier stored in the SQLite database and *config* is the
-        :class:`~price2.config.Config` instance.
+        A ``(locus_id, config, log_queue)`` triple where *locus_id* is
+        the string identifier stored in the SQLite database, *config* is
+        the :class:`~price2.config.Config` instance, and *log_queue* is
+        a :class:`multiprocessing.Queue` connected to the main-process
+        :class:`~logging.handlers.QueueListener`.
 
     Returns
     -------
@@ -170,7 +191,14 @@ def process_loc(arguments: tuple):
         ``(locus, performance_measurements)`` when
         ``config.save_memory`` is ``False``, otherwise ``None``.
     """
-    loc_id, config = arguments
+    loc_id, config, log_queue = arguments
+
+    # Route all price2 log records back to the main process.
+    worker_logger = logging.getLogger("price2")
+    if not worker_logger.handlers:
+        worker_logger.addHandler(logging.handlers.QueueHandler(log_queue))
+        worker_logger.setLevel(config.log_level)
+        worker_logger.propagate = False
 
     performance_measurements: dict = {}
     performance_measurements["loc_id"] = loc_id

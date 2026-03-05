@@ -101,6 +101,10 @@ class Config:
     save_memory : bool
         When ``True``, locus objects are not stored in the master process
         to reduce peak memory usage.
+    log_level : str
+        Logging verbosity level for the ``price2`` logger.  Accepts
+        standard Python level names (``"DEBUG"``, ``"INFO"``,
+        ``"WARNING"``, ``"ERROR"``, ``"CRITICAL"``).
     start_codons : tuple[str, ...]
         Codons accepted as translation start sites for ORF candidate
         generation.
@@ -175,6 +179,7 @@ class Config:
     likelihood_ratio_filter: bool = True
     likelihood_ratio_alpha: float = 1e-10
     save_memory: bool = True
+    log_level: str = "INFO"
 
     # ------------------------------------------------------------------ #
     # ORF candidate generation                                             #

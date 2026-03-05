@@ -1,9 +1,13 @@
 """Reference annotation loading and interval indexing from GTF files."""
 
+import logging
+
 import HTSeq
 
 from price2.genomic_region import GenomicRegion
 from price2.genomic_features import Transcript
+
+logger = logging.getLogger(__name__)
 
 
 class ReferenceAnnotation:
@@ -76,6 +80,8 @@ class ReferenceAnnotation:
 
         for transcript in self.transcripts.values():
             transcript.cds_regions_to_cds_intervals()
+
+        logger.info("Loaded %d transcripts from %s", len(self.transcripts), gtf_path)
 
     def collect_coding_transcripts(self, region: GenomicRegion) -> set[Transcript]:
         """Return all transcripts with a CDS overlapping *region*.

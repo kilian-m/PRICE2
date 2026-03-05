@@ -10,6 +10,8 @@ The module also provides helpers that construct
 BAM files are assumed to be coordinate-sorted and indexed.
 """
 
+import logging
+import logging.handlers
 import multiprocessing
 import os
 import subprocess
@@ -20,6 +22,17 @@ import pysam
 from price2.cleavage_model import CleavageEstimator, CleavageModel
 from price2.coverage_model import CoverageModel
 from price2.reference_annotation import ReferenceAnnotation
+
+logger = logging.getLogger(__name__)
+
+
+def _init_worker_logging(log_queue, log_level: str) -> None:
+    """Configure logging in a Pool worker process."""
+    worker_logger = logging.getLogger("price2")
+    if not worker_logger.handlers:
+        worker_logger.addHandler(logging.handlers.QueueHandler(log_queue))
+        worker_logger.setLevel(log_level)
+        worker_logger.propagate = False
 
 
 class RiboSeqRun:
@@ -82,6 +95,7 @@ def ribo_seq_runs_from_bams(
     wdir: str,
     ref_annotation: ReferenceAnnotation,
     processes: int = 32,
+    log_level: str = "INFO",
 ) -> list[RiboSeqRun]:
     """Build :class:`RiboSeqRun` objects from a collection of BAM files.
 
@@ -113,11 +127,29 @@ def ribo_seq_runs_from_bams(
 
     if bam_files:
         ctx = multiprocessing.get_context("forkserver")
-        with ctx.Pool(processes) as pool:
-            ribo_seq_runs: list[RiboSeqRun] = pool.starmap(
-                ribo_seq_run_from_bam,
-                [(bam_dir, bam_file, wdir, ref_annotation) for bam_file in bam_files],
-            )
+        price2_logger = logging.getLogger("price2")
+        manager = multiprocessing.Manager()
+        log_queue = manager.Queue()
+        listener = logging.handlers.QueueListener(
+            log_queue, *price2_logger.handlers, respect_handler_level=True
+        )
+        listener.start()
+        try:
+            with ctx.Pool(
+                processes,
+                initializer=_init_worker_logging,
+                initargs=(log_queue, log_level),
+            ) as pool:
+                ribo_seq_runs: list[RiboSeqRun] = pool.starmap(
+                    ribo_seq_run_from_bam,
+                    [
+                        (bam_dir, bam_file, wdir, ref_annotation)
+                        for bam_file in bam_files
+                    ],
+                )
+        finally:
+            listener.stop()
+            manager.shutdown()
     else:
         ribo_seq_runs = []
 

@@ -8,6 +8,7 @@ working directory (``price.db``).
 """
 
 import bisect
+import logging
 import os
 import HTSeq
 import pysam
@@ -24,6 +25,8 @@ from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
 from price2.locus import Locus
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class DataCollector:
@@ -80,6 +83,7 @@ class DataCollector:
         run not already stored in the database, and appends them to
         ``self.runs``.
         """
+        logger.info("Collecting Ribo-seq runs...")
         if self.config.bam_ids:
             bam_ids = set(self.config.bam_ids)
         else:
@@ -114,6 +118,7 @@ class DataCollector:
             self.config.w_dir,
             self.reference_annotation,
             self.config.processes,
+            self.config.log_level,
         )
         self.runs += new_runs
 
@@ -122,6 +127,7 @@ class DataCollector:
 
         db.commit()
         db.close()
+        logger.info("Collected %d Ribo-seq run(s).", len(self.runs))
 
     def collect_mappings(self) -> None:
         """Map reads from all runs to loci and persist results.
@@ -131,6 +137,7 @@ class DataCollector:
         :func:`collect_mappings_run` in parallel for any run whose mappings
         have not yet been stored.
         """
+        logger.info("Collecting read mappings...")
         db = sql.connect(self.db_path)
         cur = db.cursor()
         cur.execute(
@@ -182,6 +189,7 @@ class DataCollector:
                         self.loci_set,
                     )
                 )
+        logger.info("Read mappings collected.")
 
     def get_chromosome_order(self) -> None:
         """Set ``self.chr_order`` from the first BAM file found in ``bam_dir``.
@@ -287,6 +295,7 @@ class DataCollector:
         :meth:`~price2.locus.Locus.make_rgrs` to construct read-generating
         regions.  Serialises each non-empty locus to the ``loci`` table.
         """
+        logger.info("Generating ORF candidates and saving loci...")
         db = sql.connect(self.db_path)
         cur = db.cursor()
         num_runs = cur.execute("SELECT count(*) FROM runs").fetchone()[0]
@@ -383,6 +392,7 @@ class DataCollector:
 
         db.commit()
         db.close()
+        logger.info("Saved %d loci to database.", len(loci_ids_to_process))
 
 
 def collect_mappings_run(

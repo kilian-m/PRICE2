@@ -6,6 +6,7 @@ coverage.  The resulting scale factors are used to weight the expected
 coverage profile when deconvolving overlapping ORFs.
 """
 
+import logging
 import warnings
 from enum import Enum
 from typing import Optional
@@ -16,6 +17,8 @@ import numpy as np
 from price2.cleavage_model import CleavageModel, read_in_cds_likelihood
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -341,14 +344,17 @@ class CoverageModel:
         body_counts = hist[_START_BODY_SLICE]
 
         if peak_count < _MIN_READS:
-            warnings.warn(
-                f"Only {int(peak_count)} reads at start codon position. "
-                "Low evidence for coverage model."
+            logger.warning(
+                "Only %d reads at start codon position. "
+                "Low evidence for coverage model.",
+                int(peak_count),
             )
         if body_counts.sum() < _MIN_READS:
-            warnings.warn(
-                f"Only {int(body_counts.sum())} reads at middle codon positions. "
-                f"Low evidence for coverage model.  sample: {bam_path}"
+            logger.warning(
+                "Only %d reads at middle codon positions. "
+                "Low evidence for coverage model.  sample: %s",
+                int(body_counts.sum()),
+                bam_path,
             )
 
         with np.errstate(divide="raise"):
@@ -380,14 +386,18 @@ class CoverageModel:
         body_counts = hist[_STOP_BODY_SLICE]
 
         if peak_count < _MIN_READS:
-            warnings.warn(
-                f"Only {int(peak_count)} reads at stop codon position. "
-                f"Low evidence for coverage model.  sample: {bam_path}"
+            logger.warning(
+                "Only %d reads at stop codon position. "
+                "Low evidence for coverage model.  sample: %s",
+                int(peak_count),
+                bam_path,
             )
         if body_counts.sum() < _MIN_READS:
-            warnings.warn(
-                f"Only {int(body_counts.sum())} reads at middle codon positions. "
-                f"Low evidence for coverage model.  sample: {bam_path}"
+            logger.warning(
+                "Only %d reads at middle codon positions. "
+                "Low evidence for coverage model.  sample: %s",
+                int(body_counts.sum()),
+                bam_path,
             )
 
         with np.errstate(divide="raise"):

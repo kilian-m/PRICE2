@@ -4,10 +4,13 @@ Reads activity-based result files produced by the ORF deconvolution
 pipeline and writes corresponding files with TPM-normalised values.
 """
 
+import logging
 import os
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def generate_tpm_output(o_dir: str) -> None:

@@ -5,6 +5,7 @@ cleavage positions relative to the P-site) and an EM-based estimator that
 learns the model parameters from mapped Ribo-seq reads.
 """
 
+import logging
 import pickle
 import warnings
 from functools import lru_cache
@@ -18,6 +19,8 @@ from numba import njit
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
+
+logger = logging.getLogger(__name__)
 
 
 class CleavageModel:
@@ -712,15 +715,19 @@ class CleavageEstimator:
                         self.dist_starts[dist_to_start + 100] += 1
 
         if self.counted_alns < sufficient_counted_alns:
-            warnings.warn(
-                f"Not enough alignments counted: "
-                f"{self.counted_alns} < {sufficient_counted_alns} "
-                f"for {sample_bam_path}\n"
-                f"  not_unique: {self.not_unique}\n"
-                f"  not_countable: {self.not_countable}\n"
-                f"  outside_cds: {self.outside_cds}\n"
-                f"  bad_length: {self.bad_length}",
-                stacklevel=2,
+            logger.warning(
+                "Not enough alignments counted: %d < %d for %s\n"
+                "  not_unique: %d\n"
+                "  not_countable: %d\n"
+                "  outside_cds: %d\n"
+                "  bad_length: %d",
+                self.counted_alns,
+                sufficient_counted_alns,
+                sample_bam_path,
+                self.not_unique,
+                self.not_countable,
+                self.outside_cds,
+                self.bad_length,
             )
 
     def correct_table(self) -> None:
