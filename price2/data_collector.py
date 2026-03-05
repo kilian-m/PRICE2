@@ -25,114 +25,6 @@ from price2.locus import Locus
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.config import Config
 
-# ---------------------------------------------------------------------------
-# Per-worker globals for collect_loci parallelism
-# ---------------------------------------------------------------------------
-_worker_genome: dict | None = None
-_worker_config: Config | None = None
-_worker_min_explained_reads: float = 0.0
-
-
-def _init_collect_loci_worker(
-    genome: dict,
-    config: Config,
-    min_explained_reads: float,
-) -> None:
-    """Initialise per-process globals used by :func:`_process_locus_task`."""
-    global _worker_genome, _worker_config, _worker_min_explained_reads
-    _worker_genome = genome
-    _worker_config = config
-    _worker_min_explained_reads = min_explained_reads
-
-
-def _process_locus_task(
-    args: tuple,
-) -> tuple[str, bytes] | None:
-    """Greedy transcript selection and RGR generation for one locus.
-
-    Designed to run in a worker process via :class:`multiprocessing.Pool`.
-    Reads module-level globals set by :func:`_init_collect_loci_worker`.
-
-    Parameters
-    ----------
-    args : tuple
-        A 2-tuple of ``(locus, blobs)`` where
-
-        * ``locus`` – :class:`~price2.locus.Locus` to process.
-        * ``blobs`` – list of compressed pickled ``transcript_read_counts``
-          dicts (one per run) fetched from the database.
-
-    Returns
-    -------
-    tuple[str, bytes] or None
-        ``(locus_id, pickled_locus)`` when the locus has active transcripts,
-        ``None`` otherwise.
-    """
-    locus, blobs = args
-
-    # Aggregate transcript read counts across all runs.
-    transcript_read_counts: dict = {}
-    for blob in blobs:
-        for k, v in loads(zlib.decompress(blob)).items():
-            try:
-                transcript_read_counts[k] += v
-            except KeyError:
-                transcript_read_counts[k] = v
-
-    tr_ids = [t.id for t in locus.transcripts]
-    explaining_transcripts_reads_list: list = []
-
-    if tr_ids and transcript_read_counts:
-        n_tr = len(tr_ids)
-        n_rs = len(transcript_read_counts)
-        tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
-
-        M = np.zeros((n_rs, n_tr), dtype=bool)
-        counts = np.zeros(n_rs, dtype=np.float64)
-
-        for row_i, (read_set, count) in enumerate(transcript_read_counts.items()):
-            counts[row_i] = count
-            for member in read_set:
-                if member in tr_to_col:
-                    M[row_i, tr_to_col[member]] = True
-
-        while counts.sum() > 0:
-            weighted = M.T @ counts
-            best_col = int(np.argmax(weighted))
-            best_score = weighted[best_col]
-            if best_score == 0:
-                break
-            explaining_transcripts_reads_list.append((tr_ids[best_col], best_score))
-            counts[M[:, best_col]] = 0.0
-
-    transcripts_dict = {tr.id: tr for tr in locus.transcripts}
-
-    locus.keep_transcripts = [
-        transcripts_dict[tr_id]
-        for tr_id, count in explaining_transcripts_reads_list
-        if count > _worker_min_explained_reads
-    ]
-
-    locus.transcripts_number = len(locus.transcripts)
-    locus.transcripts = locus.keep_transcripts
-
-    new_tr_intervals = HTSeq.GenomicArray(
-        list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
-    )
-    for step_iv, step_set in locus.transcript_intervals.steps():
-        new_step_set = set()
-        for tr in step_set:
-            if tr in locus.transcripts:
-                new_step_set.add(tr)
-        new_tr_intervals[step_iv] = new_step_set
-
-    locus.transcript_intervals = new_tr_intervals
-
-    if locus.transcripts:
-        locus.make_rgrs(_worker_genome, _worker_config)
-        return (locus.id, dumps(locus))
-    return None
-
 
 class DataCollector:
     """Orchestrate data collection for PRICE2 deconvolution.
@@ -388,12 +280,12 @@ class DataCollector:
     def collect_loci(self) -> None:
         """Filter transcripts per locus and build read-generating regions.
 
-        Reads transcript read-count blobs from the database, then dispatches
-        per-locus work (greedy transcript selection and
-        :meth:`~price2.locus.Locus.make_rgrs`) to a
-        :class:`multiprocessing.Pool` — one task per locus.  Serialised loci
-        are written back to the ``loci`` table by the main process to avoid
-        SQLite concurrency issues.
+        Loads transcript read-count data from the database, greedily selects
+        transcripts that explain the most reads (above
+        ``config.min_explained_reads_per_run`` per run), prunes the transcript
+        set of each locus accordingly, and calls
+        :meth:`~price2.locus.Locus.make_rgrs` to construct read-generating
+        regions.  Serialises each non-empty locus to the ``loci`` table.
         """
         db = sql.connect(self.db_path)
         cur = db.cursor()
@@ -413,41 +305,82 @@ class DataCollector:
         }
         loci_ids_to_process = {loc.id for loc in self.loci_set} - processed_loci_ids
 
-        # Read all blobs upfront so the DB connection can be closed before
-        # spawning worker processes.
-        tasks: list[tuple] = []
         for loc_id in loci_ids_to_process:
             locus = loc_dict[loc_id]
-            rows = cur.execute(
-                """SELECT transcript_read_counts_blob FROM transcript_read_counts
+            cur.execute(
+                """SELECT * FROM transcript_read_counts
                         WHERE locus_id = ?""",
                 (locus.id,),
-            ).fetchall()
-            blobs = [row[0] for row in rows]
-            tasks.append((locus, blobs))
+            )
 
-        db.commit()
-        db.close()
+            # Aggregate transcript read counts across all runs.
+            transcript_read_counts: dict = {}
+            for entry in cur.fetchall():
+                for k, v in loads(zlib.decompress(entry[2])).items():
+                    try:
+                        transcript_read_counts[k] += v
+                    except KeyError:
+                        transcript_read_counts[k] = v
 
-        # Process each locus in parallel; genome is shared once via initializer.
-        # try:
-        n_workers = min(self.config.processes, max(1, len(tasks) // 8))
-        with Pool(
-            n_workers,
-            initializer=_init_collect_loci_worker,
-            initargs=(self.genome, self.config, min_explained_reads),
-        ) as p:
-            results = p.map(_process_locus_task, tasks)
-        # except AssertionError:
-        #     _init_collect_loci_worker(self.genome, self.config, min_explained_reads)
-        #     results = [_process_locus_task(task) for task in tasks]
+            tr_ids = [t.id for t in locus.transcripts]
 
-        # Write results back from the main process.
-        db = sql.connect(self.db_path)
-        cur = db.cursor()
-        for result in results:
-            if result is not None:
-                cur.execute("INSERT INTO loci VALUES (?, ?)", result)
+            explaining_transcripts_reads_list = []
+
+            if tr_ids and transcript_read_counts:
+                n_tr = len(tr_ids)
+                n_rs = len(transcript_read_counts)
+                tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
+
+                M = np.zeros((n_rs, n_tr), dtype=bool)
+                counts = np.zeros(n_rs, dtype=np.float64)
+
+                for row_i, (read_set, count) in enumerate(
+                    transcript_read_counts.items()
+                ):
+                    counts[row_i] = count
+                    for member in read_set:
+                        if member in tr_to_col:
+                            M[row_i, tr_to_col[member]] = True
+
+                while counts.sum() > 0:
+                    weighted = M.T @ counts
+                    best_col = int(np.argmax(weighted))
+                    best_score = weighted[best_col]
+                    if best_score == 0:
+                        break
+                    explaining_transcripts_reads_list.append(
+                        (tr_ids[best_col], best_score)
+                    )
+                    counts[M[:, best_col]] = 0.0
+
+            transcripts_dict = {tr.id: tr for tr in locus.transcripts}
+
+            locus.keep_transcripts = [
+                transcripts_dict[tr_id]
+                for tr_id, count in explaining_transcripts_reads_list
+                if count > min_explained_reads
+            ]
+
+            locus.transcripts_number = len(locus.transcripts)
+            locus.transcripts = locus.keep_transcripts
+
+            new_tr_intervals = HTSeq.GenomicArray(
+                list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
+            )
+
+            for step_iv, step_set in locus.transcript_intervals.steps():
+                new_step_set = set()
+                for tr in step_set:
+                    if tr in locus.transcripts:
+                        new_step_set.add(tr)
+                new_tr_intervals[step_iv] = new_step_set
+
+            locus.transcript_intervals = new_tr_intervals
+
+            if locus.transcripts:
+                locus.make_rgrs(self.genome, self.config)
+                cur.execute("INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus)))
+
         db.commit()
         db.close()
 
