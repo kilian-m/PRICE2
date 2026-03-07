@@ -54,10 +54,12 @@ class GenomicRegion:
         strand: Strand | None = None,
         df: pd.DataFrame | None = None,
         gi_string: str | None = None,
+        bed_line: str | None = None,
     ) -> None:
         """Create a ``GenomicRegion``.
 
-        Exactly one of *intervals*, *df*, or *gi_string* must be given.
+        Exactly one of *intervals*, *df*, *gi_string*, or *bed_line* must
+        be given.
 
         Parameters
         ----------
@@ -73,6 +75,12 @@ class GenomicRegion:
         gi_string : str | None
             Compact string representation, e.g.
             ``"chr1+:100-200|300-400"``.
+        bed_line : str | None
+            A single tab-separated BED line.  BED6 (6 columns) produces a
+            single-exon region; BED12 (12 columns) produces a multi-exonic
+            region from the block columns.  Coordinates are 0-based
+            half-open as per the BED specification.  Strand defaults to
+            ``'+'`` when the strand column is absent (BED3/BED4/BED5).
         """
         if df is not None:
             intervals = [
@@ -94,6 +102,31 @@ class GenomicRegion:
                 HTSeq.GenomicInterval(chrom, int(start), int(end), strand)
                 for start, end in (x.split("-") for x in intervals_str.split("|"))
             ]
+            self.chrom = chrom
+            self.strand = strand
+        elif bed_line is not None:
+            fields = bed_line.rstrip("\n").split("\t")
+            chrom = fields[0]
+            chrom_start = int(fields[1])
+            chrom_end = int(fields[2])
+            strand = fields[5] if len(fields) > 5 else "+"
+            if len(fields) >= 12:
+                block_count = int(fields[9])
+                block_sizes = [int(x) for x in fields[10].rstrip(",").split(",")]
+                block_starts = [int(x) for x in fields[11].rstrip(",").split(",")]
+                intervals = [
+                    HTSeq.GenomicInterval(
+                        chrom,
+                        chrom_start + block_starts[i],
+                        chrom_start + block_starts[i] + block_sizes[i],
+                        strand,
+                    )
+                    for i in range(block_count)
+                ]
+            else:
+                intervals = [
+                    HTSeq.GenomicInterval(chrom, chrom_start, chrom_end, strand)
+                ]
             self.chrom = chrom
             self.strand = strand
         else:
