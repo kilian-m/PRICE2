@@ -182,7 +182,9 @@ class Config:
     likelihood_ratio_filter: bool = True
     likelihood_ratio_alpha: float = 1e-10
     high_quality_runs_only: bool = False
-    save_memory: bool = True
+    save_memory: bool = (
+        True  # Do not disable this in normal mode, it can clog the pipe shifting results from workers to the master process and cause deadlocks. only use with few workers
+    )
     log_level: str = "INFO"
 
     # ------------------------------------------------------------------ #

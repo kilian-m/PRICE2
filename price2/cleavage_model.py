@@ -42,10 +42,19 @@ class CleavageModel:
         Probability of an untemplated addition.
     """
 
-    def __init__(self, pl: np.ndarray, pr: np.ndarray, pu: float) -> None:
+    def __init__(
+        self,
+        pl: np.ndarray,
+        pr: np.ndarray,
+        pu: float,
+        dist_starts: Optional[np.ndarray] = None,
+        table: Optional[np.ndarray] = None,
+    ) -> None:
         self.pl = pl
         self.pr = pr
         self.pu = pu
+        self.dist_starts = dist_starts
+        self.table = table
         self.cds_lut = np.zeros(
             (len(self.pl) + len(self.pr) + 3, 3, 2), dtype=np.float64
         )
@@ -367,6 +376,156 @@ class CleavageModel:
         )
         ax.set_xlabel("position relative to P-site")
         ax.set_ylabel("cleavage probability")
+
+    def plot_full(
+        self, fig: Optional[plt.Figure] = None
+    ) -> plt.Figure:
+        """Plot a 3-panel diagnostic figure for the cleavage model.
+
+        Panel 1: left/right cleavage distributions and UTA probability.
+        Panel 2: P-site read-start distance to CDS start histogram
+                 (requires ``dist_starts`` attribute).
+        Panel 3: read-length / reading-frame count table
+                 (requires ``table`` attribute).
+
+        Parameters
+        ----------
+        fig : matplotlib.figure.Figure or None, optional
+            Figure to draw on.  A new 3-axes figure is created when *None*.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the three panels.
+        """
+        if fig is None:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        else:
+            axes = fig.axes
+
+        ax0, ax1, ax2 = axes[0], axes[1], axes[2]
+
+        # Panel 1: read length / frame distribution
+        if self.table is not None:
+            lo, hi = 20, min(40, self.table.shape[0])
+            x = np.arange(lo, hi)
+            bar_w = 0.25
+            ax0.bar(x - bar_w, self.table[lo:hi, 0, 0, 0], bar_w, label="frame 0")
+            ax0.bar(x, self.table[lo:hi, 1, 0, 0], bar_w, label="frame 1")
+            ax0.bar(x + bar_w, self.table[lo:hi, 2, 0, 0], bar_w, label="frame 2")
+            ax0.set_xlabel("read length")
+            ax0.set_ylabel("read count")
+            ax0.set_title("read length / frame distribution")
+            ax0.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+            ax0.legend()
+        else:
+            ax0.set_visible(False)
+
+        # Panel 2: P-site distribution around CDS start
+        if self.dist_starts is not None:
+            x = np.arange(len(self.dist_starts)) - 100
+            ax1.bar(x, self.dist_starts, width=1, color="steelblue")
+            ax1.set_xlabel("read-start position relative to CDS start")
+            ax1.set_ylabel("read count")
+            ax1.set_title("P-site around CDS start")
+            ax1.set_xlim(-50, 50)
+            p_site_offset = int(np.argmax(self.pl))
+            ax1.bar(
+                -p_site_offset,
+                self.dist_starts[-p_site_offset + 100],
+                width=1,
+                color="tab:red",
+            )
+            ax1.text(
+                0.58,
+                0.95,
+                f"most frequent distance of\nread start to CDS start"
+                f" = {p_site_offset}",
+                transform=ax1.transAxes,
+                ha="left",
+                va="top",
+                fontsize=10,
+                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+            )
+        else:
+            ax1.set_visible(False)
+
+        # Panel 3: cleavage distributions
+        self.plot(ax=ax2)
+        ax2.set_title("Cleavage distributions")
+
+        return fig
+
+    #: TSV header line produced by :meth:`to_tsv_line`.
+    TSV_HEADER: str = "dataset_id\tpu\tcounted_reads\tpl\tpr"
+
+    def to_tsv_line(self, dataset_id: str, counted_reads: int = 0) -> str:
+        """Serialise the model to a single TSV line.
+
+        The line ends with ``\\n`` and can be written directly to a file
+        whose first line is :attr:`TSV_HEADER`.
+
+        Parameters
+        ----------
+        dataset_id : str
+            Sample identifier placed in the first column.
+        counted_reads : int, optional
+            Number of reads used during estimation (default 0).
+
+        Returns
+        -------
+        str
+            Tab-separated line encoding ``dataset_id``, ``pu``,
+            ``counted_reads``, ``pl`` and ``pr``.
+        """
+        pl_str = ",".join(f"{v:.6g}" for v in self.pl)
+        pr_str = ",".join(f"{v:.6g}" for v in self.pr)
+        return f"{dataset_id}\t{self.pu:.6g}\t{counted_reads}\t{pl_str}\t{pr_str}\n"
+
+    @classmethod
+    def from_tsv_line(cls, line: str) -> "tuple[str, CleavageModel]":
+        """Reconstruct a model from a single TSV line.
+
+        The line must follow the format produced by :meth:`to_tsv_line`.
+
+        Parameters
+        ----------
+        line : str
+            A data row (not the header line).
+
+        Returns
+        -------
+        tuple[str, CleavageModel]
+            ``(dataset_id, model)``.
+        """
+        dataset_id, pu_str, _counted, pl_str, pr_str = line.strip().split("\t")
+        pu = float(pu_str)
+        pl = np.array([float(v) for v in pl_str.split(",")])
+        pr = np.array([float(v) for v in pr_str.split(",")])
+        return dataset_id, cls(pl, pr, pu)
+
+    @classmethod
+    def from_tsv(cls, path: str) -> "dict[str, CleavageModel]":
+        """Load all models from a TSV file written by
+        :func:`~price2.dataset_models.save_dataset_models`.
+
+        Parameters
+        ----------
+        path : str
+            Path to the ``cleavage_models.tsv`` file.
+
+        Returns
+        -------
+        dict[str, CleavageModel]
+            Mapping of dataset identifier to the reconstructed model.
+        """
+        models: dict[str, CleavageModel] = {}
+        with open(path) as fh:
+            next(fh)  # skip header
+            for line in fh:
+                dataset_id, model = cls.from_tsv_line(line)
+                models[dataset_id] = model
+        return models
 
     @lru_cache(maxsize=None)
     def shift(self, read_length: int, oua: bool, frame: int) -> int:
@@ -786,7 +945,15 @@ class CleavageEstimator:
                 max_prob,
             )
 
-        return CleavageModel(self.best_pl, self.best_pr, self.best_u)
+        dist_starts = getattr(self, "dist_starts", None)
+        table = getattr(self, "table", None)
+        return CleavageModel(
+            self.best_pl,
+            self.best_pr,
+            self.best_u,
+            dist_starts=dist_starts.copy() if dist_starts is not None else None,
+            table=table.copy() if table is not None else None,
+        )
 
     def regularize(self, keep_prob: float = 0.9) -> None:
         """Zero out low-probability entries and re-normalise.

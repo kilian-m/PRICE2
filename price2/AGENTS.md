@@ -110,7 +110,7 @@ def estimate_activities(
 ```
 
 ### Performance-Sensitive Code
-- The deconvolution core (`locus.py`) uses **`scipy.sparse` CSR matrices** and BLAS-backed `X.T @ r` operations — do not reintroduce Numba here
+- The deconvolution core (`locus.py`) uses **`scipy.sparse` CSR matrices** and BLAS-backed `X.T @ r` operations
 - Prefer pure numpy/scipy vectorized operations for all numerical code
 - Current parallelism uses pebble ProcessPool with forkserver start method; any approach that works is acceptable
 

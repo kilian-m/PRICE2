@@ -274,7 +274,5 @@ def ribo_seq_run_from_bam(
         coverage_model,
         read_count=read_count,
         cleavage_counted_reads=ce.counted_alns,
-        cleavage_dist_starts=ce.dist_starts.copy(),
-        cleavage_table=ce.table.copy(),
         is_high_quality=is_high_quality,
     )

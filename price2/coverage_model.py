@@ -11,6 +11,7 @@ import warnings
 from enum import Enum
 from typing import Optional
 
+import matplotlib.pyplot as plt
 import pysam
 import numpy as np
 
@@ -408,9 +409,195 @@ class CoverageModel:
 
         return max(1.0, factor)
 
+    #: TSV header line produced by :meth:`to_tsv_line`.
+    TSV_HEADER: str = "dataset_id\tstart_factor\tstop_factor\tstart_hist\tstop_hist"
+
+    def to_tsv_line(self, dataset_id: str) -> str:
+        """Serialise the model to a single TSV line.
+
+        The histograms are stored as comma-separated floating-point
+        values.  The line ends with ``\\n`` and can be written directly
+        to a file whose first line is :attr:`TSV_HEADER`.
+
+        Parameters
+        ----------
+        dataset_id : str
+            Sample identifier placed in the first column.
+
+        Returns
+        -------
+        str
+            Tab-separated line encoding ``dataset_id``,
+            ``start_factor``, ``stop_factor``, ``start_hist`` and
+            ``stop_hist``.
+        """
+        start_str = ",".join(f"{v:.6g}" for v in self.start_hist)
+        stop_str = ",".join(f"{v:.6g}" for v in self.stop_hist)
+        return (
+            f"{dataset_id}\t{self.start_factor:.6g}\t{self.stop_factor:.6g}"
+            f"\t{start_str}\t{stop_str}\n"
+        )
+
+    @classmethod
+    def from_tsv_line(cls, line: str) -> "tuple[str, CoverageModel]":
+        """Reconstruct a model from a single TSV line.
+
+        The line must follow the format produced by :meth:`to_tsv_line`.
+
+        Parameters
+        ----------
+        line : str
+            A data row (not the header line).
+
+        Returns
+        -------
+        tuple[str, CoverageModel]
+            ``(dataset_id, model)``.
+        """
+        dataset_id, start_factor_str, stop_factor_str, start_str, stop_str = (
+            line.strip().split("\t")
+        )
+        start_hist = np.array([float(v) for v in start_str.split(",")])
+        stop_hist = np.array([float(v) for v in stop_str.split(",")])
+        return dataset_id, cls.from_histograms(start_hist, stop_hist, run_id=dataset_id)
+
+    @classmethod
+    def from_tsv(cls, path: str) -> "dict[str, CoverageModel]":
+        """Load all models from a TSV file written by
+        :func:`~price2.dataset_models.save_dataset_models`.
+
+        Parameters
+        ----------
+        path : str
+            Path to the ``coverage_models.tsv`` file.
+
+        Returns
+        -------
+        dict[str, CoverageModel]
+            Mapping of dataset identifier to the reconstructed model.
+        """
+        models: dict[str, CoverageModel] = {}
+        with open(path) as fh:
+            next(fh)  # skip header
+            for line in fh:
+                dataset_id, model = cls.from_tsv_line(line)
+                models[dataset_id] = model
+        return models
+
+    # ------------------------------------------------------------------
+    # Alternative constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_histograms(
+        cls,
+        start_hist: np.ndarray,
+        stop_hist: np.ndarray,
+        run_id: str = "",
+    ) -> "CoverageModel":
+        """Construct a CoverageModel from pre-computed P-site histograms.
+
+        Skips BAM file I/O; derives the start and stop enrichment factors
+        directly from the supplied histograms.  Use this to reconstruct a
+        model from saved data (e.g. a ``.npz`` file produced by
+        :func:`~price2.dataset_models.save_dataset_models`).
+
+        Parameters
+        ----------
+        start_hist : np.ndarray
+            P-site count histogram around the start codon, shape
+            ``(_HIST_SIZE,)``.  Index ``_START_CODON_IDX`` corresponds to
+            CDS position 0.
+        stop_hist : np.ndarray
+            P-site count histogram around the stop codon, shape
+            ``(_HIST_SIZE,)``.  Index ``_STOP_PEAK_IDX`` corresponds to
+            the last sense codon.
+        run_id : str, optional
+            Sample identifier used in warning messages.
+
+        Returns
+        -------
+        CoverageModel
+            Model with ``start_hist``, ``stop_hist``, ``start_factor``, and
+            ``stop_factor`` set.
+        """
+        instance = cls.__new__(cls)
+        instance.start_hist = start_hist
+        instance.stop_hist = stop_hist
+        instance.start_factor = cls._compute_start_factor(start_hist, run_id)
+        instance.stop_factor = cls._compute_stop_factor(stop_hist, run_id)
+        return instance
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def plot(
+        self,
+        axes: Optional[tuple] = None,
+    ) -> plt.Figure:
+        """Plot the start- and stop-codon P-site histograms.
+
+        Two side-by-side panels: CDS start (left) and CDS stop (right).
+        Each panel highlights the peak position in red and annotates the
+        corresponding enrichment factor.
+
+        Parameters
+        ----------
+        axes : tuple of (Axes, Axes) or None, optional
+            A ``(ax_start, ax_stop)`` tuple to draw on.  A new figure is
+            created when *None*.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the two panels.
+        """
+        if axes is None:
+            fig, (ax_start, ax_stop) = plt.subplots(1, 2, figsize=(14, 5))
+        else:
+            ax_start, ax_stop = axes
+            fig = ax_start.get_figure()
+
+        # Start-codon histogram
+        x_start = np.arange(_HIST_SIZE) - _START_CODON_IDX
+        colors_start = np.where(x_start == 0, "tab:red", "steelblue")
+        ax_start.bar(x_start, self.start_hist, width=1, color=colors_start)
+        ax_start.set_xlabel("CDS position relative to start codon")
+        ax_start.set_ylabel("P-site read count")
+        ax_start.set_title("CDS start")
+        ax_start.set_xlim(-35, 205)
+        ax_start.text(
+            0.95,
+            0.95,
+            f"start factor = {self.start_factor:.2f}",
+            transform=ax_start.transAxes,
+            ha="right",
+            va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+        # Stop-codon histogram
+        x_stop = np.arange(_HIST_SIZE) - _STOP_HIST_OFFSET
+        colors_stop = np.where(x_stop == -3, "tab:red", "steelblue")
+        ax_stop.bar(x_stop, self.stop_hist, width=1, color=colors_stop)
+        ax_stop.set_xlabel("CDS position relative to CDS end")
+        ax_stop.set_ylabel("P-site read count")
+        ax_stop.set_title("CDS stop")
+        ax_stop.set_xlim(-205, 35)
+        ax_stop.text(
+            0.3,
+            0.95,
+            f"stop factor = {self.stop_factor:.2f}",
+            transform=ax_stop.transAxes,
+            ha="right",
+            va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+        return fig
 
     def get_coverage_factor(self, position: CoveragePosition) -> float:
         """Return the coverage scale factor for *position*.

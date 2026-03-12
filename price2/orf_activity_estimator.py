@@ -31,6 +31,14 @@ from price2.equivalence_groups import make_equivalence_groups
 # fork directly.
 mp.set_start_method("forkserver", force=True)
 
+# Increase pebble's channel lock timeout.  The default is 60 s; with
+# forkserver and many workers (e.g. 80) the result-pipe mutex can be
+# contended long enough to exceed that, causing workers to exit with
+# code 1 ("Abnormal termination").  600 s gives ample headroom.
+from pebble.common import CONSTS as _pebble_consts
+
+_pebble_consts.channel_lock_timeout = 600
+
 logger = logging.getLogger(__name__)
 
 
