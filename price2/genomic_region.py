@@ -228,6 +228,7 @@ class GenomicRegion:
         j = 0
         cum_len = 0  # cumulative spliced length of self-intervals before index j
         prev_j = None
+        prev_other_end = None
         local_start = None
         local_end = None
 
@@ -259,6 +260,19 @@ class GenomicRegion:
                     "Other region spans a junction not present in this region."
                 )
 
+            # Junction boundary check: when consecutive other-intervals
+            # map to consecutive self-intervals, the splice sites must
+            # align exactly.
+            if prev_j is not None and j == prev_j + 1:
+                if prev_other_end != self.intervals[prev_j].end:
+                    raise ValueError(
+                        "Read junction does not match reference exon boundary."
+                    )
+                if a != x:
+                    raise ValueError(
+                        "Read junction does not match reference exon boundary."
+                    )
+
             offset_start = cum_len + (a - x)
             offset_end = cum_len + (b - x)
 
@@ -266,6 +280,7 @@ class GenomicRegion:
                 local_start = offset_start
             local_end = offset_end
             prev_j = j
+            prev_other_end = b
 
         # For negative strand, local position 0 is the 5' end (highest
         # genomic coordinate), so flip the chromosome-order offsets.

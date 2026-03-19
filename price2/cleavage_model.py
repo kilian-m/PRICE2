@@ -53,8 +53,10 @@ class CleavageModel:
         self.pl = pl
         self.pr = pr
         self.pu = pu
-        self.dist_starts = dist_starts
-        self.table = table
+        if dist_starts is not None:
+            self.dist_starts = dist_starts
+        if table is not None:
+            self.table = table
         self.cds_lut = np.zeros(
             (len(self.pl) + len(self.pr) + 3, 3, 2), dtype=np.float64
         )
@@ -377,9 +379,7 @@ class CleavageModel:
         ax.set_xlabel("position relative to P-site")
         ax.set_ylabel("cleavage probability")
 
-    def plot_full(
-        self, fig: Optional[plt.Figure] = None
-    ) -> plt.Figure:
+    def plot_full(self, fig: Optional[plt.Figure] = None) -> plt.Figure:
         """Plot a 3-panel diagnostic figure for the cleavage model.
 
         Panel 1: left/right cleavage distributions and UTA probability.
@@ -406,49 +406,42 @@ class CleavageModel:
         ax0, ax1, ax2 = axes[0], axes[1], axes[2]
 
         # Panel 1: read length / frame distribution
-        if self.table is not None:
-            lo, hi = 20, min(40, self.table.shape[0])
-            x = np.arange(lo, hi)
-            bar_w = 0.25
-            ax0.bar(x - bar_w, self.table[lo:hi, 0, 0, 0], bar_w, label="frame 0")
-            ax0.bar(x, self.table[lo:hi, 1, 0, 0], bar_w, label="frame 1")
-            ax0.bar(x + bar_w, self.table[lo:hi, 2, 0, 0], bar_w, label="frame 2")
-            ax0.set_xlabel("read length")
-            ax0.set_ylabel("read count")
-            ax0.set_title("read length / frame distribution")
-            ax0.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-            ax0.legend()
-        else:
-            ax0.set_visible(False)
+        lo, hi = 20, min(40, self.table.shape[0])
+        x = np.arange(lo, hi)
+        bar_w = 0.25
+        ax0.bar(x - bar_w, self.table[lo:hi, 0, 0, 0], bar_w, label="frame 0")
+        ax0.bar(x, self.table[lo:hi, 1, 0, 0], bar_w, label="frame 1")
+        ax0.bar(x + bar_w, self.table[lo:hi, 2, 0, 0], bar_w, label="frame 2")
+        ax0.set_xlabel("read length")
+        ax0.set_ylabel("read count")
+        ax0.set_title("read length / frame distribution")
+        ax0.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+        ax0.legend()
 
         # Panel 2: P-site distribution around CDS start
-        if self.dist_starts is not None:
-            x = np.arange(len(self.dist_starts)) - 100
-            ax1.bar(x, self.dist_starts, width=1, color="steelblue")
-            ax1.set_xlabel("read-start position relative to CDS start")
-            ax1.set_ylabel("read count")
-            ax1.set_title("P-site around CDS start")
-            ax1.set_xlim(-50, 50)
-            p_site_offset = int(np.argmax(self.pl))
-            ax1.bar(
-                -p_site_offset,
-                self.dist_starts[-p_site_offset + 100],
-                width=1,
-                color="tab:red",
-            )
-            ax1.text(
-                0.58,
-                0.95,
-                f"most frequent distance of\nread start to CDS start"
-                f" = {p_site_offset}",
-                transform=ax1.transAxes,
-                ha="left",
-                va="top",
-                fontsize=10,
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-            )
-        else:
-            ax1.set_visible(False)
+        x = np.arange(len(self.dist_starts)) - 100
+        ax1.bar(x, self.dist_starts, width=1, color="steelblue")
+        ax1.set_xlabel("read-start position relative to CDS start")
+        ax1.set_ylabel("read count")
+        ax1.set_title("P-site around CDS start")
+        ax1.set_xlim(-50, 50)
+        p_site_offset = int(np.argmax(self.pl))
+        ax1.bar(
+            -p_site_offset,
+            self.dist_starts[-p_site_offset + 100],
+            width=1,
+            color="tab:red",
+        )
+        ax1.text(
+            0.58,
+            0.95,
+            f"most frequent distance of\nread start to CDS start" f" = {p_site_offset}",
+            transform=ax1.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
 
         # Panel 3: cleavage distributions
         self.plot(ax=ax2)
@@ -456,63 +449,55 @@ class CleavageModel:
 
         return fig
 
-    #: TSV header line produced by :meth:`to_tsv_line`.
-    TSV_HEADER: str = "dataset_id\tpu\tcounted_reads\tpl\tpr"
+    #: TSV header line produced by :meth:`to_files`.
+    TSV_HEADER: str = "dataset_id\tpu\tpl\tpr"
 
-    def to_tsv_line(self, dataset_id: str, counted_reads: int = 0) -> str:
-        """Serialise the model to a single TSV line.
+    def to_files(
+        self,
+        dataset_id: str,
+        tsv_fh,
+        npz_data: Optional[dict[str, np.ndarray]] = None,
+    ) -> None:
+        """Write the model to open file handles.
 
-        The line ends with ``\\n`` and can be written directly to a file
-        whose first line is :attr:`TSV_HEADER`.
+        Appends one TSV line with the obligatory attributes to *tsv_fh*.
+        If *npz_data* is provided, optional arrays (``dist_starts``,
+        ``table``) are added to the dict for later ``np.savez``.
 
         Parameters
         ----------
         dataset_id : str
-            Sample identifier placed in the first column.
-        counted_reads : int, optional
-            Number of reads used during estimation (default 0).
-
-        Returns
-        -------
-        str
-            Tab-separated line encoding ``dataset_id``, ``pu``,
-            ``counted_reads``, ``pl`` and ``pr``.
+            Sample identifier placed in the first TSV column.
+        tsv_fh : file-like
+            Writable text file handle (header already written).
+        npz_data : dict[str, np.ndarray] or None, optional
+            Accumulator dict for optional arrays.
         """
         pl_str = ",".join(f"{v:.6g}" for v in self.pl)
         pr_str = ",".join(f"{v:.6g}" for v in self.pr)
-        return f"{dataset_id}\t{self.pu:.6g}\t{counted_reads}\t{pl_str}\t{pr_str}\n"
+        tsv_fh.write(f"{dataset_id}\t{self.pu:.6g}\t{pl_str}\t{pr_str}\n")
+
+        if npz_data is not None:
+            if hasattr(self, "dist_starts"):
+                npz_data[f"{dataset_id}_dist_starts"] = self.dist_starts
+            if hasattr(self, "table"):
+                npz_data[f"{dataset_id}_table"] = self.table
 
     @classmethod
-    def from_tsv_line(cls, line: str) -> "tuple[str, CleavageModel]":
-        """Reconstruct a model from a single TSV line.
-
-        The line must follow the format produced by :meth:`to_tsv_line`.
+    def from_files(
+        cls, tsv_path: str, npz_path: Optional[str] = None
+    ) -> "dict[str, CleavageModel]":
+        """Load models from a TSV file and optionally an NPZ file.
 
         Parameters
         ----------
-        line : str
-            A data row (not the header line).
-
-        Returns
-        -------
-        tuple[str, CleavageModel]
-            ``(dataset_id, model)``.
-        """
-        dataset_id, pu_str, _counted, pl_str, pr_str = line.strip().split("\t")
-        pu = float(pu_str)
-        pl = np.array([float(v) for v in pl_str.split(",")])
-        pr = np.array([float(v) for v in pr_str.split(",")])
-        return dataset_id, cls(pl, pr, pu)
-
-    @classmethod
-    def from_tsv(cls, path: str) -> "dict[str, CleavageModel]":
-        """Load all models from a TSV file written by
-        :func:`~price2.dataset_models.save_dataset_models`.
-
-        Parameters
-        ----------
-        path : str
-            Path to the ``cleavage_models.tsv`` file.
+        tsv_path : str
+            Path to the ``cleavage_models.tsv`` file (obligatory
+            attributes: ``pl``, ``pr``, ``pu``).
+        npz_path : str or None, optional
+            Path to the ``cleavage_models.npz`` file.  When provided,
+            optional attributes (``dist_starts``, ``table``) are
+            attached to the corresponding models.
 
         Returns
         -------
@@ -520,11 +505,26 @@ class CleavageModel:
             Mapping of dataset identifier to the reconstructed model.
         """
         models: dict[str, CleavageModel] = {}
-        with open(path) as fh:
+        with open(tsv_path) as fh:
             next(fh)  # skip header
             for line in fh:
-                dataset_id, model = cls.from_tsv_line(line)
-                models[dataset_id] = model
+                parts = line.strip().split("\t")
+                dataset_id = parts[0]
+                pu = float(parts[1])
+                pl = np.array([float(v) for v in parts[2].split(",")])
+                pr = np.array([float(v) for v in parts[3].split(",")])
+                models[dataset_id] = cls(pl, pr, pu)
+
+        if npz_path is not None:
+            data = np.load(npz_path)
+            for dataset_id, model in models.items():
+                key_ds = f"{dataset_id}_dist_starts"
+                key_t = f"{dataset_id}_table"
+                if key_ds in data:
+                    model.dist_starts = data[key_ds]
+                if key_t in data:
+                    model.table = data[key_t]
+
         return models
 
     @lru_cache(maxsize=None)

@@ -58,12 +58,6 @@ class RiboSeqRun:
         Total number of mapped reads in the original BAM file.
     cleavage_counted_reads : int, optional
         Number of reads used for cleavage model estimation.
-    cleavage_dist_starts : np.ndarray or None, optional
-        Histogram of read-start distances to CDS start, shape (200,).
-        Index ``i`` corresponds to distance ``i - 100``.
-    cleavage_table : np.ndarray or None, optional
-        Read-count table by (length, frame, UTA, condition) used for
-        cleavage model estimation.
     is_high_quality : bool, optional
         Whether the cleavage model passed quality checks (peak at position 12
         and peak probability >= 0.3).
@@ -76,8 +70,6 @@ class RiboSeqRun:
         coverage_model: CoverageModel,
         read_count: int = 0,
         cleavage_counted_reads: int = 0,
-        cleavage_dist_starts: "np.ndarray | None" = None,
-        cleavage_table: "np.ndarray | None" = None,
         is_high_quality: bool = True,
     ) -> None:
         self.id = run_id
@@ -85,8 +77,6 @@ class RiboSeqRun:
         self.coverage_model = coverage_model
         self.read_count = read_count
         self.cleavage_counted_reads = cleavage_counted_reads
-        self.cleavage_dist_starts = cleavage_dist_starts
-        self.cleavage_table = cleavage_table
         self.is_high_quality = is_high_quality
 
     def __repr__(self) -> str:
@@ -244,7 +234,7 @@ def ribo_seq_run_from_bam(
     cleavage_model = ce.run()
 
     # Estimate the coverage model.
-    coverage_model = CoverageModel(
+    coverage_model = CoverageModel.from_bam(
         ref_annotation,
         sample_bam_file,
         cleavage_model,
@@ -276,3 +266,136 @@ def ribo_seq_run_from_bam(
         cleavage_counted_reads=ce.counted_alns,
         is_high_quality=is_high_quality,
     )
+
+
+# ---------------------------------------------------------------------------
+# Dataset model I/O
+# ---------------------------------------------------------------------------
+
+
+def save_dataset_models(
+    runs: list[RiboSeqRun],
+    output_dir: str,
+    save_optional: bool = True,
+) -> None:
+    """Save cleavage and coverage model summaries, plots, and optional data.
+
+    Creates a ``dataset_models/`` sub-directory under *output_dir* and
+    writes:
+
+    * ``cleavage_models.tsv`` – obligatory attributes (pl, pr, pu).
+    * ``cleavage_models.pdf`` – multi-page diagnostic plots (requires
+      optional cleavage attributes).
+    * ``coverage_models.tsv`` – obligatory attributes (start_factor,
+      stop_factor).
+    * ``coverage_models.pdf`` – multi-page histogram plots (requires
+      optional coverage attributes).
+
+    When *save_optional* is True, also writes:
+
+    * ``cleavage_models.npz`` – optional arrays (dist_starts, table).
+    * ``coverage_models.npz`` – optional arrays (start_hist, stop_hist).
+
+    Parameters
+    ----------
+    runs : list[RiboSeqRun]
+        Ribo-seq runs whose models should be exported.
+    output_dir : str
+        Root output directory (``config.o_dir``).
+    save_optional : bool, optional
+        Whether to write ``.npz`` files with optional model attributes
+        (default True).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    dm_dir = os.path.join(output_dir, "dataset_models")
+    os.makedirs(dm_dir, exist_ok=True)
+
+    # --- Cleavage TSV + optional NPZ ---
+    cleavage_tsv = os.path.join(dm_dir, "cleavage_models.tsv")
+    cleavage_npz_data: dict[str, np.ndarray] = {} if save_optional else None
+    with open(cleavage_tsv, "w") as fh:
+        fh.write(CleavageModel.TSV_HEADER + "\n")
+        for run in runs:
+            run.cleavage_model.to_files(run.id, fh, cleavage_npz_data)
+    if cleavage_npz_data:
+        np.savez(os.path.join(dm_dir, "cleavage_models.npz"), **cleavage_npz_data)
+
+    # --- Cleavage PDF ---
+    path = os.path.join(dm_dir, "cleavage_models.pdf")
+    with PdfPages(path) as pdf:
+        for run in runs:
+            fig = run.cleavage_model.plot_full()
+            fig.suptitle(run.id, fontsize=14, fontweight="bold")
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    # --- Coverage TSV + optional NPZ ---
+    coverage_tsv = os.path.join(dm_dir, "coverage_models.tsv")
+    coverage_npz_data: dict[str, np.ndarray] = {} if save_optional else None
+    with open(coverage_tsv, "w") as fh:
+        fh.write(CoverageModel.TSV_HEADER + "\n")
+        for run in runs:
+            run.coverage_model.to_files(run.id, fh, coverage_npz_data)
+    if coverage_npz_data:
+        np.savez(os.path.join(dm_dir, "coverage_models.npz"), **coverage_npz_data)
+
+    # --- Coverage PDF ---
+    path = os.path.join(dm_dir, "coverage_models.pdf")
+    with PdfPages(path) as pdf:
+        for run in runs:
+            fig = run.coverage_model.plot()
+            fig.suptitle(run.id, fontsize=14, fontweight="bold")
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+def load_cleavage_models(
+    dm_dir: str,
+    load_optional: bool = False,
+) -> dict[str, CleavageModel]:
+    """Load cleavage models from a ``dataset_models/`` directory.
+
+    Parameters
+    ----------
+    dm_dir : str
+        Path to a ``dataset_models/`` directory.
+    load_optional : bool, optional
+        Whether to load optional attributes from the ``.npz`` file
+        (default False).
+
+    Returns
+    -------
+    dict[str, CleavageModel]
+        Mapping of dataset identifier to the reconstructed model.
+    """
+    tsv = os.path.join(dm_dir, "cleavage_models.tsv")
+    npz = os.path.join(dm_dir, "cleavage_models.npz")
+    return CleavageModel.from_files(tsv, npz if load_optional and os.path.exists(npz) else None)
+
+
+def load_coverage_models(
+    dm_dir: str,
+    load_optional: bool = False,
+) -> dict[str, CoverageModel]:
+    """Load coverage models from a ``dataset_models/`` directory.
+
+    Parameters
+    ----------
+    dm_dir : str
+        Path to a ``dataset_models/`` directory.
+    load_optional : bool, optional
+        Whether to load optional attributes from the ``.npz`` file
+        (default False).
+
+    Returns
+    -------
+    dict[str, CoverageModel]
+        Mapping of dataset identifier to the reconstructed model.
+    """
+    tsv = os.path.join(dm_dir, "coverage_models.tsv")
+    npz = os.path.join(dm_dir, "coverage_models.npz")
+    return CoverageModel.from_files(tsv, npz if load_optional and os.path.exists(npz) else None)

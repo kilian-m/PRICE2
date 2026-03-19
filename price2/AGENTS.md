@@ -34,7 +34,6 @@ price2/
 ├── coverage_model.py           # Coverage profile modeling
 ├── equivalence_groups.py       # Equivalence group construction
 ├── data_collector.py           # Data collection orchestration
-├── dataset_models.py           # Export dataset model summaries and plots
 ├── locus.py                    # Locus class (core deconvolution logic)
 ├── orf_activity_estimator.py   # Parallel ORF activity estimation
 └── AGENTS.md                   # This file

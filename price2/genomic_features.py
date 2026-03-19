@@ -113,37 +113,24 @@ class Transcript:
         self.exons.add_interval(exon.iv)
         self.exon_length += exon.iv.length
 
-    def add_region(self, region: HTSeq.features.GenomicFeature) -> None:
-        """Add a UTR or CDS sub-region to this transcript.
+    def add_cds_region(self, region: HTSeq.features.GenomicFeature) -> None:
+        """Add a CDS sub-region to this transcript.
 
-        Accumulates intervals for ``five_prime_utr``, ``CDS``, and
-        ``three_prime_utr`` features.
+        Accumulates intervals for ``CDS`` features.
 
         Parameters
         ----------
         region : HTSeq.features.GenomicFeature
-            A sub-transcript GTF feature (``five_prime_utr``, ``CDS``,
+            A sub-transcript GTF feature (``CDS``) as parsed by HTSeq.
             or ``three_prime_utr``) as parsed by HTSeq.
         """
-        if region.type == "five_prime_utr":
-            if not hasattr(self, "five_prime_utr"):
-                self.five_prime_utr: GenomicRegion = GenomicRegion(
-                    [], chrom=region.iv.chrom, strand=region.iv.strand
-                )
-            self.five_prime_utr.add_interval(region.iv)
-        elif region.type == "CDS":
-            if not hasattr(self, "_cds"):
-                self._cds: GenomicRegion = GenomicRegion(
-                    [], chrom=region.iv.chrom, strand=region.iv.strand
-                )
-            self._cds.add_interval(region.iv)
-            self.coding_length += region.iv.length
-        elif region.type == "three_prime_utr":
-            if not hasattr(self, "three_prime_utr"):
-                self.three_prime_utr: GenomicRegion = GenomicRegion(
-                    [], chrom=region.iv.chrom, strand=region.iv.strand
-                )
-            self.three_prime_utr.add_interval(region.iv)
+
+        if not hasattr(self, "_cds"):
+            self._cds: GenomicRegion = GenomicRegion(
+                [], chrom=region.iv.chrom, strand=region.iv.strand
+            )
+        self._cds.add_interval(region.iv)
+        self.coding_length += region.iv.length
 
     def cds_regions_to_cds_intervals(self) -> None:
         """Compute annotated CDS position in transcript coordinates.
@@ -153,7 +140,12 @@ class Transcript:
         has been added to this transcript.
         """
         try:
-            self.annotated_cds_iv = self.exons.map_to_local(self._cds)
+            if len(self._cds) % 3 != 0:
+                del self._cds
+                self.coding_length = 0
+                self.annotated_cds_iv = None
+            else:
+                self.annotated_cds_iv = self.exons.map_to_local(self._cds)
         except AttributeError:
             self.annotated_cds_iv = None
 

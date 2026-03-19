@@ -71,15 +71,14 @@ class ReferenceAnnotation:
                 self.transcript_intervals[feature.iv] += self.transcripts[
                     feature.attr["transcript_id"]
                 ]
-            elif feature.type in ["CDS", "five_prime_utr", "three_prime_utr"]:
-                self.transcripts[feature.attr["transcript_id"]].add_region(feature)
-                if feature.type == "CDS":
-                    self.cds_intervals[feature.iv] += self.transcripts[
-                        feature.attr["transcript_id"]
-                    ]
+            elif feature.type == "CDS":
+                self.transcripts[feature.attr["transcript_id"]].add_cds_region(feature)
 
         for transcript in self.transcripts.values():
             transcript.cds_regions_to_cds_intervals()
+            if transcript.annotated_cds_iv is not None:
+                for interval in transcript._cds.intervals:
+                    self.cds_intervals[interval] += transcript
 
         logger.info("Loaded %d transcripts from %s", len(self.transcripts), gtf_path)
 

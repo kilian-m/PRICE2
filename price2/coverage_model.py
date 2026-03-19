@@ -103,8 +103,8 @@ def _try_assign_p_site(
 
     # Project the read onto CDS coordinates for every candidate transcript.
     # Accept only reads that map to exactly one unique CDS interval.
-    cds_intervals: set[tuple[int, int]] = set()
-    transcript = None
+    cds_intervals: list[tuple[int, int]] = []
+    transcripts = []
     for tr in transcript_candidates:
         try:
             iv_on_exons = tr.exons.map_to_local(aln.genomic_region)
@@ -114,13 +114,14 @@ def _try_assign_p_site(
             )
         except ValueError:
             continue
-        cds_intervals.add(iv_on_cds)
-        transcript = tr
+        cds_intervals.append(iv_on_cds)
+        transcripts.append(tr)
 
     if len(cds_intervals) != 1:
         return None
 
-    iv_on_cds = cds_intervals.pop()
+    iv_on_cds = cds_intervals[0]
+    transcript = transcripts[0]
     n_codons = (iv_on_cds[1] - iv_on_cds[0]) // 3
     if n_codons == 0:
         return None
@@ -183,41 +184,71 @@ class CoveragePosition(Enum):
 class CoverageModel:
     """Position-specific ribosome footprint enrichment model.
 
-    Estimates coverage scale factors at the start codon and at the last
-    sense codon before the stop codon, relative to the average coverage over
-    the ORF body.  Both factors are derived from annotated CDS regions in
-    *ra* and the cleavage model *cm*.
+    Models elevated ribosome footprint density at ORF start codons and at
+    the codon immediately upstream of stop codons, relative to average
+    ORF-body coverage.
 
     Parameters
-    ----------
-    ra : ReferenceAnnotation
-        Parsed reference annotation.
-    sample_bam_path : str
-        Path to the BAM file for the Ribo-seq sample.
-    cm : CleavageModel
-        Cleavage model used to assign reads to P-site positions.
-
-    Attributes
     ----------
     start_factor : float
         Enrichment at the start codon relative to the ORF body.  Always >= 1.
     stop_factor : float
         Enrichment one codon upstream of the stop codon relative to the ORF
         body.  Always >= 1.
+    start_hist : np.ndarray or None, optional
+        P-site count histogram around the start codon.  Optional; only
+        needed for plotting.
+    stop_hist : np.ndarray or None, optional
+        P-site count histogram around the stop codon.  Optional; only
+        needed for plotting.
     """
 
     def __init__(
         self,
+        start_factor: float,
+        stop_factor: float,
+        start_hist: Optional[np.ndarray] = None,
+        stop_hist: Optional[np.ndarray] = None,
+    ) -> None:
+        self.start_factor = start_factor
+        self.stop_factor = stop_factor
+        if start_hist is not None:
+            self.start_hist = start_hist
+        if stop_hist is not None:
+            self.stop_hist = stop_hist
+
+    # ------------------------------------------------------------------
+    # Alternative constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_bam(
+        cls,
         ra: ReferenceAnnotation,
         sample_bam_path: str,
         cm: CleavageModel,
-    ) -> None:
-        start_hist = self._build_start_histogram(ra, sample_bam_path, cm)
-        stop_hist = self._build_stop_histogram(ra, sample_bam_path, cm)
-        self.start_hist = start_hist
-        self.stop_hist = stop_hist
-        self.start_factor = self._compute_start_factor(start_hist, sample_bam_path)
-        self.stop_factor = self._compute_stop_factor(stop_hist, sample_bam_path)
+    ) -> "CoverageModel":
+        """Estimate a coverage model from a BAM file.
+
+        Parameters
+        ----------
+        ra : ReferenceAnnotation
+            Parsed reference annotation.
+        sample_bam_path : str
+            Path to the BAM file for the Ribo-seq sample.
+        cm : CleavageModel
+            Cleavage model used to assign reads to P-site positions.
+
+        Returns
+        -------
+        CoverageModel
+            Model with all attributes (including optional histograms) set.
+        """
+        start_hist = cls._build_start_histogram(ra, sample_bam_path, cm)
+        stop_hist = cls._build_stop_histogram(ra, sample_bam_path, cm)
+        start_factor = cls._compute_start_factor(start_hist, sample_bam_path)
+        stop_factor = cls._compute_stop_factor(stop_hist, sample_bam_path)
+        return cls(start_factor, stop_factor, start_hist, stop_hist)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -409,67 +440,53 @@ class CoverageModel:
 
         return max(1.0, factor)
 
-    #: TSV header line produced by :meth:`to_tsv_line`.
-    TSV_HEADER: str = "dataset_id\tstart_factor\tstop_factor\tstart_hist\tstop_hist"
+    #: TSV header line produced by :meth:`to_files`.
+    TSV_HEADER: str = "dataset_id\tstart_factor\tstop_factor"
 
-    def to_tsv_line(self, dataset_id: str) -> str:
-        """Serialise the model to a single TSV line.
+    def to_files(
+        self,
+        dataset_id: str,
+        tsv_fh,
+        npz_data: Optional[dict[str, np.ndarray]] = None,
+    ) -> None:
+        """Write the model to open file handles.
 
-        The histograms are stored as comma-separated floating-point
-        values.  The line ends with ``\\n`` and can be written directly
-        to a file whose first line is :attr:`TSV_HEADER`.
+        Appends one TSV line with the obligatory attributes to *tsv_fh*.
+        If *npz_data* is provided, optional arrays (``start_hist``,
+        ``stop_hist``) are added to the dict for later ``np.savez``.
 
         Parameters
         ----------
         dataset_id : str
-            Sample identifier placed in the first column.
-
-        Returns
-        -------
-        str
-            Tab-separated line encoding ``dataset_id``,
-            ``start_factor``, ``stop_factor``, ``start_hist`` and
-            ``stop_hist``.
+            Sample identifier placed in the first TSV column.
+        tsv_fh : file-like
+            Writable text file handle (header already written).
+        npz_data : dict[str, np.ndarray] or None, optional
+            Accumulator dict for optional arrays.
         """
-        start_str = ",".join(f"{v:.6g}" for v in self.start_hist)
-        stop_str = ",".join(f"{v:.6g}" for v in self.stop_hist)
-        return (
-            f"{dataset_id}\t{self.start_factor:.6g}\t{self.stop_factor:.6g}"
-            f"\t{start_str}\t{stop_str}\n"
-        )
+        tsv_fh.write(f"{dataset_id}\t{self.start_factor:.6g}\t{self.stop_factor:.6g}\n")
+
+        if npz_data is not None:
+            if hasattr(self, "start_hist"):
+                npz_data[f"{dataset_id}_start_hist"] = self.start_hist
+            if hasattr(self, "stop_hist"):
+                npz_data[f"{dataset_id}_stop_hist"] = self.stop_hist
 
     @classmethod
-    def from_tsv_line(cls, line: str) -> "tuple[str, CoverageModel]":
-        """Reconstruct a model from a single TSV line.
-
-        The line must follow the format produced by :meth:`to_tsv_line`.
+    def from_files(
+        cls, tsv_path: str, npz_path: Optional[str] = None
+    ) -> "dict[str, CoverageModel]":
+        """Load models from a TSV file and optionally an NPZ file.
 
         Parameters
         ----------
-        line : str
-            A data row (not the header line).
-
-        Returns
-        -------
-        tuple[str, CoverageModel]
-            ``(dataset_id, model)``.
-        """
-        dataset_id, start_factor_str, stop_factor_str, start_str, stop_str = (
-            line.strip().split("\t")
-        )
-        start_hist = np.array([float(v) for v in start_str.split(",")])
-        stop_hist = np.array([float(v) for v in stop_str.split(",")])
-        return dataset_id, cls.from_histograms(start_hist, stop_hist, run_id=dataset_id)
-
-    @classmethod
-    def from_tsv(cls, path: str) -> "dict[str, CoverageModel]":
-        """Load all models from a TSV file written by
-        :func:`~price2.dataset_models.save_dataset_models`.
-
-        Parameters
-        ----------
-        path : str
-            Path to the ``coverage_models.tsv`` file.
+        tsv_path : str
+            Path to the ``coverage_models.tsv`` file (obligatory
+            attributes: ``start_factor``, ``stop_factor``).
+        npz_path : str or None, optional
+            Path to the ``coverage_models.npz`` file.  When provided,
+            optional attributes (``start_hist``, ``stop_hist``) are
+            attached to the corresponding models.
 
         Returns
         -------
@@ -477,11 +494,23 @@ class CoverageModel:
             Mapping of dataset identifier to the reconstructed model.
         """
         models: dict[str, CoverageModel] = {}
-        with open(path) as fh:
+        with open(tsv_path) as fh:
             next(fh)  # skip header
             for line in fh:
-                dataset_id, model = cls.from_tsv_line(line)
-                models[dataset_id] = model
+                parts = line.strip().split("\t")
+                dataset_id = parts[0]
+                models[dataset_id] = cls(float(parts[1]), float(parts[2]))
+
+        if npz_path is not None:
+            data = np.load(npz_path)
+            for dataset_id, model in models.items():
+                key_sh = f"{dataset_id}_start_hist"
+                key_eh = f"{dataset_id}_stop_hist"
+                if key_sh in data:
+                    model.start_hist = data[key_sh]
+                if key_eh in data:
+                    model.stop_hist = data[key_eh]
+
         return models
 
     # ------------------------------------------------------------------
@@ -498,35 +527,27 @@ class CoverageModel:
         """Construct a CoverageModel from pre-computed P-site histograms.
 
         Skips BAM file I/O; derives the start and stop enrichment factors
-        directly from the supplied histograms.  Use this to reconstruct a
-        model from saved data (e.g. a ``.npz`` file produced by
-        :func:`~price2.dataset_models.save_dataset_models`).
+        directly from the supplied histograms.
 
         Parameters
         ----------
         start_hist : np.ndarray
             P-site count histogram around the start codon, shape
-            ``(_HIST_SIZE,)``.  Index ``_START_CODON_IDX`` corresponds to
-            CDS position 0.
+            ``(_HIST_SIZE,)``.
         stop_hist : np.ndarray
             P-site count histogram around the stop codon, shape
-            ``(_HIST_SIZE,)``.  Index ``_STOP_PEAK_IDX`` corresponds to
-            the last sense codon.
+            ``(_HIST_SIZE,)``.
         run_id : str, optional
             Sample identifier used in warning messages.
 
         Returns
         -------
         CoverageModel
-            Model with ``start_hist``, ``stop_hist``, ``start_factor``, and
-            ``stop_factor`` set.
+            Model with all attributes (including optional histograms) set.
         """
-        instance = cls.__new__(cls)
-        instance.start_hist = start_hist
-        instance.stop_hist = stop_hist
-        instance.start_factor = cls._compute_start_factor(start_hist, run_id)
-        instance.stop_factor = cls._compute_stop_factor(stop_hist, run_id)
-        return instance
+        start_factor = cls._compute_start_factor(start_hist, run_id)
+        stop_factor = cls._compute_stop_factor(stop_hist, run_id)
+        return cls(start_factor, stop_factor, start_hist, stop_hist)
 
     # ------------------------------------------------------------------
     # Public API

@@ -31,6 +31,7 @@ from filelock import FileLock
 from scipy.optimize import minimize
 from scipy.sparse import csr_matrix, vstack as sp_vstack
 from scipy.stats import chi2
+from scipy.special import gammaln
 
 from price2.config import Config
 from price2.coverage_model import CoveragePosition
@@ -1840,9 +1841,7 @@ def poisson_log_likelihood_sparse(
     d_act = delta[active]
     y_act = y[active]
     return float(
-        (y_act * np.log(d_act)).sum()
-        - d_act.sum()
-        - float(np.sum([math.lgamma(yi + 1) for yi in y_act]))
+        (y_act * np.log(d_act)).sum() - d_act.sum() - float(gammaln(y_act + 1).sum())
     )
 
 

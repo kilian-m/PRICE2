@@ -20,7 +20,7 @@ import HTSeq
 
 from price2.config import Config
 from price2.data_collector import DataCollector
-from price2.dataset_models import save_dataset_models
+from price2.ribo_seq_run import save_dataset_models
 from price2.orf_activity_estimator import ORFActivityEstimator
 from price2.reference_annotation import ReferenceAnnotation
 from price2.tpm import generate_tpm_output
