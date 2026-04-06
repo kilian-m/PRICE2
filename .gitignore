@@ -1,24 +1,19 @@
-# data / output directories
-evaluation_real/
-evaluation_simulated/
-false_positives/
-lrz_workflow/
-orf_deconvolution_development/
-peptide_prism/
-peptides/
-playground/
-
-# misc
-general.yaml
-
 # Python
 **/__pycache__/
 **/.pytest_cache/
 *.pyc
 
-# environment
+# Environment
 .venv/
 
-# editor
+# Editor
 .vscode/
+
+# Data files
+*.db
+*.db-journal
+
+# OS
+.DS_Store
 tests/
+general.yaml

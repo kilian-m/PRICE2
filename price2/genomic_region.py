@@ -260,6 +260,13 @@ class GenomicRegion:
                     "Other region spans a junction not present in this region."
                 )
 
+            # Same-exon junction: consecutive read exons within one
+            # self-interval means a spurious splice inside an exon.
+            if prev_j is not None and j == prev_j:
+                raise ValueError(
+                    "Read has a splice junction inside a reference exon."
+                )
+
             # Junction boundary check: when consecutive other-intervals
             # map to consecutive self-intervals, the splice sites must
             # align exactly.

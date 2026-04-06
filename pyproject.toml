@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "price2"
+version = "0.1.0"
+
+[project.scripts]
+price2 = "price2.price:main"

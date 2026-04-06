@@ -380,6 +380,7 @@ class CoverageModel:
                 "Only %d reads at start codon position. "
                 "Low evidence for coverage model.",
                 int(peak_count),
+                bam_path,
             )
         if body_counts.sum() < _MIN_READS:
             logger.warning(
