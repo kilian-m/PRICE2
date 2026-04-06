@@ -305,7 +305,10 @@ def process_loc(arguments: tuple):
     )
 
     # --- Group-LASSO optimisation ---
-    loc.deconvolve(config, runs=runs)
+    if config.outlier_removal:
+        loc.deconvolve_with_outlier_removal(config, runs=runs)
+    else:
+        loc.deconvolve(config, runs=runs)
 
     loc.rgr_filter_sets["deconvoluted"] = loc.rgr_set
     performance_measurements["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)

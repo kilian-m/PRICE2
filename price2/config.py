@@ -177,6 +177,13 @@ class Config:
     min_activity_fraction: float = 0.1
 
     # ------------------------------------------------------------------ #
+    # Outlier EG removal                                                   #
+    # ------------------------------------------------------------------ #
+    outlier_removal: bool = False
+    outlier_threshold: float = 3.0
+    outlier_max_remove_frac: float = 0.2
+
+    # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #
     # ------------------------------------------------------------------ #
     likelihood_ratio_filter: bool = True

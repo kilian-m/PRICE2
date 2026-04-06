@@ -1285,6 +1285,158 @@ class Locus:
 
         return opt_time, data_time
 
+    def deconvolve_with_outlier_removal(
+        self,
+        config: Config,
+        runs: list[RiboSeqRun],
+    ) -> tuple[float, float]:
+        """Two-stage deconvolution with outlier EG removal.
+
+        Stage 1 — outlier detection:
+            Solve unpenalised Poisson NLL to obtain residuals.  Flag
+            equivalence groups whose deviance residual exceeds
+            ``config.outlier_threshold`` and remove them from X and y.
+
+        Stage 2 — penalised group-LASSO solve on the cleaned system
+            using ``config.lam``.
+
+        Parameters
+        ----------
+        config : Config
+            Configuration providing outlier, regularisation, and
+            convergence parameters.
+        runs : list[RiboSeqRun]
+            Ribo-seq runs to deconvolve jointly.
+
+        Returns
+        -------
+        tuple[float, float]
+            ``(opt_time, data_time)`` — wall-clock seconds spent in
+            optimisation vs. data preparation.
+        """
+        logger = logging.getLogger("price2")
+        opt_time = 0.0
+        data_time = 0.0
+
+        # ── Build sparse system ──────────────────────────────────────────
+        s1 = time.time()
+        args_dict = self.to_sparse_args(runs)
+        X = args_dict["X"]
+        y = args_dict["y"]
+        num_rgrs = args_dict["num_rgrs"]
+        num_runs = args_dict["num_runs"]
+        rgr_lengths = args_dict["rgr_lengths"]
+        s2 = time.time()
+        data_time += s2 - s1
+
+        n = num_rgrs * num_runs
+        bounds = [(config.pseudo_min, None)] * n
+
+        # ── Stage 1: unpenalised solve for outlier detection ─────────────
+        s1 = time.time()
+        result_unpen = minimize(
+            poisson_nll_grad,
+            np.ones(n),
+            args=(X, y),
+            method="L-BFGS-B",
+            jac=True,
+            bounds=bounds,
+            options={
+                "maxiter": 10_000,
+                "ftol": config.ftol,
+                "gtol": config.gtol,
+                "maxls": config.maxls,
+            },
+        )
+        w_unpen = result_unpen.x
+
+        # Deviance residuals
+        delta = np.asarray(X @ w_unpen).ravel()
+        dev_res = _poisson_deviance_residuals(y, delta)
+
+        # Flag outlier EGs (large positive residuals: observed >> expected)
+        outlier_mask = dev_res > config.outlier_threshold
+        max_remove = int(len(y) * config.outlier_max_remove_frac)
+        if outlier_mask.sum() > max_remove:
+            indices = np.argsort(dev_res)[::-1][:max_remove]
+            outlier_mask = np.zeros(len(y), dtype=bool)
+            outlier_mask[indices] = True
+
+        keep_mask = ~outlier_mask
+        if keep_mask.sum() < len(y):
+            X_clean = X[keep_mask]
+            y_clean = y[keep_mask]
+        else:
+            X_clean = X
+            y_clean = y
+
+        s2 = time.time()
+        opt_time += s2 - s1
+        n_removed = int(outlier_mask.sum())
+        logger.debug(
+            "Outlier removal: %d / %d EGs flagged (threshold=%.1f)",
+            n_removed,
+            len(y),
+            config.outlier_threshold,
+        )
+
+        # ── Stage 2: penalised solve on cleaned data ─────────────────────
+        s1 = time.time()
+
+        cb = Callback(
+            w_unpen,
+            num_runs,
+            config,
+            remove_rgrs=True,
+            rgr_lengths=rgr_lengths,
+        )
+        optimization_result = minimize(
+            poisson_nll_grad_lasso,
+            w_unpen,
+            args=(X_clean, y_clean, config.lam, num_rgrs, num_runs),
+            method="L-BFGS-B",
+            jac=True,
+            bounds=[(config.pseudo_min, None)] * n,
+            callback=cb,
+            options={
+                "maxiter": 10_000,
+                "ftol": config.ftol,
+                "gtol": config.gtol,
+                "maxls": config.maxls,
+            },
+        )
+
+        s2 = time.time()
+        opt_time += s2 - s1
+
+        # ── Store result ─────────────────────────────────────────────────
+        result_matrix = optimization_result.x.reshape(num_rgrs, num_runs)
+        result_matrix[result_matrix <= config.pseudo_min] = 0
+        self.result = result_matrix
+
+        # ── Post-optimisation RGR removal (same as deconvolve) ───────────
+        x = self.result
+        x_t = x.T
+        canonical_indices = (rgr_lengths * x_t).argmax(axis=1)
+        min_activities = np.maximum(
+            x_t[np.arange(x_t.shape[0]), canonical_indices]
+            * config.min_activity_fraction,
+            config.rgr_min_activity,
+        )
+        self.rgr_indices_to_remove = set(
+            np.where(np.all(x < min_activities, axis=1))[0]
+        )
+        rgrs_to_remove = set(
+            [
+                rgr
+                for rgr in self.rgr_set
+                if rgr.index in self.rgr_indices_to_remove and rgr.type == "ORF"
+            ]
+        )
+        self.remove_rgrs(rgrs_to_remove, runs=runs)
+
+        return opt_time, data_time
+
     def remove_rgrs(
         self,
         rgrs_to_remove: set[ReadGeneratingRegion],
@@ -1732,6 +1884,42 @@ def egs_to_sparse(
     )
     y = np.array(y_list, dtype=np.float64)
     return X, y
+
+
+def _poisson_deviance_residuals(
+    y: np.ndarray,
+    delta: np.ndarray,
+) -> np.ndarray:
+    """Signed deviance residuals for a Poisson model.
+
+    .. math::
+
+        d_i = \\text{sign}(y_i - \\delta_i)
+              \\sqrt{2 \\bigl[y_i \\ln(y_i / \\delta_i) - (y_i - \\delta_i)\\bigr]}
+
+    Approximately standard-normal for well-fitting observations.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Observed counts.
+    delta : np.ndarray
+        Fitted expected counts (δ = X @ w).
+
+    Returns
+    -------
+    np.ndarray
+        Signed deviance residuals, same shape as *y*.
+    """
+    res = np.zeros_like(y, dtype=np.float64)
+    pos = y > 0
+    delta_safe = np.maximum(delta, 1e-300)
+    dev_pos = 2 * (y[pos] * np.log(y[pos] / delta_safe[pos]) - (y[pos] - delta[pos]))
+    dev_pos = np.maximum(dev_pos, 0)  # numerical safety
+    res[pos] = np.sign(y[pos] - delta[pos]) * np.sqrt(dev_pos)
+    zero = ~pos
+    res[zero] = -np.sqrt(2 * delta[zero])
+    return res
 
 
 def poisson_nll_grad(
