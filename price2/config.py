@@ -173,11 +173,13 @@ class Config:
     min_activity_fraction: float = 0.1
 
     # ------------------------------------------------------------------ #
-    # Outlier EG removal                                                   #
+    # IRLS-Huber                                                           #
     # ------------------------------------------------------------------ #
-    outlier_removal: bool = False
-    outlier_threshold: float = 3.0
-    outlier_max_remove_frac: float = 0.2
+    irls_huber_c: float = (
+        3.0  # low values -> more robust | high values -> more like MLE
+    )
+    irls_huber_max_outer: int = 10
+    irls_huber_tol: float = 1e-4
 
     # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #

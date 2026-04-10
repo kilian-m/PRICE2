@@ -294,6 +294,7 @@ def process_loc(arguments: tuple):
     t2 = time.time()
 
     performance_measurements["eg_time"] = t2 - t1
+    performance_measurements["eg_count"] = sum(len(egs) for egs in loc.egs.values())
 
     # --- Assign reads to equivalence groups ---
     t1 = time.time()
@@ -305,10 +306,10 @@ def process_loc(arguments: tuple):
     )
 
     # --- Group-LASSO optimisation ---
-    if config.outlier_removal:
-        loc.deconvolve_with_outlier_removal(config, runs=runs)
-    else:
-        loc.deconvolve(config, runs=runs)
+    loc.deconvolve(config, runs=runs)
+    performance_measurements["irls_outer_iterations"] = getattr(
+        loc, "irls_outer_iterations", 0
+    )
 
     loc.rgr_filter_sets["deconvoluted"] = loc.rgr_set
     performance_measurements["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)

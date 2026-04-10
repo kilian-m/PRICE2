@@ -1172,139 +1172,22 @@ class Locus:
         config: Config,
         runs: list[RiboSeqRun],
     ) -> tuple[float, float]:
-        """Run group-LASSO penalised Poisson-likelihood deconvolution.
+        """IRLS deconvolution with Huber weights on Pearson residuals.
 
-        Iteratively optimises ORF activities.  Between iterations, ORFs
-        whose activity falls below the canonical-ORF-relative threshold
-        are removed to speed convergence.
+        At each outer iteration:
+          1. Compute fitted values δ = X @ w and Pearson residuals.
+          2. Compute Huber weights: ω_i = min(1, c / |r_i|).
+          3. Solve weighted group-LASSO Poisson NLL.
 
-        Parameters
-        ----------
-        config : Config
-            Configuration providing regularisation and convergence
-            parameters.
-        runs : list[RiboSeqRun]
-            Ribo-seq runs to deconvolve jointly.
-
-        Returns
-        -------
-        tuple[float, float]
-            ``(opt_time, data_time)`` — wall-clock seconds spent in
-            optimisation vs. data preparation.
-        """
-        opt_time = 0.0
-        data_time = 0.0
-
-        while True:
-            s1 = time.time()
-            args_dict = self.to_sparse_args(runs)
-            X = args_dict["X"]
-            y = args_dict["y"]
-            num_rgrs = args_dict["num_rgrs"]
-            num_runs = args_dict["num_runs"]
-            rgr_lengths = args_dict["rgr_lengths"]
-            initial_guess = args_dict["initial_guess"]
-            s2 = time.time()
-            data_time += s2 - s1
-            s1 = time.time()
-
-            bounds = [(config.pseudo_min, None)] * len(initial_guess)
-
-            cb = Callback(
-                initial_guess,
-                num_runs,
-                config,
-                remove_rgrs=True,
-                rgr_lengths=rgr_lengths,
-            )
-
-            optimization_result = minimize(
-                poisson_nll_grad_lasso,
-                initial_guess,
-                args=(X, y, config.lam, num_rgrs, num_runs),
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                callback=cb,
-                options={
-                    "maxiter": 10_000,
-                    "ftol": config.ftol,
-                    "gtol": config.gtol,
-                    "maxls": config.maxls,
-                },
-            )
-            s2 = time.time()
-            opt_time += s2 - s1
-
-            if cb.success or optimization_result.success:
-                break
-            elif cb.rgr_indices_to_remove:
-                self.result = optimization_result.x.reshape(-1, num_runs)
-                rgrs_to_remove = set(
-                    [
-                        rgr
-                        for rgr in self.rgr_set
-                        if rgr.index in cb.rgr_indices_to_remove and rgr.type == "ORF"
-                    ]
-                )
-                self.remove_rgrs(rgrs_to_remove, runs=runs)
-            else:
-                raise RuntimeError(
-                    f"Optimization stopped unexpectedly. {optimization_result.message}"
-                )
-
-        tmp = optimization_result.x.copy()
-        tmp = tmp.reshape(-1, num_runs)
-
-        result = optimization_result
-        result.x = result.x.reshape(-1, num_runs)
-        result.x[result.x <= config.pseudo_min] = 0
-
-        self.result = result.x
-
-        x = self.result
-        x_t = x.T
-        canonical_indices = (rgr_lengths * x_t).argmax(axis=1)
-        min_activities = np.maximum(
-            x_t[np.arange(x_t.shape[0]), canonical_indices]
-            * config.min_activity_fraction,
-            config.rgr_min_activity,
-        )
-        self.rgr_indices_to_remove = set(
-            np.where(np.all(x < min_activities, axis=1))[0]
-        )
-        rgrs_to_remove = set(
-            [
-                rgr
-                for rgr in self.rgr_set
-                if rgr.index in self.rgr_indices_to_remove and rgr.type == "ORF"
-            ]
-        )
-
-        self.remove_rgrs(rgrs_to_remove, runs=runs)
-
-        return opt_time, data_time
-
-    def deconvolve_with_outlier_removal(
-        self,
-        config: Config,
-        runs: list[RiboSeqRun],
-    ) -> tuple[float, float]:
-        """Two-stage deconvolution with outlier EG removal.
-
-        Stage 1 — outlier detection:
-            Solve unpenalised Poisson NLL to obtain residuals.  Flag
-            equivalence groups whose deviance residual exceeds
-            ``config.outlier_threshold`` and remove them from X and y.
-
-        Stage 2 — penalised group-LASSO solve on the cleaned system
-            using ``config.lam``.
+        Converges when the relative change in w falls below
+        ``config.irls_huber_tol``.
 
         Parameters
         ----------
         config : Config
-            Configuration providing outlier, regularisation, and
-            convergence parameters.
+            Configuration providing ``irls_huber_c``,
+            ``irls_huber_max_outer``, ``irls_huber_tol``, and
+            standard optimisation parameters.
         runs : list[RiboSeqRun]
             Ribo-seq runs to deconvolve jointly.
 
@@ -1331,88 +1214,75 @@ class Locus:
 
         n = num_rgrs * num_runs
         bounds = [(config.pseudo_min, None)] * n
+        c = config.irls_huber_c
 
-        # ── Stage 1: unpenalised solve for outlier detection ─────────────
+        w_current = np.ones(n)
+
         s1 = time.time()
-        result_unpen = minimize(
-            poisson_nll_grad,
-            np.ones(n),
-            args=(X, y),
-            method="L-BFGS-B",
-            jac=True,
-            bounds=bounds,
-            options={
-                "maxiter": 10_000,
-                "ftol": config.ftol,
-                "gtol": config.gtol,
-                "maxls": config.maxls,
-            },
-        )
-        w_unpen = result_unpen.x
+        for outer in range(config.irls_huber_max_outer):
+            # Compute fitted values and Pearson residuals
+            delta = np.asarray(X @ w_current).ravel()
+            delta_safe = np.maximum(delta, 1e-14)
+            pearson_r = (y - delta_safe) / np.sqrt(delta_safe)
 
-        # Deviance residuals
-        delta = np.asarray(X @ w_unpen).ravel()
-        dev_res = _poisson_deviance_residuals(y, delta)
+            # Huber weights: ω_i = min(1, c / |r_i|)
+            abs_r = np.abs(pearson_r)
+            weights = np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
 
-        # Flag outlier EGs (large positive residuals: observed >> expected)
-        outlier_mask = dev_res > config.outlier_threshold
-        max_remove = int(len(y) * config.outlier_max_remove_frac)
-        if outlier_mask.sum() > max_remove:
-            indices = np.argsort(dev_res)[::-1][:max_remove]
-            outlier_mask = np.zeros(len(y), dtype=bool)
-            outlier_mask[indices] = True
+            # Solve weighted group-LASSO Poisson NLL
+            cb = Callback(
+                w_current,
+                num_runs,
+                config,
+                remove_rgrs=False,
+                rgr_lengths=rgr_lengths,
+            )
+            result = minimize(
+                weighted_poisson_nll_grad_lasso,
+                w_current,
+                args=(X, y, weights, config.lam, num_rgrs, num_runs),
+                method="L-BFGS-B",
+                jac=True,
+                bounds=bounds,
+                callback=cb,
+                options={
+                    "maxiter": 10_000,
+                    "ftol": config.ftol,
+                    "gtol": config.gtol,
+                    "maxls": config.maxls,
+                },
+            )
 
-        keep_mask = ~outlier_mask
-        if keep_mask.sum() < len(y):
-            X_clean = X[keep_mask]
-            y_clean = y[keep_mask]
-        else:
-            X_clean = X
-            y_clean = y
+            w_new = result.x
+            rel_change = np.linalg.norm(w_new - w_current) / max(
+                np.linalg.norm(w_current), 1e-14
+            )
+            w_current = w_new
+            if rel_change < config.irls_huber_tol:
+                break
 
         s2 = time.time()
         opt_time += s2 - s1
-        n_removed = int(outlier_mask.sum())
+        self.irls_outer_iterations = outer + 1
         logger.debug(
-            "Outlier removal: %d / %d EGs flagged (threshold=%.1f)",
-            n_removed,
-            len(y),
-            config.outlier_threshold,
+            "IRLS-Huber: converged in %d outer iterations (c=%.1f)",
+            outer + 1,
+            c,
         )
-
-        # ── Stage 2: penalised solve on cleaned data ─────────────────────
-        s1 = time.time()
-
-        cb = Callback(
-            w_unpen,
-            num_runs,
-            config,
-            remove_rgrs=True,
-            rgr_lengths=rgr_lengths,
-        )
-        optimization_result = minimize(
-            poisson_nll_grad_lasso,
-            w_unpen,
-            args=(X_clean, y_clean, config.lam, num_rgrs, num_runs),
-            method="L-BFGS-B",
-            jac=True,
-            bounds=[(config.pseudo_min, None)] * n,
-            callback=cb,
-            options={
-                "maxiter": 10_000,
-                "ftol": config.ftol,
-                "gtol": config.gtol,
-                "maxls": config.maxls,
-            },
-        )
-
-        s2 = time.time()
-        opt_time += s2 - s1
 
         # ── Store result ─────────────────────────────────────────────────
-        result_matrix = optimization_result.x.reshape(num_rgrs, num_runs)
+        result_matrix = w_current.reshape(num_rgrs, num_runs)
         result_matrix[result_matrix <= config.pseudo_min] = 0
         self.result = result_matrix
+
+        # Store Huber weights for use in weighted LRT
+        delta = np.asarray(X @ w_current).ravel()
+        delta_safe = np.maximum(delta, 1e-14)
+        pearson_r = (y - delta_safe) / np.sqrt(delta_safe)
+        abs_r = np.abs(pearson_r)
+        self.irls_huber_weights = np.where(
+            abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14)
+        )
 
         # ── Post-optimisation RGR removal (same as deconvolve) ───────────
         x = self.result
@@ -1521,7 +1391,12 @@ class Locus:
         config: Config,
         runs: list[RiboSeqRun],
     ) -> None:
-        """Apply likelihood-ratio test filtering to remove non-significant ORFs.
+        """Likelihood-ratio test filtering using Huber weights.
+
+        Uses the Huber weights from the IRLS-Huber deconvolution to
+        compute a weighted Poisson log-likelihood for both the full and
+        reduced models, so that outlier EGs contribute less to the test
+        statistic.
 
         For each ORF, a Wilks test compares the full log-likelihood with
         the log-likelihood obtained when that ORF's activity is clamped
@@ -1539,13 +1414,15 @@ class Locus:
             Ribo-seq runs to include.
         """
 
-        def run_likelihood_optimization(initial_guess, bounds, optim_args):
+        weights = self.irls_huber_weights
+
+        def run_weighted_likelihood_optimization(initial_guess, bounds, optim_args):
             X_lr, y_lr, ftol, gtol = optim_args
             cb = Callback(initial_guess, num_runs, config)
             optimization_result = minimize(
-                poisson_nll_grad,
+                weighted_poisson_nll_grad,
                 initial_guess,
-                args=(X_lr, y_lr),
+                args=(X_lr, y_lr, weights),
                 method="L-BFGS-B",
                 jac=True,
                 bounds=bounds,
@@ -1561,10 +1438,12 @@ class Locus:
                 optimization_result.success = True
             if not optimization_result.success:
                 raise RuntimeError(
-                    f"Likelihood ratio filtering failed to converge. "
+                    f"Weighted LRT filtering failed to converge. "
                     f"{optimization_result.message}"
                 )
-            ll = poisson_log_likelihood_sparse(optimization_result.x, X_lr, y_lr)
+            ll = weighted_poisson_log_likelihood_sparse(
+                optimization_result.x, X_lr, y_lr, weights
+            )
             return optimization_result, ll
 
         sparse_args = self.to_sparse_args(runs)
@@ -1574,6 +1453,14 @@ class Locus:
         initial_guess = sparse_args["initial_guess"]
         num_runs = sparse_args["num_runs"]
         args = (X_lr, y_lr, config.ftol, config.gtol)
+
+        # Recompute weights on the current sparse system
+        delta = np.asarray(X_lr @ initial_guess).ravel()
+        delta_safe = np.maximum(delta, 1e-14)
+        pearson_r = (y_lr - delta_safe) / np.sqrt(delta_safe)
+        abs_r = np.abs(pearson_r)
+        c = config.irls_huber_c
+        weights = np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
 
         noise_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"}
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
@@ -1589,7 +1476,7 @@ class Locus:
 
         optim_args = args
 
-        optimization_result, full_log_likelihood = run_likelihood_optimization(
+        optimization_result, full_log_likelihood = run_weighted_likelihood_optimization(
             initial_guess, bounds, optim_args
         )
 
@@ -1599,7 +1486,6 @@ class Locus:
 
         rgr_ind_list = list(test_rgr_indices)
         try:
-            # sort by activity
             act_sum = self.result[np.array(rgr_ind_list)].sum(axis=1)
             rgr_ind_list = np.array(rgr_ind_list)[np.argsort(act_sum)]
         except IndexError:
@@ -1614,8 +1500,8 @@ class Locus:
             reduced_activities[rgr_ind] = config.pseudo_min
             reduced_activities = reduced_activities.flatten()
 
-            reduced_log_likelihood = poisson_log_likelihood_sparse(
-                reduced_activities, X_lr, y_lr
+            reduced_log_likelihood = weighted_poisson_log_likelihood_sparse(
+                reduced_activities, X_lr, y_lr, weights
             )
 
             log_p = wilks_test_p(
@@ -1638,8 +1524,10 @@ class Locus:
                     bounds[index] = t
                 bounds = list(bounds.flatten())
 
-                optimization_result, full_log_likelihood = run_likelihood_optimization(
-                    full_activities, bounds, optim_args
+                optimization_result, full_log_likelihood = (
+                    run_weighted_likelihood_optimization(
+                        full_activities, bounds, optim_args
+                    )
                 )
                 full_activities = optimization_result.x
 
@@ -1652,7 +1540,9 @@ class Locus:
                     bounds[index] = t
                 bounds = list(bounds.flatten())
                 optimization_result_reduced, reduced_log_likelihood = (
-                    run_likelihood_optimization(full_activities, bounds, optim_args)
+                    run_weighted_likelihood_optimization(
+                        full_activities, bounds, optim_args
+                    )
                 )
 
                 log_p = wilks_test_p(
@@ -1673,7 +1563,7 @@ class Locus:
             bounds[index] = t
         bounds = list(bounds.flatten())
 
-        optimization_result, full_log_likelihood = run_likelihood_optimization(
+        optimization_result, full_log_likelihood = run_weighted_likelihood_optimization(
             full_activities, bounds, optim_args
         )
         full_activities = optimization_result.x
@@ -1886,42 +1776,6 @@ def egs_to_sparse(
     return X, y
 
 
-def _poisson_deviance_residuals(
-    y: np.ndarray,
-    delta: np.ndarray,
-) -> np.ndarray:
-    """Signed deviance residuals for a Poisson model.
-
-    .. math::
-
-        d_i = \\text{sign}(y_i - \\delta_i)
-              \\sqrt{2 \\bigl[y_i \\ln(y_i / \\delta_i) - (y_i - \\delta_i)\\bigr]}
-
-    Approximately standard-normal for well-fitting observations.
-
-    Parameters
-    ----------
-    y : np.ndarray
-        Observed counts.
-    delta : np.ndarray
-        Fitted expected counts (δ = X @ w).
-
-    Returns
-    -------
-    np.ndarray
-        Signed deviance residuals, same shape as *y*.
-    """
-    res = np.zeros_like(y, dtype=np.float64)
-    pos = y > 0
-    delta_safe = np.maximum(delta, 1e-300)
-    dev_pos = 2 * (y[pos] * np.log(y[pos] / delta_safe[pos]) - (y[pos] - delta[pos]))
-    dev_pos = np.maximum(dev_pos, 0)  # numerical safety
-    res[pos] = np.sign(y[pos] - delta[pos]) * np.sqrt(dev_pos)
-    zero = ~pos
-    res[zero] = -np.sqrt(2 * delta[zero])
-    return res
-
-
 def poisson_nll_grad(
     w: np.ndarray,
     X: csr_matrix,
@@ -1958,79 +1812,102 @@ def poisson_nll_grad(
     return loss, grad
 
 
-def poisson_nll_grad_lasso(
+def weighted_poisson_nll_grad(
     w: np.ndarray,
     X: csr_matrix,
     y: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[float, np.ndarray]:
+    """Weighted identity-link Poisson NLL and gradient.
+
+    Loss:   Σ_i ω_i · [δ_i − y_i · ln δ_i]
+    Grad:   X.T @ [ω_i · (1 − y_i / δ_i)]
+
+    Parameters
+    ----------
+    w : np.ndarray, shape ``(n_features,)``
+    X : csr_matrix, shape ``(n_samples, n_features)``
+    y : np.ndarray, shape ``(n_samples,)``
+    weights : np.ndarray, shape ``(n_samples,)``
+        Per-observation Huber weights in [0, 1].
+
+    Returns
+    -------
+    loss : float
+    grad : np.ndarray, shape ``(n_features,)``
+    """
+    delta = np.asarray(X @ w).ravel()
+    active = ~((delta == 0.0) & (y == 0.0))
+    d_act = delta[active]
+    y_act = y[active]
+    w_act = weights[active]
+    loss = float((w_act * (d_act - y_act * np.log(d_act))).sum())
+    r = np.zeros(len(y), dtype=np.float64)
+    r[active] = w_act * (1.0 - y_act / d_act)
+    grad = np.asarray(X.T @ r).ravel()
+    return loss, grad
+
+
+def weighted_poisson_nll_grad_lasso(
+    w: np.ndarray,
+    X: csr_matrix,
+    y: np.ndarray,
+    weights: np.ndarray,
     lam: float,
     num_rgrs: int,
     num_runs: int,
 ) -> tuple[float, np.ndarray]:
-    """Identity-link Poisson NLL with group-LASSO penalty, sparse version.
-
-    Penalty:  λ · Σ_k ‖x_k‖₂,  where ``x_k = w[k*R : (k+1)*R]``.
+    """Weighted Poisson NLL with group-LASSO penalty.
 
     Parameters
     ----------
     w : np.ndarray, shape ``(num_rgrs * num_runs,)``
-        Current activity estimate.
     X : csr_matrix
-        Sparse design matrix built by :func:`egs_to_sparse`.
     y : np.ndarray
-        Observed read counts.
+    weights : np.ndarray, shape ``(n_samples,)``
     lam : float
-        Group-LASSO regularisation strength.
     num_rgrs : int
-        Number of RGRs.
     num_runs : int
-        Number of runs (= group size).
 
     Returns
     -------
     loss : float
     grad : np.ndarray, shape ``(num_rgrs * num_runs,)``
     """
-    loss, grad = poisson_nll_grad(w, X, y)
+    loss, grad = weighted_poisson_nll_grad(w, X, y, weights)
     W = w.reshape(num_rgrs, num_runs)
-    norms = np.sqrt((W**2).sum(axis=1))  # (num_rgrs,)
+    norms = np.sqrt((W**2).sum(axis=1))
     safe_norms = np.maximum(norms, 1e-300)
     loss += lam * norms.sum()
-    grad_penalty = lam * (W / safe_norms[:, None])  # (num_rgrs, num_runs)
+    grad_penalty = lam * (W / safe_norms[:, None])
     grad = grad + grad_penalty.ravel()
     return loss, grad
 
 
-def poisson_log_likelihood_sparse(
+def weighted_poisson_log_likelihood_sparse(
     w: np.ndarray,
     X: csr_matrix,
     y: np.ndarray,
+    weights: np.ndarray,
 ) -> float:
-    """Compute the Poisson log-likelihood using a sparse design matrix.
-
-    Returns the *positive* log-likelihood (without penalty).  Used for
-    likelihood-ratio tests.
+    """Weighted Poisson log-likelihood for likelihood-ratio tests.
 
     Parameters
     ----------
     w : np.ndarray, shape ``(n_features,)``
-        Current activity estimate.
     X : csr_matrix
-        Sparse design matrix built by :func:`egs_to_sparse`.
     y : np.ndarray
-        Observed read counts.
+    weights : np.ndarray, shape ``(n_samples,)``
 
     Returns
     -------
     float
-        Log-likelihood value.
+        Weighted log-likelihood value.
     """
     delta = np.asarray(X @ w).ravel()
     active = ~((delta == 0.0) & (y == 0.0))
-    d_act = delta[active]
-    y_act = y[active]
-    return float(
-        (y_act * np.log(d_act)).sum() - d_act.sum() - float(gammaln(y_act + 1).sum())
-    )
+    d_act, y_act, w_act = delta[active], y[active], weights[active]
+    return float((w_act * (y_act * np.log(d_act) - d_act - gammaln(y_act + 1))).sum())
 
 
 # ------------------------------------------------------------------ #
