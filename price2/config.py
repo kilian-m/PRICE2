@@ -48,9 +48,6 @@ class Config:
         Per-locus timeout in seconds.
     memory_limit_gb : int
         Per-worker memory limit in gigabytes.
-    warm_start : bool
-        When ``True``, reuse cached intermediate results stored in the
-        working directory.  When ``False``, recompute from scratch.
     verbose_gtf : bool
         Write GTF files of retained ORFs after each filtering step.
     pseudo_min : float
@@ -138,7 +135,6 @@ class Config:
     processes: int = 80
     timeout: int = 60 * 30
     memory_limit_gb: int = 5
-    warm_start: bool = True
     verbose_gtf: bool = True
     pseudo_min: float = 1e-14
     loci_subset: int = 0

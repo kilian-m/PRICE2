@@ -111,20 +111,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def setup_directories(config: Config) -> None:
-    """Create working and output directories, removing stale ones if needed.
+    """Create working and output directories from scratch.
 
-    When ``config.warm_start`` is *False* any pre-existing working and output
-    directories are deleted before recreation, ensuring a clean run.
+    Any pre-existing working and output directories are deleted before
+    recreation, ensuring a clean run.
 
     Parameters
     ----------
     config : Config
         Fully populated configuration object.
     """
-    if not config.warm_start:
-        for path in (config.w_dir, config.o_dir):
-            if os.path.exists(path):
-                shutil.rmtree(path)
+    for path in (config.w_dir, config.o_dir):
+        if os.path.exists(path):
+            shutil.rmtree(path)
 
     for path in (config.w_dir, config.o_dir):
         os.makedirs(path, exist_ok=True)
