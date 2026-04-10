@@ -14,6 +14,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import pysam
 import numpy as np
+from scipy.stats import trim_mean
 
 from price2.cleavage_model import CleavageModel, read_in_cds_likelihood
 from price2.reference_annotation import ReferenceAnnotation
@@ -392,9 +393,13 @@ class CoverageModel:
 
         with np.errstate(divide="raise"):
             try:
-                factor = float(peak_count / body_counts.mean())
-            except (FloatingPointError, ZeroDivisionError):
+                factor = float(
+                    peak_count / trim_mean(body_counts, proportiontocut=0.25)
+                )
+            except (FloatingPointError, ValueError):
                 factor = 1.0
+            except ZeroDivisionError:
+                factor = 1000.0
 
         return max(1.0, factor)
 
@@ -435,9 +440,13 @@ class CoverageModel:
 
         with np.errstate(divide="raise"):
             try:
-                factor = float(peak_count / body_counts.mean())
-            except (FloatingPointError, ZeroDivisionError):
+                factor = float(
+                    peak_count / trim_mean(body_counts, proportiontocut=0.25)
+                )
+            except (FloatingPointError, ValueError):
                 factor = 1.0
+            except ZeroDivisionError:
+                factor = 1000.0
 
         return max(1.0, factor)
 
@@ -583,7 +592,26 @@ class CoverageModel:
 
         # Start-codon histogram
         x_start = np.arange(_HIST_SIZE) - _START_CODON_IDX
-        colors_start = np.where(x_start == 0, "tab:red", "steelblue")
+
+        # Determine which body positions survive the 50% trim.
+        start_body_idx = np.arange(_HIST_SIZE)[_START_BODY_SLICE]
+        start_body_vals = self.start_hist[_START_BODY_SLICE]
+        q25, q75 = np.percentile(start_body_vals, [25, 75])
+        start_kept = set(
+            start_body_idx[(start_body_vals >= q25) & (start_body_vals <= q75)]
+        )
+
+        colors_start = []
+        for i in range(_HIST_SIZE):
+            if i == _START_CODON_IDX:
+                colors_start.append("tab:red")
+            elif i in start_kept:
+                colors_start.append("steelblue")
+            elif i in set(start_body_idx):
+                colors_start.append("lightsteelblue")
+            else:
+                colors_start.append("steelblue")
+
         ax_start.bar(x_start, self.start_hist, width=1, color=colors_start)
         ax_start.set_xlabel("CDS position relative to start codon")
         ax_start.set_ylabel("P-site read count")
@@ -602,7 +630,26 @@ class CoverageModel:
 
         # Stop-codon histogram
         x_stop = np.arange(_HIST_SIZE) - _STOP_HIST_OFFSET
-        colors_stop = np.where(x_stop == -3, "tab:red", "steelblue")
+
+        # Determine which body positions survive the 50% trim.
+        stop_body_idx = np.arange(_HIST_SIZE)[_STOP_BODY_SLICE]
+        stop_body_vals = self.stop_hist[_STOP_BODY_SLICE]
+        q25, q75 = np.percentile(stop_body_vals, [25, 75])
+        stop_kept = set(
+            stop_body_idx[(stop_body_vals >= q25) & (stop_body_vals <= q75)]
+        )
+
+        colors_stop = []
+        for i in range(_HIST_SIZE):
+            if i == _STOP_PEAK_IDX:
+                colors_stop.append("tab:red")
+            elif i in stop_kept:
+                colors_stop.append("steelblue")
+            elif i in set(stop_body_idx):
+                colors_stop.append("lightsteelblue")
+            else:
+                colors_stop.append("steelblue")
+
         ax_stop.bar(x_stop, self.stop_hist, width=1, color=colors_stop)
         ax_stop.set_xlabel("CDS position relative to CDS end")
         ax_stop.set_ylabel("P-site read count")
