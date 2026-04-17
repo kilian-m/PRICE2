@@ -27,25 +27,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Size of the accumulation arrays used while building the P-site histograms.
-_HIST_SIZE: int = 300
+# Each bin corresponds to one codon (3 nt).
+_HIST_SIZE: int = 120
 
 # Index in the start-histogram that corresponds to CDS position 0 (start codon).
-_START_CODON_IDX: int = 30
+_START_CODON_IDX: int = 10
 
-# Slice over the ORF body in the start-histogram (positions 3, 6, …, 198 of CDS).
-_START_BODY_SLICE: slice = slice(33, 230, 3)
+# Slice over the ORF body in the start-histogram (codons 1 .. 100 of CDS).
+_START_BODY_SLICE: slice = slice(11, 111)
 
 # Index in the stop-histogram that corresponds to the last sense codon before
 # the stop codon (CDS position len(cds) − 3).
-_STOP_PEAK_IDX: int = 217
+_STOP_PEAK_IDX: int = 110
 
 # Offset applied when filling the stop-histogram:
-#   index = p_site_cds_pos − len(cds) + _STOP_HIST_OFFSET
-# so that CDS position len(cds) maps to index _STOP_HIST_OFFSET.
-_STOP_HIST_OFFSET: int = 220
+#   index = p_site_cds_pos // 3 − len(cds) // 3 + _STOP_HIST_OFFSET
+# so that CDS codon len(cds)//3 maps to index _STOP_HIST_OFFSET.
+_STOP_HIST_OFFSET: int = 111
 
 # Slice over the ORF body in the stop-histogram.
-_STOP_BODY_SLICE: slice = slice(_STOP_PEAK_IDX - 198, _STOP_PEAK_IDX, 3)
+_STOP_BODY_SLICE: slice = slice(_STOP_PEAK_IDX - 100, _STOP_PEAK_IDX)
 
 # Minimum number of reads required for reliable factor estimation.
 _MIN_READS: int = 100
@@ -58,11 +59,11 @@ _MIN_DOMINANT_FRACTION: float = 0.8
 _MIN_CODON_LIKELIHOOD: float = 0.01
 
 # Window (in CDS positions) around the start codon used to select reads.
-_START_WINDOW: tuple[int, int] = (-30, 200)
+_START_WINDOW: tuple[int, int] = (-30, 330)
 
 # Window (in CDS positions relative to CDS end) used to select reads for
 # the stop-codon histogram.
-_STOP_WINDOW: tuple[int, int] = (-200, 30)
+_STOP_WINDOW: tuple[int, int] = (-330, 30)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +302,9 @@ class CoverageModel:
                 if iv_on_cds[0] < transcript.coding_length < iv_on_cds[1]:
                     continue
 
-                hist[p_site + _START_CODON_IDX] += 1
+                idx = p_site // 3 + _START_CODON_IDX
+                if 0 <= idx < _HIST_SIZE:
+                    hist[idx] += 1
 
         return hist
 
@@ -352,7 +355,9 @@ class CoverageModel:
                 if iv_on_cds[0] < 0 < iv_on_cds[1]:
                     continue
 
-                hist[p_site - transcript.coding_length + _STOP_HIST_OFFSET] += 1
+                idx = p_site // 3 - transcript.coding_length // 3 + _STOP_HIST_OFFSET
+                if 0 <= idx < _HIST_SIZE:
+                    hist[idx] += 1
 
         return hist
 
@@ -590,7 +595,7 @@ class CoverageModel:
             ax_start, ax_stop = axes
             fig = ax_start.get_figure()
 
-        # Start-codon histogram
+        # Start-codon histogram (x-axis in codon positions)
         x_start = np.arange(_HIST_SIZE) - _START_CODON_IDX
 
         # Determine which body positions survive the 50% trim.
@@ -610,13 +615,13 @@ class CoverageModel:
             elif i in set(start_body_idx):
                 colors_start.append("lightsteelblue")
             else:
-                colors_start.append("steelblue")
+                colors_start.append("lightsteelblue")
 
         ax_start.bar(x_start, self.start_hist, width=1, color=colors_start)
-        ax_start.set_xlabel("CDS position relative to start codon")
+        ax_start.set_xlabel("Codon position relative to translation start")
         ax_start.set_ylabel("P-site read count")
         ax_start.set_title("CDS start")
-        ax_start.set_xlim(-35, 205)
+        ax_start.set_xlim(-12, 105)
         ax_start.text(
             0.95,
             0.95,
@@ -628,7 +633,7 @@ class CoverageModel:
             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
         )
 
-        # Stop-codon histogram
+        # Stop-codon histogram (x-axis in codon positions)
         x_stop = np.arange(_HIST_SIZE) - _STOP_HIST_OFFSET
 
         # Determine which body positions survive the 50% trim.
@@ -648,13 +653,13 @@ class CoverageModel:
             elif i in set(stop_body_idx):
                 colors_stop.append("lightsteelblue")
             else:
-                colors_stop.append("steelblue")
+                colors_stop.append("lightsteelblue")
 
         ax_stop.bar(x_stop, self.stop_hist, width=1, color=colors_stop)
-        ax_stop.set_xlabel("CDS position relative to CDS end")
+        ax_stop.set_xlabel("Codon position relative to translation end")
         ax_stop.set_ylabel("P-site read count")
         ax_stop.set_title("CDS stop")
-        ax_stop.set_xlim(-205, 35)
+        ax_stop.set_xlim(-105, 12)
         ax_stop.text(
             0.3,
             0.95,

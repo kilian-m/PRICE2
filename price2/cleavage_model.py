@@ -423,7 +423,7 @@ class CleavageModel:
         ax1.bar(x, self.dist_starts, width=1, color="steelblue")
         ax1.set_xlabel("read-start position relative to CDS start")
         ax1.set_ylabel("read count")
-        ax1.set_title("P-site around CDS start")
+        ax1.set_title("Read starts around CDS start")
         ax1.set_xlim(-50, 50)
         p_site_offset = int(np.argmax(self.pl))
         ax1.bar(
