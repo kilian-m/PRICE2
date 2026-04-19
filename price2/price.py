@@ -110,23 +110,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def setup_directories(config: Config) -> None:
-    """Create working and output directories from scratch.
+def setup_directories(config: Config) -> bool:
+    """Create working and output directories.
 
-    Any pre-existing working and output directories are deleted before
-    recreation, ensuring a clean run.
+    When ``config.warm_start`` is ``True`` and a populated SQLite
+    database already exists in ``w_dir``, only the output directory is
+    cleared and ``processed_loci.txt`` is removed so that deconvolution
+    reruns all loci.  If the database is absent the run falls back to a
+    full cold start (both directories are wiped and recreated).
+
+    When ``config.warm_start`` is ``False`` both directories are always
+    wiped and recreated.
 
     Parameters
     ----------
     config : Config
         Fully populated configuration object.
-    """
-    for path in (config.w_dir, config.o_dir):
-        if os.path.exists(path):
-            shutil.rmtree(path)
 
-    for path in (config.w_dir, config.o_dir):
-        os.makedirs(path, exist_ok=True)
+    Returns
+    -------
+    bool
+        ``True`` when data collection will be skipped (warm start
+        effective), ``False`` when a full cold run is required.
+    """
+    db_path = os.path.join(config.w_dir, "price.db")
+    warm = config.warm_start and os.path.exists(db_path)
+
+    if warm:
+        if os.path.exists(config.o_dir):
+            shutil.rmtree(config.o_dir)
+        os.makedirs(config.o_dir, exist_ok=True)
+        processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
+        if os.path.exists(processed_loci_path):
+            os.remove(processed_loci_path)
+    else:
+        for path in (config.w_dir, config.o_dir):
+            if os.path.exists(path):
+                shutil.rmtree(path)
+        for path in (config.w_dir, config.o_dir):
+            os.makedirs(path, exist_ok=True)
+
+    return warm
 
 
 def load_genome(fasta_path: str) -> dict:
@@ -158,55 +182,59 @@ def run_pipeline(config: Config) -> None:
     config : Config
         Fully populated configuration object.
     """
-    setup_directories(config)
+    warm = setup_directories(config)
 
-    ref_annotation = _timed(
-        "load reference annotation... ",
-        ReferenceAnnotation,
-        config.gtf_path,
-    )
-
-    genome = _timed(
-        "load genome... ",
-        load_genome,
-        config.fasta_path,
-    )
-
-    # --- Data collection ---
-    data_collector = DataCollector(ref_annotation, genome, config)
-
-    _timed(
-        "compute cleavage and coverage models... ",
-        data_collector.collect_runs,
-    )
-
-    if config.export_dataset_models:
-        _timed(
-            "save dataset model summaries... ",
-            save_dataset_models,
-            data_collector.runs,
-            config.o_dir,
+    if warm:
+        logger.info(
+            "warm start: reusing existing database in %s",
+            config.w_dir,
+        )
+    else:
+        ref_annotation = _timed(
+            "load reference annotation... ",
+            ReferenceAnnotation,
+            config.gtf_path,
         )
 
-    _timed(
-        "collect mappings... ",
-        data_collector.collect_mappings,
-    )
+        genome = _timed(
+            "load genome... ",
+            load_genome,
+            config.fasta_path,
+        )
 
-    _timed(
-        "generate ORFs and save loci... ",
-        data_collector.collect_loci,
-    )
+        # --- Data collection ---
+        data_collector = DataCollector(ref_annotation, genome, config)
+
+        _timed(
+            "compute cleavage and coverage models... ",
+            data_collector.collect_runs,
+        )
+
+        if config.export_dataset_models:
+            _timed(
+                "save dataset model summaries... ",
+                save_dataset_models,
+                data_collector.runs,
+                config.o_dir,
+            )
+
+        _timed(
+            "collect mappings... ",
+            data_collector.collect_mappings,
+        )
+
+        _timed(
+            "generate ORFs and save loci... ",
+            data_collector.collect_loci,
+        )
 
     # --- ORF deconvolution ---
     orf_activity_estimator = ORFActivityEstimator(config)
 
-    n_runs = len(data_collector.runs)
     n_loci = len(orf_activity_estimator.loci_ids)
     n_proc = config.processes
     logger.info(
-        "run ORF deconvolution for %d run(s) and %d loci in %d process(es)...",
-        n_runs,
+        "run ORF deconvolution for %d loci in %d process(es)...",
         n_loci,
         n_proc,
     )

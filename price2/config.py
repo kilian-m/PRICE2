@@ -51,9 +51,6 @@ class Config:
     pseudo_min : float
         Lower bound applied to activity estimates during optimisation to
         avoid ``log(0)`` numerical instability.
-    loci_subset : int
-        Limit the number of loci to process (0 = no limit).  Intended
-        for debugging only.
     min_explained_reads_per_run : int
         Minimum number of reads that must be explained by a single
         transcript per run for that transcript to be retained.
@@ -109,6 +106,11 @@ class Config:
     stop_codons : tuple[str, ...]
         Codons accepted as translation stop sites for ORF candidate
         generation.
+    warm_start : bool
+        When ``True``, skip data collection and reuse the existing working
+        directory (``w_dir``) and its SQLite database.  The pipeline
+        resumes directly at ORF deconvolution.  Requires a prior run to
+        have completed the data-collection phase (default ``False``).
     export_dataset_models : bool
         Write the ``dataset_models/`` directory with cleavage and coverage
         model summaries and plots (default ``True``).
@@ -160,7 +162,6 @@ class Config:
     timeout: int = 60 * 30
     memory_limit_gb: int = 5
     pseudo_min: float = 1e-14
-    loci_subset: int = 0
 
     # ------------------------------------------------------------------ #
     # Transcript pre-filtering                                             #
@@ -220,6 +221,11 @@ class Config:
     # ------------------------------------------------------------------ #
     start_codons: tuple[str, ...] = ("ATG", "CTG", "GTG", "ACG")
     stop_codons: tuple[str, ...] = ("TAA", "TAG", "TGA")
+
+    # ------------------------------------------------------------------ #
+    # Export options                                                        #
+    # ------------------------------------------------------------------ #
+    warm_start: bool = False
 
     # ------------------------------------------------------------------ #
     # Export options                                                        #

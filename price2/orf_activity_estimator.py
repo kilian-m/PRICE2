@@ -72,8 +72,6 @@ class ORFActivityEstimator:
 
         cur.execute("SELECT locus_id FROM loci")
         self.loci_ids = [id for id, in cur.fetchall()]
-        if config.loci_subset > 0:
-            self.loci_ids = self.loci_ids[: config.loci_subset]
 
     def run_orf_deconvolution(self) -> None:
         """Run the full per-locus ORF deconvolution pipeline.
@@ -392,9 +390,7 @@ def process_loc(arguments: tuple):
         if config.export_orfs:
             loc.to_tsv(f"{config.base_o_dir}/final", runs=runs)
         if config.export_regions and not loc.result_df.empty:
-            loc.to_tsv(
-                f"{config.base_o_dir}/final", runs=runs, include_noise=True
-            )
+            loc.to_tsv(f"{config.base_o_dir}/final", runs=runs, include_noise=True)
 
     if config.export_gtf:
         loc.to_gtf(
