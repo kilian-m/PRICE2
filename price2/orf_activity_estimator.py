@@ -105,7 +105,12 @@ class ORFActivityEstimator:
         ra_dir = os.path.join(self.config.o_dir, "regions_activities")
         os.makedirs(ra_dir, exist_ok=True)
 
-        if os.path.exists(f"{self.config.o_dir}/performance_measurements.tsv"):
+        processed_loci_path = os.path.join(self.config.w_dir, "processed_loci.txt")
+        if os.path.exists(processed_loci_path):
+            with open(processed_loci_path) as fh:
+                processed_loc_ids = {line.strip() for line in fh if line.strip()}
+            loci_ids = loci_ids - processed_loc_ids
+        elif os.path.exists(f"{self.config.o_dir}/performance_measurements.tsv"):
             processed_loc_ids = set(
                 pd.read_csv(
                     f"{self.config.o_dir}/performance_measurements.tsv",
@@ -234,9 +239,18 @@ def process_loc(arguments: tuple):
     t2 = time.time()
     performance_measurements["db_time"] = t2 - t1
 
-    if config.verbose_gtf:
-        loc.to_gtf(f"{config.base_o_dir}/all")
-        loc.to_tsv(f"{config.base_o_dir}/all")
+    if config.export_all_steps:
+        if config.export_gtf:
+            loc.to_gtf(
+                f"{config.base_o_dir}/all",
+                write_orfs=config.export_orfs,
+                write_loci=config.export_loci,
+                write_transcripts=config.export_transcripts,
+            )
+        if config.export_tsv and config.export_orfs:
+            loc.to_tsv(f"{config.base_o_dir}/all")
+        if config.export_bed and config.export_orfs:
+            loc.to_bed(f"{config.base_o_dir}/all")
     loc.rgr_filter_sets = {}
 
     # --- Load reads ---
@@ -262,9 +276,18 @@ def process_loc(arguments: tuple):
     if config.coverage_filter:
         loc.coverage_filter_rgrs(config)
 
-    if config.verbose_gtf:
-        loc.to_gtf(f"{config.base_o_dir}/coverage_filtered")
-        loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
+    if config.export_all_steps:
+        if config.export_gtf:
+            loc.to_gtf(
+                f"{config.base_o_dir}/coverage_filtered",
+                write_orfs=config.export_orfs,
+                write_loci=config.export_loci,
+                write_transcripts=config.export_transcripts,
+            )
+        if config.export_tsv and config.export_orfs:
+            loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
+        if config.export_bed and config.export_orfs:
+            loc.to_bed(f"{config.base_o_dir}/coverage_filtered")
     loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
 
     performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
@@ -281,9 +304,18 @@ def process_loc(arguments: tuple):
     t2 = time.time()
     performance_measurements["filter_2_time"] = t2 - t1
 
-    if config.verbose_gtf:
-        loc.to_gtf(f"{config.base_o_dir}/deconvolution_filtered")
-        loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
+    if config.export_all_steps:
+        if config.export_gtf:
+            loc.to_gtf(
+                f"{config.base_o_dir}/deconvolution_filtered",
+                write_orfs=config.export_orfs,
+                write_loci=config.export_loci,
+                write_transcripts=config.export_transcripts,
+            )
+        if config.export_tsv and config.export_orfs:
+            loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
+        if config.export_bed and config.export_orfs:
+            loc.to_bed(f"{config.base_o_dir}/deconvolution_filtered")
 
     # --- Equivalence groups ---
     for tr in loc.transcripts:
@@ -316,9 +348,18 @@ def process_loc(arguments: tuple):
     t2 = time.time()
     performance_measurements["optimization_time"] = t2 - t1
 
-    if config.verbose_gtf:
-        loc.to_gtf(f"{config.base_o_dir}/deconvoluted")
-        loc.to_tsv(f"{config.base_o_dir}/deconvoluted")
+    if config.export_all_steps:
+        if config.export_gtf:
+            loc.to_gtf(
+                f"{config.base_o_dir}/deconvoluted",
+                write_orfs=config.export_orfs,
+                write_loci=config.export_loci,
+                write_transcripts=config.export_transcripts,
+            )
+        if config.export_tsv and config.export_orfs:
+            loc.to_tsv(f"{config.base_o_dir}/deconvoluted")
+        if config.export_bed and config.export_orfs:
+            loc.to_bed(f"{config.base_o_dir}/deconvoluted")
 
     # --- Likelihood-ratio filter ---
     if config.likelihood_ratio_filter:
@@ -347,36 +388,48 @@ def process_loc(arguments: tuple):
     performance_measurements["overall_time"] = t_end - t_start
     performance_measurements["exon_length"] = loc.exon_length
 
-    if not loc.result_df.empty:
-        loc.to_tsv(
-            f"{config.base_o_dir}/final",
-            runs=runs,
-            include_noise=True,
-        )
-    loc.to_gtf(
-        f"{config.base_o_dir}/final",
-        write_orfs=True,
-        write_loci=True,
-        write_transcripts=True,
-    )
-
-    loc.to_tsv(f"{config.base_o_dir}/final", runs=runs)
-
-    if not os.path.exists(f"{config.o_dir}/performance_measurements.tsv"):
-        header = True
-    else:
-        header = False
-    lock = FileLock(f"{config.o_dir}/performance_measurements.tsv.lock")
-    with lock:
-        with open(f"{config.o_dir}/performance_measurements.tsv", "a") as f:
-            f.write(
-                pd.DataFrame([performance_measurements]).to_csv(
-                    header=header,
-                    index=False,
-                    float_format="{:.2e}".format,
-                    sep="\t",
-                )
+    if config.export_tsv:
+        if config.export_orfs:
+            loc.to_tsv(f"{config.base_o_dir}/final", runs=runs)
+        if config.export_regions and not loc.result_df.empty:
+            loc.to_tsv(
+                f"{config.base_o_dir}/final", runs=runs, include_noise=True
             )
+
+    if config.export_gtf:
+        loc.to_gtf(
+            f"{config.base_o_dir}/final",
+            write_orfs=config.export_orfs,
+            write_loci=config.export_loci,
+            write_transcripts=config.export_transcripts,
+        )
+
+    if config.export_bed:
+        if config.export_orfs:
+            loc.to_bed(f"{config.base_o_dir}/final")
+        if config.export_regions and not loc.result_df.empty:
+            loc.to_bed(f"{config.base_o_dir}/final", include_noise=True)
+
+    if config.export_performance_measurements:
+        perf_path = f"{config.o_dir}/performance_measurements.tsv"
+        header = not os.path.exists(perf_path)
+        lock = FileLock(perf_path + ".lock")
+        with lock:
+            with open(perf_path, "a") as f:
+                f.write(
+                    pd.DataFrame([performance_measurements]).to_csv(
+                        header=header,
+                        index=False,
+                        float_format="{:.2e}".format,
+                        sep="\t",
+                    )
+                )
+
+    processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
+    lock = FileLock(processed_loci_path + ".lock")
+    with lock:
+        with open(processed_loci_path, "a") as f:
+            f.write(loc_id + "\n")
 
     if config.save_memory:
         return

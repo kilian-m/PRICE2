@@ -180,12 +180,13 @@ def run_pipeline(config: Config) -> None:
         data_collector.collect_runs,
     )
 
-    _timed(
-        "save dataset model summaries... ",
-        save_dataset_models,
-        data_collector.runs,
-        config.o_dir,
-    )
+    if config.export_dataset_models:
+        _timed(
+            "save dataset model summaries... ",
+            save_dataset_models,
+            data_collector.runs,
+            config.o_dir,
+        )
 
     _timed(
         "collect mappings... ",
@@ -217,6 +218,7 @@ def run_pipeline(config: Config) -> None:
         "generate TPM output... ",
         generate_tpm_output,
         config.o_dir,
+        export_tsv=config.export_tsv,
     )
 
 

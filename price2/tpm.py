@@ -13,7 +13,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-def generate_tpm_output(o_dir: str) -> None:
+def generate_tpm_output(o_dir: str, export_tsv: bool = True) -> None:
     """Convert activity values to TPM and write a parallel TSV file.
 
     Reads ``final_orfs.tsv`` (and, if present, ``final_regions.tsv``)
@@ -30,7 +30,12 @@ def generate_tpm_output(o_dir: str) -> None:
     ----------
     o_dir : str
         Path to the PRICE2 output directory.
+    export_tsv : bool
+        When ``False`` skip TSV output entirely.
     """
+    if not export_tsv:
+        return
+
     ra_dir = os.path.join(o_dir, "regions_activities")
     meta_cols = [
         "orf_id",
@@ -60,6 +65,7 @@ def generate_tpm_output(o_dir: str) -> None:
             continue
 
         df = pd.read_csv(in_path, sep="\t")
+
         run_cols = [c for c in df.columns if c not in cols]
 
         if not run_cols:

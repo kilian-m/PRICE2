@@ -48,8 +48,6 @@ class Config:
         Per-locus timeout in seconds.
     memory_limit_gb : int
         Per-worker memory limit in gigabytes.
-    verbose_gtf : bool
-        Write GTF files of retained ORFs after each filtering step.
     pseudo_min : float
         Lower bound applied to activity estimates during optimisation to
         avoid ``log(0)`` numerical instability.
@@ -111,6 +109,32 @@ class Config:
     stop_codons : tuple[str, ...]
         Codons accepted as translation stop sites for ORF candidate
         generation.
+    export_dataset_models : bool
+        Write the ``dataset_models/`` directory with cleavage and coverage
+        model summaries and plots (default ``True``).
+    export_performance_measurements : bool
+        Write ``performance_measurements.tsv`` with per-locus timing and
+        filtering statistics (default ``False``).
+    export_all_steps : bool
+        When ``True``, write output files for every filtering step.
+        When ``False`` (default) only the final results are exported.
+    export_tsv : bool
+        Write TSV output files (default ``True``).
+    export_gtf : bool
+        Write GTF output files (default ``False``).
+    export_bed : bool
+        Write BED12 output files (default ``True``).
+    export_orfs : bool
+        Include ORF entries in output files (default ``True``).
+    export_regions : bool
+        Include all regions (ORFs + NOISE) in output files (default
+        ``False``).  Produces ``*_regions.*`` files alongside
+        ``*_orfs.*``.
+    export_loci : bool
+        Include locus interval entries in GTF output (default ``False``).
+    export_transcripts : bool
+        Include transcript/NOISE entries in GTF output (default
+        ``False``).
     """
 
     # ------------------------------------------------------------------ #
@@ -135,7 +159,6 @@ class Config:
     processes: int = 80
     timeout: int = 60 * 30
     memory_limit_gb: int = 5
-    verbose_gtf: bool = True
     pseudo_min: float = 1e-14
     loci_subset: int = 0
 
@@ -197,6 +220,20 @@ class Config:
     # ------------------------------------------------------------------ #
     start_codons: tuple[str, ...] = ("ATG", "CTG", "GTG", "ACG")
     stop_codons: tuple[str, ...] = ("TAA", "TAG", "TGA")
+
+    # ------------------------------------------------------------------ #
+    # Export options                                                        #
+    # ------------------------------------------------------------------ #
+    export_dataset_models: bool = True
+    export_performance_measurements: bool = False
+    export_all_steps: bool = False
+    export_tsv: bool = True
+    export_gtf: bool = False
+    export_bed: bool = True
+    export_orfs: bool = True
+    export_regions: bool = False
+    export_loci: bool = False
+    export_transcripts: bool = False
 
     # ------------------------------------------------------------------ #
     # Factory                                                              #

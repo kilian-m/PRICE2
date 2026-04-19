@@ -711,6 +711,31 @@ class Locus:
                     else:
                         f.write(rgr.to_tsv_line(self.id))
 
+    def to_bed(
+        self,
+        prefix: str,
+        include_noise: bool = False,
+    ) -> None:
+        """Append region results to a BED12 file.
+
+        Parameters
+        ----------
+        prefix : str
+            Path prefix; the file is named ``<prefix>_regions.bed`` when
+            *include_noise* is ``True``, otherwise ``<prefix>_orfs.bed``.
+        include_noise : bool
+            When ``True`` NOISE regions are written alongside ORFs.
+        """
+        suffix = "regions" if include_noise else "orfs"
+        path = f"{prefix}_{suffix}.bed"
+        lock = FileLock(path + ".lock")
+        with lock:
+            with open(path, "a") as f:
+                for rgr in self.rgr_set:
+                    if not include_noise and rgr.type != "ORF":
+                        continue
+                    f.write(rgr.to_bed_line())
+
     def to_fasta(
         self,
         prefix: str,

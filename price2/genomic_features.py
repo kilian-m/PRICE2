@@ -435,3 +435,61 @@ class ReadGeneratingRegion:
             f"{self.id}\t{self.transcript.gene_id}\t{loc_id}\t"
             f"{self.full_genomic_region}\t{orf_type_str}\n"
         )
+
+    # Colours used in BED itemRgb column, matched in order (first wins).
+    _BED_COLOURS: list[tuple[str, str]] = [
+        ("pcRNA-ORF", "255,192,203"),
+        ("lincRNA-ORF", "128,128,128"),
+        ("varRNA-ORF", "160,160,160"),
+        ("N terminal", "0,200,200"),
+        ("uoORF", "255,140,0"),
+        ("doORF", "180,220,0"),
+        ("iORF", "200,0,200"),
+        ("uORF", "255,0,0"),
+        ("dORF", "0,200,0"),
+        ("cORF", "0,128,255"),
+    ]
+    _BED_COLOUR_DEFAULT: str = "100,100,100"
+
+    def _bed_colour(self) -> str:
+        orf_type = self.orf_type or ""
+        for key, colour in self._BED_COLOURS:
+            if key in orf_type:
+                return colour
+        return self._BED_COLOUR_DEFAULT
+
+    def to_bed_line(self) -> str:
+        """Serialise this RGR as a BED12 line.
+
+        Returns a single tab-separated BED12 record (0-based, half-open
+        coordinates) terminated by ``\\n``.  The ``name`` field is
+        ``<orf_id>:<gene_id>:<orf_type>``.  ``itemRgb`` is set based on
+        :attr:`orf_type`.
+
+        Returns
+        -------
+        str
+            BED12 line terminated by ``\\n``.
+        """
+        gr = self.full_genomic_region
+        chrom_start = gr.intervals[0].start
+        chrom_end = gr.intervals[-1].end
+        orf_type_str = self.orf_type if self.orf_type is not None else ""
+        name = f"{self.id}:{self.transcript.gene_id}:{orf_type_str}"
+        score = 0
+        strand = gr.strand
+        thick_start = chrom_start
+        thick_end = chrom_end
+        colour = self._bed_colour()
+        block_count = len(gr.intervals)
+        block_sizes = ",".join(
+            str(iv.end - iv.start) for iv in gr.intervals
+        )
+        block_starts = ",".join(
+            str(iv.start - chrom_start) for iv in gr.intervals
+        )
+        return (
+            f"{gr.chrom}\t{chrom_start}\t{chrom_end}\t{name}\t{score}\t"
+            f"{strand}\t{thick_start}\t{thick_end}\t{colour}\t"
+            f"{block_count}\t{block_sizes}\t{block_starts}\n"
+        )
