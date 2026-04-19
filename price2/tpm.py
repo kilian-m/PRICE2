@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 def generate_tpm_output(o_dir: str, export_tsv: bool = True) -> None:
     """Convert activity values to TPM and write a parallel TSV file.
 
-    Reads ``final_orfs.tsv`` (and, if present, ``final_regions.tsv``)
+    Reads ``orfs.tsv`` (and, if present, ``regions.tsv``)
     from ``<o_dir>/regions_activities/``, converts activity values
     (reads per nucleotide) to Transcripts Per Million (TPM) per run,
-    and writes the results to ``final_orfs_tpm.tsv`` (and
-    ``final_regions_tpm.tsv``).
+    and writes the results to ``orfs_tpm.tsv`` (and
+    ``regions_tpm.tsv``).
 
     TPM for region *i* in run *j* is defined as::
 
@@ -58,8 +58,8 @@ def generate_tpm_output(o_dir: str, export_tsv: bool = True) -> None:
         ("orfs", "orf_id", meta_cols),
         ("regions", "region_id", region_meta_cols),
     ]:
-        in_path = os.path.join(ra_dir, f"final_{suffix}.tsv")
-        out_path = os.path.join(ra_dir, f"final_{suffix}_tpm.tsv")
+        in_path = os.path.join(ra_dir, f"{suffix}.tsv")
+        out_path = os.path.join(ra_dir, f"{suffix}_tpm.tsv")
 
         if not os.path.exists(in_path):
             continue

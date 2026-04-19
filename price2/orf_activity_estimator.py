@@ -388,13 +388,13 @@ def process_loc(arguments: tuple):
 
     if config.export_tsv:
         if config.export_orfs:
-            loc.to_tsv(f"{config.base_o_dir}/final", runs=runs)
+            loc.to_tsv(f"{config.base_o_dir}/", runs=runs)
         if config.export_regions and not loc.result_df.empty:
-            loc.to_tsv(f"{config.base_o_dir}/final", runs=runs, include_noise=True)
+            loc.to_tsv(f"{config.base_o_dir}/", runs=runs, include_noise=True)
 
     if config.export_gtf:
         loc.to_gtf(
-            f"{config.base_o_dir}/final",
+            f"{config.base_o_dir}/",
             write_orfs=config.export_orfs,
             write_loci=config.export_loci,
             write_transcripts=config.export_transcripts,
@@ -402,9 +402,9 @@ def process_loc(arguments: tuple):
 
     if config.export_bed:
         if config.export_orfs:
-            loc.to_bed(f"{config.base_o_dir}/final")
+            loc.to_bed(f"{config.base_o_dir}/")
         if config.export_regions and not loc.result_df.empty:
-            loc.to_bed(f"{config.base_o_dir}/final", include_noise=True)
+            loc.to_bed(f"{config.base_o_dir}/", include_noise=True)
 
     if config.export_performance_measurements:
         perf_path = f"{config.o_dir}/performance_measurements.tsv"

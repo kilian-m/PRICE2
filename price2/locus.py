@@ -630,15 +630,16 @@ class Locus:
         write_orfs : bool
             Write ORF-type RGRs.
         """
+        sep = "" if prefix.endswith("/") else "_"
         if write_loci:
-            path = f"{prefix}_loci.gtf"
+            path = f"{prefix}{sep}loci.gtf"
             lock = FileLock(path + ".lock")
             with lock:
                 with open(path, "a") as f:
                     f.write(self.gtf_line())
 
         if write_transcripts:
-            path = f"{prefix}_transcripts.gtf"
+            path = f"{prefix}{sep}transcripts.gtf"
             lock = FileLock(path + ".lock")
             with lock:
                 with open(path, "a") as f:
@@ -647,7 +648,7 @@ class Locus:
                             f.write(rgr.to_gtf(self.id))
 
         if write_orfs:
-            path = f"{prefix}_orfs.gtf"
+            path = f"{prefix}{sep}orfs.gtf"
             lock = FileLock(path + ".lock")
             with lock:
                 with open(path, "a") as f:
@@ -682,7 +683,8 @@ class Locus:
         """
         suffix = "regions" if include_noise else "orfs"
         id_col = "region_id" if include_noise else "orf_id"
-        path = f"{prefix}_{suffix}.tsv"
+        sep = "" if prefix.endswith("/") else "_"
+        path = f"{prefix}{sep}{suffix}.tsv"
         lock = FileLock(path + ".lock")
         with lock:
             # Write header once when activity columns are requested.
@@ -727,7 +729,8 @@ class Locus:
             When ``True`` NOISE regions are written alongside ORFs.
         """
         suffix = "regions" if include_noise else "orfs"
-        path = f"{prefix}_{suffix}.bed"
+        sep = "" if prefix.endswith("/") else "_"
+        path = f"{prefix}{sep}{suffix}.bed"
         lock = FileLock(path + ".lock")
         with lock:
             with open(path, "a") as f:
