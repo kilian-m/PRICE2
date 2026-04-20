@@ -190,6 +190,19 @@ class DataCollector:
                         self.loci_set,
                     )
                 )
+
+        db = sql.connect(self.db_path)
+        cur = db.cursor()
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reads_locus_id ON reads(locus_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trc_locus_id "
+            "ON transcript_read_counts(locus_id)"
+        )
+        db.commit()
+        db.close()
+
         logger.info("Read mappings collected.")
 
     def get_chromosome_order(self) -> None:
