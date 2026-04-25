@@ -221,8 +221,9 @@ def process_loc(arguments: tuple):
 
     # --- Load locus and runs from database ---
     db_path = f"{config.w_dir}/price.db"
-    db = sql.connect(db_path)
+    db = sql.connect(db_path, timeout=120)
     cur = db.cursor()
+    cur.execute("PRAGMA busy_timeout = 120000")
     cur.execute("SELECT * FROM loci WHERE locus_id = ?", (loc_id,))
     loc = loads(cur.fetchone()[1])
     performance_measurements["chrom"] = loc.iv.chrom

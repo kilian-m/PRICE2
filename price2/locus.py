@@ -791,8 +791,9 @@ class Locus:
         db_path : str
             Path to the ``price.db`` SQLite database.
         """
-        db = sql.connect(db_path)
+        db = sql.connect(db_path, timeout=120)
         cur = db.cursor()
+        cur.execute("PRAGMA busy_timeout = 120000")
         reads_dfs = cur.execute(
             """
             SELECT * FROM reads 
