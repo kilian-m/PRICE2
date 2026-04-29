@@ -1701,6 +1701,34 @@ class Locus:
 # ------------------------------------------------------------------ #
 
 
+def _chi2_logsf_asymptotic(x: float, k: int) -> float:
+    """Asymptotic log upper-tail of chi-squared for large x.
+
+    Uses the divergent asymptotic series for the upper regularized
+    incomplete gamma function Q(s, z) with s = k/2, z = x/2:
+
+        log Q(s, z) = -z + (s-1) log(z) - log Γ(s)
+                     + log(1 + (s-1)/z + (s-1)(s-2)/z² + ...)
+
+    The series is truncated before the terms start to grow.
+    """
+    s = 0.5 * k
+    z = 0.5 * x
+    leading = -z + (s - 1.0) * np.log(z) - gammaln(s)
+    term = 1.0
+    total = 1.0
+    prev_abs = 1.0
+    for n in range(1, 64):
+        term *= (s - n) / z
+        if abs(term) > prev_abs:
+            break
+        total += term
+        prev_abs = abs(term)
+        if abs(term) < 1e-16 * abs(total):
+            break
+    return leading + np.log(total)
+
+
 def wilks_test_p(
     log_likelihood_full: float,
     log_likelihood_reduced: float,
@@ -1723,7 +1751,12 @@ def wilks_test_p(
         Log p-value (use ``np.exp(result)`` for the p-value).
     """
     λ = -2 * (log_likelihood_reduced - log_likelihood_full)
-    return chi2.logsf(λ, df_diff)
+    if λ <= 0:
+        return 0.0
+    logp = chi2.logsf(λ, df_diff)
+    if not np.isfinite(logp):
+        logp = _chi2_logsf_asymptotic(λ, df_diff)
+    return logp
 
 
 # ------------------------------------------------------------------ #
