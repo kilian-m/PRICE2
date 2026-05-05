@@ -12,6 +12,7 @@ import logging
 import os
 import HTSeq
 import pysam
+from pyfaidx import Fasta
 import sqlite3 as sql
 from pickle import dumps, loads
 import zlib
@@ -53,7 +54,7 @@ class DataCollector:
     def __init__(
         self,
         reference_annotation: ReferenceAnnotation,
-        genome: dict[str, HTSeq.Sequence],
+        genome: Fasta,
         config: Config,
     ) -> None:
         """Initialise the DataCollector.
@@ -62,8 +63,8 @@ class DataCollector:
         ----------
         reference_annotation : ReferenceAnnotation
             Parsed reference annotation used to define loci.
-        genome : dict[str, HTSeq.Sequence]
-            Mapping from chromosome name to its nucleotide sequence.
+        genome : pyfaidx.Fasta
+            Indexed FASTA handle keyed by chromosome name.
         config : Config
             Run configuration.
         """

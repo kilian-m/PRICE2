@@ -24,6 +24,7 @@ from pickle import loads
 
 import HTSeq
 import numpy as np
+from pyfaidx import Fasta
 
 logger = logging.getLogger(__name__)
 import pandas as pd
@@ -274,7 +275,7 @@ class Locus:
 
     def make_rgrs(
         self,
-        genome: dict[str, HTSeq.Sequence],
+        genome: Fasta,
         config: Config,
         min_length_to_end: int = 30,
     ) -> None:
@@ -289,8 +290,8 @@ class Locus:
 
         Parameters
         ----------
-        genome : dict[str, HTSeq.Sequence]
-            Chromosome-keyed genome sequences.
+        genome : pyfaidx.Fasta
+            Indexed FASTA handle keyed by chromosome name.
         config : Config
             Configuration providing ``start_codons`` and ``stop_codons``.
         min_length_to_end : int
@@ -742,7 +743,7 @@ class Locus:
     def to_fasta(
         self,
         prefix: str,
-        genome: dict[str, HTSeq.Sequence],
+        genome: Fasta,
     ) -> None:
         """Append ORF sequences (with flanking context) to a FASTA file.
 
@@ -753,8 +754,8 @@ class Locus:
         ----------
         prefix : str
             Directory prefix; the file is ``<prefix>/orfs.fasta``.
-        genome : dict[str, HTSeq.Sequence]
-            Chromosome-keyed genome sequences.
+        genome : pyfaidx.Fasta
+            Indexed FASTA handle keyed by chromosome name.
         """
 
         path = f"{prefix}/orfs.fasta"
@@ -767,7 +768,7 @@ class Locus:
                 min(len(rgr.transcript), iv_on_transcript[1] + 20),
             )
             gr = rgr.transcript.exons.map_to_global(iv_on_transcript)
-            seq = gr.get_sequence(genome).seq.upper()
+            seq = gr.get_sequence(genome).upper()
 
             lock = FileLock(path + ".lock")
             with lock:

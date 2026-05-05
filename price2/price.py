@@ -17,6 +17,7 @@ import sys
 import time
 
 import HTSeq
+from pyfaidx import Fasta
 
 from price2.config import Config
 from price2.data_collector import DataCollector
@@ -153,8 +154,12 @@ def setup_directories(config: Config) -> bool:
     return warm
 
 
-def load_genome(fasta_path: str) -> dict:
-    """Load the reference genome from a FASTA file.
+def load_genome(fasta_path: str) -> Fasta:
+    """Open the reference genome FASTA via :mod:`pyfaidx`.
+
+    Returns an ``mmap``-backed handle so that the OS shares a single
+    page cache across worker processes.  The ``.fai`` index is built
+    on first access if not already present.
 
     Parameters
     ----------
@@ -163,10 +168,10 @@ def load_genome(fasta_path: str) -> dict:
 
     Returns
     -------
-    dict
-        Mapping from sequence name to ``HTSeq.Sequence`` object.
+    pyfaidx.Fasta
+        Chromosome-keyed indexed FASTA handle.
     """
-    return {seq.name: seq for seq in HTSeq.FastaReader(fasta_path)}
+    return Fasta(fasta_path)
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ dependencies:
   # Genomics
   - htseq
   - pysam
+  - pyfaidx              # mmap-backed FASTA access for shared-memory parallel workers
   - samtools             # called via subprocess for BAM downsampling
   # Parallelism & system
   - pebble

@@ -19,6 +19,7 @@ from typing import Literal
 import HTSeq
 import pandas as pd
 from HTSeq import GenomicInterval
+from pyfaidx import Fasta
 
 Strand = Literal["+", "-"]
 """Genomic strand: either ``'+'`` (forward) or ``'-'`` (reverse)."""
@@ -357,7 +358,7 @@ class GenomicRegion:
             chrom=self.chrom,
         )
 
-    def get_sequence(self, genome: dict[str, HTSeq._HTSeq.Sequence]) -> str:
+    def get_sequence(self, genome: Fasta) -> str:
         """Extract the nucleotide sequence for this region.
 
         On the negative strand each exon is reverse-complemented so
@@ -365,23 +366,22 @@ class GenomicRegion:
 
         Parameters
         ----------
-        genome : dict[str, HTSeq._HTSeq.Sequence]
-            Mapping of chromosome names to genome sequences.
+        genome : pyfaidx.Fasta
+            Indexed FASTA handle keyed by chromosome name.
 
         Returns
         -------
         str
             Spliced nucleotide sequence.
         """
+        chrom = genome[self.chrom]
         parts: list[str] = []
         if self.strand == "+":
             for iv in self.intervals:
-                parts.append(str(genome[self.chrom][iv.start : iv.end]))
+                parts.append(str(chrom[iv.start : iv.end]))
         elif self.strand == "-":
             for iv in self.intervals[::-1]:
-                parts.append(
-                    str(genome[self.chrom][iv.start : iv.end].get_reverse_complement())
-                )
+                parts.append(str(-chrom[iv.start : iv.end]))
         return "".join(parts)
 
     def contains_to_stop(self, other: GenomicRegion) -> bool:
