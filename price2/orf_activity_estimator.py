@@ -21,9 +21,11 @@ import multiprocessing as mp
 import pandas as pd
 from filelock import FileLock
 from pebble import ProcessPool
+from pyfaidx import Fasta
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+from price2.data_collector import build_rgrs
 from price2.equivalence_groups import make_equivalence_groups
 
 # Must be set before any ProcessPool is created.  ``forkserver`` is
@@ -40,6 +42,20 @@ from pebble.common import CONSTS as _pebble_consts
 _pebble_consts.channel_lock_timeout = 600
 
 logger = logging.getLogger(__name__)
+
+# Worker-local pyfaidx handle cache.  ``max_tasks=1`` means each worker
+# handles one locus, so this typically opens once per worker; the cache
+# keeps the code defensive if that ever changes.
+_genome_cache: dict[str, Fasta] = {}
+
+
+def _get_genome(path: str) -> Fasta:
+    """Return a worker-local :class:`pyfaidx.Fasta` for *path*."""
+    handle = _genome_cache.get(path)
+    if handle is None:
+        handle = Fasta(path)
+        _genome_cache[path] = handle
+    return handle
 
 
 class ORFActivityEstimator:
@@ -237,6 +253,22 @@ def process_loc(arguments: tuple):
 
     t2 = time.time()
     performance_measurements["db_time"] = t2 - t1
+
+    # --- Build ORF candidates (formerly DataCollector.collect_loci) ---
+    t1 = time.time()
+    genome = _get_genome(config.fasta_path)
+    min_explained_reads = config.min_explained_reads_per_run * len(runs)
+    has_transcripts = build_rgrs(
+        loc, db_path, genome, config, min_explained_reads
+    )
+    performance_measurements["build_rgrs_time"] = time.time() - t1
+    if not has_transcripts:
+        processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
+        lock = FileLock(processed_loci_path + ".lock")
+        with lock:
+            with open(processed_loci_path, "a") as f:
+                f.write(loc_id + "\n")
+        return None if config.save_memory else (loc, performance_measurements)
 
     if config.export_all_steps:
         if config.export_gtf:

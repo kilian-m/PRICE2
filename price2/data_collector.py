@@ -301,22 +301,17 @@ class DataCollector:
                 pass
 
     def collect_loci(self) -> None:
-        """Filter transcripts per locus and build read-generating regions.
+        """Persist pre-RGR locus skeletons to the ``loci`` table.
 
-        Loads transcript read-count data from the database, greedily selects
-        transcripts that explain the most reads (above
-        ``config.min_explained_reads_per_run`` per run), prunes the transcript
-        set of each locus accordingly, and calls
-        :meth:`~price2.locus.Locus.make_rgrs` to construct read-generating
-        regions.  Serialises each non-empty locus to the ``loci`` table.
+        Per-locus transcript filtering and ORF candidate generation
+        (formerly performed here serially) now run inside the parallel
+        deconvolution workers via :func:`build_rgrs`.  This method only
+        records the locus skeletons and the run count needed to compute
+        ``min_explained_reads`` downstream.
         """
-        logger.info("Generating ORF candidates and saving loci...")
+        logger.info("Saving locus skeletons...")
         db = sql.connect(self.db_path)
         cur = db.cursor()
-        num_runs = cur.execute("SELECT count(*) FROM runs").fetchone()[0]
-        min_explained_reads = self.config.min_explained_reads_per_run * num_runs
-
-        loc_dict = {loc.id: loc for loc in self.loci_set}
 
         cur.execute(
             """CREATE TABLE IF NOT EXISTS loci (
@@ -328,86 +323,127 @@ class DataCollector:
             loc_id for loc_id, in cur.execute("SELECT locus_id FROM loci").fetchall()
         }
         loci_ids_to_process = {loc.id for loc in self.loci_set} - processed_loci_ids
+        loc_dict = {loc.id: loc for loc in self.loci_set}
 
         for loc_id in loci_ids_to_process:
             locus = loc_dict[loc_id]
             cur.execute(
-                """SELECT * FROM transcript_read_counts
-                        WHERE locus_id = ?""",
-                (locus.id,),
+                "INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus))
             )
-
-            # Aggregate transcript read counts across all runs.
-            transcript_read_counts: dict = {}
-            for entry in cur.fetchall():
-                for k, v in loads(zlib.decompress(entry[2])).items():
-                    try:
-                        transcript_read_counts[k] += v
-                    except KeyError:
-                        transcript_read_counts[k] = v
-
-            tr_ids = [t.id for t in locus.transcripts]
-
-            explaining_transcripts_reads_list = []
-
-            if tr_ids and transcript_read_counts:
-                n_tr = len(tr_ids)
-                n_rs = len(transcript_read_counts)
-                tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
-
-                M = np.zeros((n_rs, n_tr), dtype=bool)
-                counts = np.zeros(n_rs, dtype=np.float64)
-
-                for row_i, (read_set, count) in enumerate(
-                    transcript_read_counts.items()
-                ):
-                    counts[row_i] = count
-                    for member in read_set:
-                        if member in tr_to_col:
-                            M[row_i, tr_to_col[member]] = True
-
-                while counts.sum() > 0:
-                    weighted = M.T @ counts
-                    best_col = int(np.argmax(weighted))
-                    best_score = weighted[best_col]
-                    if best_score == 0:
-                        break
-                    explaining_transcripts_reads_list.append(
-                        (tr_ids[best_col], best_score)
-                    )
-                    counts[M[:, best_col]] = 0.0
-
-            transcripts_dict = {tr.id: tr for tr in locus.transcripts}
-
-            locus.keep_transcripts = [
-                transcripts_dict[tr_id]
-                for tr_id, count in explaining_transcripts_reads_list
-                if count > min_explained_reads
-            ]
-
-            locus.transcripts_number = len(locus.transcripts)
-            locus.transcripts = locus.keep_transcripts
-
-            new_tr_intervals = HTSeq.GenomicArray(
-                list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
-            )
-
-            for step_iv, step_set in locus.transcript_intervals.steps():
-                new_step_set = set()
-                for tr in step_set:
-                    if tr in locus.transcripts:
-                        new_step_set.add(tr)
-                new_tr_intervals[step_iv] = new_step_set
-
-            locus.transcript_intervals = new_tr_intervals
-
-            if locus.transcripts:
-                locus.make_rgrs(self.genome, self.config)
-                cur.execute("INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus)))
 
         db.commit()
         db.close()
-        logger.info("Saved %d loci to database.", len(loci_ids_to_process))
+        logger.info("Saved %d locus skeletons.", len(loci_ids_to_process))
+
+
+def build_rgrs(
+    locus: Locus,
+    db_path: str,
+    genome: Fasta,
+    config: Config,
+    min_explained_reads: float,
+) -> bool:
+    """Filter a locus's transcripts by read support and build its RGRs.
+
+    Greedily selects transcripts that jointly explain the most observed
+    reads above ``min_explained_reads``, prunes the locus's transcript
+    set and ``transcript_intervals`` accordingly, and calls
+    :meth:`~price2.locus.Locus.make_rgrs` when transcripts remain.
+
+    Parameters
+    ----------
+    locus : Locus
+        Pre-RGR locus skeleton, mutated in place.
+    db_path : str
+        Path to ``price.db`` (read-only access for
+        ``transcript_read_counts``).
+    genome : pyfaidx.Fasta
+        Worker-local indexed FASTA handle.
+    config : Config
+        Parsed PRICE configuration.
+    min_explained_reads : float
+        Threshold (count, not per-run) used to discard transcripts with
+        insufficient read support.
+
+    Returns
+    -------
+    bool
+        ``True`` when the locus retained at least one transcript and
+        RGRs were built; ``False`` for empty loci that downstream code
+        should skip.
+    """
+    db = sql.connect(db_path, timeout=120)
+    cur = db.cursor()
+    cur.execute("PRAGMA busy_timeout = 120000")
+    cur.execute(
+        "SELECT * FROM transcript_read_counts WHERE locus_id = ?",
+        (locus.id,),
+    )
+
+    transcript_read_counts: dict = {}
+    for entry in cur.fetchall():
+        for k, v in loads(zlib.decompress(entry[2])).items():
+            try:
+                transcript_read_counts[k] += v
+            except KeyError:
+                transcript_read_counts[k] = v
+    db.close()
+
+    tr_ids = [t.id for t in locus.transcripts]
+    explaining_transcripts_reads_list = []
+
+    if tr_ids and transcript_read_counts:
+        n_tr = len(tr_ids)
+        n_rs = len(transcript_read_counts)
+        tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
+
+        M = np.zeros((n_rs, n_tr), dtype=bool)
+        counts = np.zeros(n_rs, dtype=np.float64)
+
+        for row_i, (read_set, count) in enumerate(transcript_read_counts.items()):
+            counts[row_i] = count
+            for member in read_set:
+                if member in tr_to_col:
+                    M[row_i, tr_to_col[member]] = True
+
+        while counts.sum() > 0:
+            weighted = M.T @ counts
+            best_col = int(np.argmax(weighted))
+            best_score = weighted[best_col]
+            if best_score == 0:
+                break
+            explaining_transcripts_reads_list.append(
+                (tr_ids[best_col], best_score)
+            )
+            counts[M[:, best_col]] = 0.0
+
+    transcripts_dict = {tr.id: tr for tr in locus.transcripts}
+
+    locus.keep_transcripts = [
+        transcripts_dict[tr_id]
+        for tr_id, count in explaining_transcripts_reads_list
+        if count > min_explained_reads
+    ]
+
+    locus.transcripts_number = len(locus.transcripts)
+    locus.transcripts = locus.keep_transcripts
+
+    new_tr_intervals = HTSeq.GenomicArray(
+        list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
+    )
+    for step_iv, step_set in locus.transcript_intervals.steps():
+        new_step_set = set()
+        for tr in step_set:
+            if tr in locus.transcripts:
+                new_step_set.add(tr)
+        new_tr_intervals[step_iv] = new_step_set
+    locus.transcript_intervals = new_tr_intervals
+
+    if not locus.transcripts:
+        return False
+
+    locus.make_rgrs(genome, config)
+    return True
 
 
 def collect_mappings_run(
