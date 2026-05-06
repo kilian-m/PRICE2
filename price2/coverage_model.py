@@ -384,7 +384,7 @@ class CoverageModel:
         if peak_count < _MIN_READS:
             logger.warning(
                 "Only %d reads at start codon position. "
-                "Low evidence for coverage model.",
+                "Low evidence for coverage model.  sample: %s",
                 int(peak_count),
                 bam_path,
             )
