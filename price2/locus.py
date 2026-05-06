@@ -1821,35 +1821,51 @@ def egs_to_sparse(
     y : np.ndarray, shape ``(n_EGs_total,)``
         Observed read counts.
     """
-    rows_idx: list[int] = []
-    cols_idx: list[int] = []
-    data: list[float] = []
-    y_list: list[float] = []
-    row = 0
+    # Pass 1: count rows (non-empty EGs) and total non-zeros so we can
+    # pre-size numpy arrays.  Building Python int/float lists with one
+    # entry per CSR cell costs ~80 B/cell on CPython and dominates peak
+    # RSS at this stage; numpy buffers are 12 B/cell instead.
+    n_rows = 0
+    nnz = 0
+    for run in runs:
+        for (rgr_frame_covpos, _, _), _ in locus_egs[run].items():
+            sz = len(rgr_frame_covpos)
+            if sz == 0:
+                continue
+            n_rows += 1
+            nnz += sz
 
+    rows_idx = np.empty(nnz, dtype=np.int64)
+    cols_idx = np.empty(nnz, dtype=np.int64)
+    data = np.empty(nnz, dtype=np.float64)
+    y = np.empty(n_rows, dtype=np.float64)
+
+    # Pass 2: populate.
+    row = 0
+    cell = 0
     for run_index, run in enumerate(runs):
         for (rgr_frame_covpos, read_length, oua), eg in locus_egs[run].items():
             if not rgr_frame_covpos:
                 continue
-            y_list.append(float(eg.read_count))
+            y[row] = eg.read_count
+            length = eg.length
+            oua_int = int(oua)
             for rgr, frame, cov_pos in rgr_frame_covpos:
                 f = 3 if frame is None else frame
-                val = (
-                    eg.length
-                    * cm_lut[run_index, read_length, f, int(oua)]
+                rows_idx[cell] = row
+                cols_idx[cell] = rgr.index * num_runs + run_index
+                data[cell] = (
+                    length
+                    * cm_lut[run_index, read_length, f, oua_int]
                     * coverage_params[run_index, cov_pos.value]
                 )
-                rows_idx.append(row)
-                cols_idx.append(rgr.index * num_runs + run_index)
-                data.append(val)
+                cell += 1
             row += 1
 
-    n_rows = row
     n_cols = num_rgrs * num_runs
     X = csr_matrix(
         (data, (rows_idx, cols_idx)), shape=(n_rows, n_cols), dtype=np.float64
     )
-    y = np.array(y_list, dtype=np.float64)
     return X, y
 
 
