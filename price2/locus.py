@@ -1123,9 +1123,6 @@ class Locus:
                     self.egs[run][
                         (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
                     ].read_count += read_count
-                    self.egs[run][
-                        (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
-                    ].reads.add(rsa)
                     run.read_count += read_count
                 except KeyError:
                     self.uncounted_reads += read_count
@@ -1392,29 +1389,44 @@ class Locus:
         entries whose keys become identical after removed RGRs are
         dropped from the key's ``rgr_frame_covpos`` frozenset.
 
+        Two memory optimisations:
+
+        * an ``old_to_new`` cache maps each old key to its remapped key, so
+          the new ``rgr_frame_covpos`` frozenset is materialised only once
+          per distinct old key (rather than once per (old key, run));
+        * per-run dicts are rebuilt one at a time and the old dict for
+          that run is released immediately, bounding the doubled-allocation
+          transient to a single run instead of the full ``len(runs)``.
+
         Parameters
         ----------
         runs : list[RiboSeqRun]
             Ribo-seq runs whose EGs should be rebuilt.
         """
-        new_egs = {}
+        rgr_set = self.rgr_set
+        old_to_new: dict[tuple, tuple] = {}
+
+        new_egs: dict = {}
         for run in runs:
-            new_egs[run] = defaultdict(EquivalenceGroup)
-            for old_eg_key in self.egs[run]:
-                (rgr_frame_covpos, read_length, oua) = old_eg_key
-                new_rgr_frame_covpos = set()
-                for rgr, frame, covpos in rgr_frame_covpos:
-                    if rgr in self.rgr_set:
-                        new_rgr_frame_covpos.add((rgr, frame, covpos))
-                new_rgr_frame_covpos = frozenset(new_rgr_frame_covpos)
-                new_eg_key = (new_rgr_frame_covpos, read_length, oua)
+            old_run_egs = self.egs.pop(run)
+            new_run_egs: dict = defaultdict(EquivalenceGroup)
+            for old_eg_key, old_eg in old_run_egs.items():
+                new_eg_key = old_to_new.get(old_eg_key)
+                if new_eg_key is None:
+                    rgr_frame_covpos, read_length, oua = old_eg_key
+                    new_rgr_frame_covpos = frozenset(
+                        (rgr, frame, covpos)
+                        for rgr, frame, covpos in rgr_frame_covpos
+                        if rgr in rgr_set
+                    )
+                    new_eg_key = (new_rgr_frame_covpos, read_length, oua)
+                    old_to_new[old_eg_key] = new_eg_key
 
-                new_eg = new_egs[run][new_eg_key]
-                old_eg = self.egs[run][old_eg_key]
-
+                new_eg = new_run_egs[new_eg_key]
                 new_eg.length += old_eg.length
                 new_eg.read_count += old_eg.read_count
-                new_eg.reads |= old_eg.reads
+
+            new_egs[run] = new_run_egs
 
         self.egs = new_egs
 

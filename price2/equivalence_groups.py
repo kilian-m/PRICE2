@@ -29,13 +29,12 @@ class EquivalenceGroup:
         Number of genomic positions (in codon-space) belonging to this group.
     read_count : int
         Number of observed reads assigned to this group.
-    reads : set
-        Individual read identifiers assigned to this group.
     """
+
+    __slots__ = ("length", "read_count")
 
     length: int
     read_count: int
-    reads: set
 
     def __init__(
         self,
@@ -44,7 +43,6 @@ class EquivalenceGroup:
     ) -> None:
         self.length = length
         self.read_count = read_count
-        self.reads = set()
 
 
 class NodeType(Enum):
@@ -162,7 +160,12 @@ class EquivalenceGroupIntervals:
             if sc < ec:
                 self.intervals[ph].append((sc, ec, tup))
 
-    def get_egs_dict(self, read_length: int, oua: bool) -> dict:
+    def get_egs_dict(
+        self,
+        read_length: int,
+        oua: bool,
+        key_cache: dict | None = None,
+    ) -> dict:
         """Convert internal intervals to a dict of EquivalenceGroups.
 
         Parameters
@@ -172,6 +175,12 @@ class EquivalenceGroupIntervals:
         oua : bool
             Whether this is for the upstream-annotated (True) or downstream
             (False) cleavage model variant.
+        key_cache : dict or None
+            Optional shared cache used to intern the
+            ``(frozenset_of_rgr_frame_covpos, read_length, oua)`` key tuples
+            so that equivalent keys produced for different runs reference the
+            same Python objects.  Pass the same dict across all calls to share
+            keys.
 
         Returns
         -------
@@ -205,7 +214,10 @@ class EquivalenceGroupIntervals:
 
             for pos, typ, tup in events:
                 if prev_pos is not None and pos != prev_pos and active:
-                    egs[(frozenset(active), read_length, oua)].length += pos - prev_pos
+                    key = (frozenset(active), read_length, oua)
+                    if key_cache is not None:
+                        key = key_cache.setdefault(key, key)
+                    egs[key].length += pos - prev_pos
                 if typ == 0:  # end event
                     cnt = active.get(tup, 1) - 1
                     if cnt <= 0:
@@ -623,6 +635,7 @@ def get_equivalence_groups_dict(
     egis: dict[Transcript, EquivalenceGroupIntervals],
     read_length: int,
     oua: bool,
+    key_cache: dict | None = None,
 ) -> dict:
     """Aggregate equivalence groups over the full read-equivalence DAG.
 
@@ -642,6 +655,9 @@ def get_equivalence_groups_dict(
         Read length for which these groups are computed.
     oua : bool
         Whether this is for the upstream-annotated cleavage model variant.
+    key_cache : dict or None
+        Optional shared cache used to intern equivalence-group keys across
+        runs and read lengths.
 
     Returns
     -------
@@ -669,7 +685,7 @@ def get_equivalence_groups_dict(
                 for tr in current_node.transcripts_positions.keys()
             ],
             current_node.iv.length,
-        ).get_egs_dict(read_length, oua)
+        ).get_egs_dict(read_length, oua, key_cache=key_cache)
 
         for k, v in node_eg_dict.items():
             try:
@@ -687,6 +703,12 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     the read-equivalence DAG and collects equivalence groups for each
     transcript in the locus.
 
+    A shared key cache interns the
+    ``(frozenset_of_rgr_frame_covpos, read_length, oua)`` tuples so that
+    identical keys produced for different runs reference the same Python
+    objects.  In typical multi-run loci this reduces ``loc.egs`` memory by
+    one to two orders of magnitude.
+
     Parameters
     ----------
     loc :
@@ -702,6 +724,7 @@ def make_equivalence_groups(loc, runs: list) -> dict:
         :class:`EquivalenceGroup`.
     """
     egs: dict = {}
+    key_cache: dict = {}
     splice_graph = make_splice_graph(loc.transcript_intervals)
 
     for run in runs:
@@ -716,7 +739,11 @@ def make_equivalence_groups(loc, runs: list) -> dict:
                 }
 
                 for k, v in get_equivalence_groups_dict(
-                    read_equivalence_graph, egis, read_length, oua
+                    read_equivalence_graph,
+                    egis,
+                    read_length,
+                    oua,
+                    key_cache=key_cache,
                 ).items():
 
                     try:
