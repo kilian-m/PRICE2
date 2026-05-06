@@ -411,9 +411,7 @@ def process_loc(arguments: tuple):
     performance_measurements["activity_time"] = t2 - t1
 
     # --- Collect final statistics ---
-    performance_measurements["gene_number"] = len(
-        {rgr.transcript.gene_id for rgr in loc.rgr_set_complete}
-    )
+    performance_measurements["gene_number"] = len(loc.gene_ids_complete)
     performance_measurements["transcripts_number"] = loc.transcripts_number
     t_end = time.time()
     performance_measurements["overall_time"] = t_end - t_start

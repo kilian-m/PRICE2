@@ -394,7 +394,9 @@ class Locus:
             for iv in rgr.genomic_region.intervals:
                 self.rgr_intervals[iv] += rgr
 
-        self.rgr_set_complete = self.rgr_set
+        self.gene_ids_complete = {
+            rgr.transcript.gene_id for rgr in self.rgr_set
+        }
 
     def get_rgr_frame_covpos(
         self,
