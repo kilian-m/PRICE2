@@ -76,7 +76,10 @@ def generate_tpm_output(o_dir: str, export_tsv: bool = True) -> None:
         col_sums[col_sums == 0] = 1.0  # avoid division by zero
         tpm = (activities / col_sums) * 1e6
 
-        df_tpm = df[cols].copy()
-        df_tpm[run_cols] = tpm
+        df_tpm = pd.concat(
+            [df[cols].reset_index(drop=True),
+             pd.DataFrame(tpm, columns=run_cols)],
+            axis=1,
+        )
 
         df_tpm.to_csv(out_path, sep="\t", index=False, float_format="%.2e")
