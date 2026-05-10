@@ -344,8 +344,20 @@ class Locus:
                     transcript.id,
                     (0, len(transcript.exons)),
                 )
-                self.rgr_set.add(noise)
-                transcript.rgr_set.add(noise)
+                if noise not in noise_dict:
+                    noise_dict[noise] = noise
+                else:
+                    existing = noise_dict[noise]
+                    existing_span = (
+                        existing.dist_to_transcript_end
+                        + existing.dist_to_transcript_start
+                    )
+                    new_span = (
+                        noise.dist_to_transcript_end
+                        + noise.dist_to_transcript_start
+                    )
+                    if new_span > existing_span:
+                        noise_dict[noise] = noise
 
             seq = transcript.exons.get_sequence(genome)
             c = 0
