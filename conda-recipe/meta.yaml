@@ -50,7 +50,7 @@ about:
   summary: "Detect actively translated ORFs from multiple Ribo-seq datasets using group-LASSO penalized Poisson regression."
   description: |
     PRICE 2 detects actively translated open reading frames based on multiple
-    Ribo-seq or TI-seq datasets. It builds on ideas from PRICE and a generative
+    Ribo-seq or QTI-seq datasets. It builds on ideas from PRICE and a generative
     model for isoform deconvolution, using group-LASSO penalized Poisson
     regression over read equivalence groups.
   license: GPL-3.0-or-later

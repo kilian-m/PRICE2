@@ -3,7 +3,7 @@
 </div>
 
 ## About
-PRICE 2 is a tool to detect translated open reading frames based on multiple ribo-seq or TI-seq datasets. It builds on ideas introduced in [PRICE](https://github.com/erhard-lab/gedi/wiki/Price) and the well established [generative model for isoform deconvolution](https://academic.oup.com/bioinformatics/article/25/8/1026/324948R).
+PRICE 2 is a tool to detect translated open reading frames based on multiple ribo-seq or QTI-seq datasets. It builds on ideas introduced in [PRICE](https://github.com/erhard-lab/gedi/wiki/Price) and the well established [generative model for isoform deconvolution](https://academic.oup.com/bioinformatics/article/25/8/1026/324948R).
 
 ## User Guide
 ### Installation
