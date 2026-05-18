@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://github.com/kilian-m/PRICE2/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 79f246c73d46d681db3d5e536a6cff2e387655fb53aefe3b3df8774fb33795e3
+  sha256: 9eb96e66a867889f6adba576137aeb6d75f4f36b096c82fd01630010f4e005c6
 
 build:
   number: 0
