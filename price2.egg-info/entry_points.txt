@@ -1,2 +1,0 @@
-[console_scripts]
-price2 = price2.price:main

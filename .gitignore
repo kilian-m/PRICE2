@@ -17,3 +17,8 @@
 .DS_Store
 tests/
 general.yaml
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

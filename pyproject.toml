@@ -1,10 +1,51 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "price2"
-version = "0.1.0"
+version = "1.0.0"
+description = "Detect actively translated ORFs from multiple Ribo-seq datasets using group-LASSO penalized Poisson regression."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Kilian Maidhof", email = "kilianmaidhof@googlemail.com" },
+]
+keywords = ["ribo-seq", "translation", "ORF", "genomics", "bioinformatics"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "numba",
+    "HTSeq",
+    "pysam",
+    "pyfaidx",
+    "pebble",
+    "filelock",
+    "psutil",
+    "tqdm",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/kilian-m/PRICE2"
+Repository = "https://github.com/kilian-m/PRICE2"
+Issues = "https://github.com/kilian-m/PRICE2/issues"
 
 [project.scripts]
 price2 = "price2.price:main"
+
+[tool.setuptools]
+packages = ["price2"]
