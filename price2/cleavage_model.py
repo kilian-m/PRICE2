@@ -57,10 +57,12 @@ class CleavageModel:
             self.dist_starts = dist_starts
         if table is not None:
             self.table = table
-        self.cds_lut = np.zeros(
-            (len(self.pl) + len(self.pr) + 3, 3, 2), dtype=np.float64
-        )
-        for length in range(len(self.pl) + len(self.pr) + 3):
+        # Axis 0 size is len(pl) + len(pr) + 4 so the longest physically
+        # possible read (len(pl) + len(pr) + 2 bases of cleavage + 1
+        # untemplated addition) has a valid LUT entry.
+        lut_len = len(self.pl) + len(self.pr) + 4
+        self.cds_lut = np.zeros((lut_len, 3, 2), dtype=np.float64)
+        for length in range(lut_len):
             for frame in range(3):
                 for oua in range(2):
                     self.cds_lut[length, frame, oua] = read_in_cds_likelihood(
@@ -73,10 +75,8 @@ class CleavageModel:
                         region_start=0,
                         region_end=10**10,
                     )
-        self.noise_lut = np.zeros(
-            (len(self.pl) + len(self.pr) + 3, 2), dtype=np.float64
-        )
-        for length in range(len(self.pl) + len(self.pr) + 3):
+        self.noise_lut = np.zeros((lut_len, 2), dtype=np.float64)
+        for length in range(lut_len):
             for oua in range(2):
                 self.noise_lut[length, oua] = read_in_noise_likelihood(
                     pl=self.pl,
