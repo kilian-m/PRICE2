@@ -90,6 +90,45 @@ class RiboSeqAlignment:
     # ------------------------------------------------------------------
 
     @classmethod
+    def from_region(
+        cls,
+        genomic_region: GenomicRegion,
+        untemplated_addition: bool,
+        unique: bool,
+        read_count: int,
+    ) -> "RiboSeqAlignment":
+        """Construct a :class:`RiboSeqAlignment` from pre-built attributes.
+
+        Fast path used by the vectorized loader in
+        :meth:`~price2.locus.Locus.get_reads_from_db`.  Bypasses the
+        ``__init__`` type dispatch and the per-row pandas access of
+        :meth:`_init_from_dataframe`.
+
+        Parameters
+        ----------
+        genomic_region : GenomicRegion
+            Spliced genomic region of the alignment, in chromosome order.
+        untemplated_addition : bool
+            Whether a 1-nt 5' untemplated addition was detected.
+        unique : bool
+            ``True`` when the fragment maps to exactly one locus
+            (``mapping_positions`` is set to 1, otherwise 2).
+        read_count : int
+            Collapsed read count.
+
+        Returns
+        -------
+        RiboSeqAlignment
+            Fully initialised instance.
+        """
+        obj: RiboSeqAlignment = cls.__new__(cls)
+        obj.genomic_region = genomic_region
+        obj.untemplated_addition = untemplated_addition
+        obj.mapping_positions = 1 if unique else 2
+        obj.read_count = read_count
+        return obj
+
+    @classmethod
     def from_pysam(cls, aln: "pysam.AlignedSegment") -> "RiboSeqAlignment":
         """Construct a :class:`RiboSeqAlignment` from a pysam alignment.
 

@@ -38,6 +38,7 @@ from price2.config import Config
 from price2.coverage_model import CoveragePosition
 from price2.equivalence_groups import EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
+from price2.genomic_region import GenomicRegion
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 
@@ -818,20 +819,63 @@ class Locus:
         )
         self.run_read_count = {}
         self.rsas_dict = {}
+        chrom = self.iv.chrom
+        strand = self.iv.strand
+        # Memoize GenomicRegion objects by their interval-coordinate signature.
+        # Reads are exact-deduplicated within a run at collection time, but the
+        # same coordinates recur across runs (typically 40-80% of reads); sharing
+        # one immutable GenomicRegion across runs avoids rebuilding its intervals
+        # and hash.  Scoped per locus, so it is freed when the locus is done.
+        region_cache: dict[tuple, GenomicRegion] = {}
         for _, run_id, blob in reads_dfs:
-            rsas_run = []
             reads_df = loads(zlib.decompress(blob))
-            reads_df["chrom"] = self.iv.chrom
-            reads_df["strand"] = self.iv.strand
-            reads_df["read_id"] = reads_df["is_first_iv"].cumsum()
-            for _, read_df in reads_df.groupby("read_id"):
-                rsa = RiboSeqAlignment(read_df)
-                rsas_run.append(rsa)
+
+            # Vectorized: pull columns into numpy arrays and locate per-read
+            # boundaries from is_first_iv, avoiding groupby / iterrows / per-row
+            # Series construction (the dominant cost of read loading).
+            is_first = reads_df["is_first_iv"].to_numpy()
+            starts = reads_df["start"].to_numpy()
+            ends = reads_df["end"].to_numpy()
+            uas = reads_df["untemplated_addition"].to_numpy()
+            uniques = reads_df["unique"].to_numpy()
+            counts = reads_df["count"].to_numpy()
+
+            boundaries = np.flatnonzero(is_first)
+            read_ends = np.append(boundaries[1:], len(is_first))
+
+            rsas_run = []
+            for b, e in zip(boundaries.tolist(), read_ends.tolist()):
+                if e - b == 1:
+                    sig = (int(starts[b]), int(ends[b]))
+                else:
+                    sig = tuple(
+                        (int(starts[j]), int(ends[j])) for j in range(b, e)
+                    )
+                gr = region_cache.get(sig)
+                if gr is None:
+                    intervals = [
+                        HTSeq.GenomicInterval(
+                            chrom, int(starts[j]), int(ends[j]), strand
+                        )
+                        for j in range(b, e)
+                    ]
+                    gr = GenomicRegion(
+                        intervals=intervals, chrom=chrom, strand=strand
+                    )
+                    region_cache[sig] = gr
+                rsas_run.append(
+                    RiboSeqAlignment.from_region(
+                        gr,
+                        untemplated_addition=bool(uas[b]),
+                        unique=bool(uniques[b]),
+                        read_count=int(counts[b]),
+                    )
+                )
             self.rsas_dict[run_id] = rsas_run
 
-            self.run_read_count[run_id] = reads_df[reads_df["is_first_iv"]][
-                "count"
-            ].sum()
+            self.run_read_count[run_id] = int(
+                counts[boundaries].astype(np.int64).sum()
+            )
 
     def make_well_fitting_reads(self, runs: list[RiboSeqRun]) -> None:
         """Count well-fitting reads per RGR and run.
