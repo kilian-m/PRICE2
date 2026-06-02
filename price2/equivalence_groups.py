@@ -696,6 +696,45 @@ def get_equivalence_groups_dict(
     return egs_dict
 
 
+def cleavage_dist_signature(cleavage_model, read_length: int, oua: bool) -> tuple:
+    """Signature of the cleavage distances that determine equivalence groups.
+
+    :func:`make_equivalence_intervals` reads the cleavage model only through
+    ``get_dist_to_orf_start`` / ``get_dist_to_orf_end`` for frames
+    ``(None, 0, 1, 2)``.  Two runs that share this signature for a given
+    ``(read_length, oua)`` therefore produce identical equivalence groups, so
+    the :func:`get_equivalence_groups_dict` result can be reused between them.
+
+    Parameters
+    ----------
+    cleavage_model :
+        Cleavage model providing ``get_dist_to_orf_start`` and
+        ``get_dist_to_orf_end``.
+    read_length : int
+        Read length to model.
+    oua : bool
+        Whether to use the upstream-annotated cleavage model variant.
+
+    Returns
+    -------
+    tuple
+        ``((start, end), ...)`` distance pairs for frames ``(None, 0, 1, 2)``;
+        a missing entry (``KeyError``) is recorded as ``None``.
+    """
+    vals = []
+    for frame in (None, 0, 1, 2):
+        try:
+            start = cleavage_model.get_dist_to_orf_start(read_length, oua, frame)
+        except KeyError:
+            start = None
+        try:
+            end = cleavage_model.get_dist_to_orf_end(read_length, oua, frame)
+        except KeyError:
+            end = None
+        vals.append((start, end))
+    return tuple(vals)
+
+
 def make_equivalence_groups(loc, runs: list) -> dict:
     """Compute all equivalence groups for a locus across all runs.
 
@@ -708,6 +747,16 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     identical keys produced for different runs reference the same Python
     objects.  In typical multi-run loci this reduces ``loc.egs`` memory by
     one to two orders of magnitude.
+
+    Two cross-run caches avoid redundant work, which matters most when many
+    runs are present:
+
+    * ``traverse_dag`` depends only on ``(splice_graph, read_length)``, not the
+      run, so the read-equivalence DAG is built once per read length.
+    * :func:`get_equivalence_groups_dict` depends on the run only through the
+      cleavage-distance signature (see :func:`cleavage_dist_signature`), so its
+      contribution is computed once per ``(read_length, oua, signature)`` and
+      reused across runs that share that signature.
 
     Parameters
     ----------
@@ -727,29 +776,55 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     key_cache: dict = {}
     splice_graph = make_splice_graph(loc.transcript_intervals)
 
-    for run in runs:
-        egs[run] = {}
-        cleavage_model = run.cleavage_model
-        for read_length in run.cleavage_model.non_zero_lengths:
-            read_equivalence_graph = traverse_dag(splice_graph, read_length)
-            for oua in [True, False]:
-                egis = {
-                    tr: make_equivalence_intervals(tr, cleavage_model, read_length, oua)
-                    for tr in loc.transcripts
-                }
+    # read_length -> read-equivalence DAG (run-independent).
+    dag_cache: dict = {}
+    # (read_length, oua, cleavage signature) -> {eg_key: length}.  A fresh
+    # EquivalenceGroup is created per run on lookup because read_count is
+    # accumulated per run downstream, so the cached objects must not be shared.
+    contrib_cache: dict = {}
 
-                for k, v in get_equivalence_groups_dict(
-                    read_equivalence_graph,
-                    egis,
+    for run in runs:
+        run_egs: dict = {}
+        egs[run] = run_egs
+        cleavage_model = run.cleavage_model
+        for read_length in cleavage_model.non_zero_lengths:
+            read_equivalence_graph = dag_cache.get(read_length)
+            if read_equivalence_graph is None:
+                read_equivalence_graph = traverse_dag(splice_graph, read_length)
+                dag_cache[read_length] = read_equivalence_graph
+
+            for oua in (True, False):
+                ckey = (
                     read_length,
                     oua,
-                    key_cache=key_cache,
-                ).items():
+                    cleavage_dist_signature(cleavage_model, read_length, oua),
+                )
+                contrib = contrib_cache.get(ckey)
+                if contrib is None:
+                    egis = {
+                        tr: make_equivalence_intervals(
+                            tr, cleavage_model, read_length, oua
+                        )
+                        for tr in loc.transcripts
+                    }
+                    contrib = {
+                        k: v.length
+                        for k, v in get_equivalence_groups_dict(
+                            read_equivalence_graph,
+                            egis,
+                            read_length,
+                            oua,
+                            key_cache=key_cache,
+                        ).items()
+                    }
+                    contrib_cache[ckey] = contrib
 
-                    try:
-                        egs[run][k].length += v.length
-                    except KeyError:
-                        egs[run][k] = v
+                for k, length in contrib.items():
+                    eg = run_egs.get(k)
+                    if eg is None:
+                        run_egs[k] = EquivalenceGroup(length=length)
+                    else:
+                        eg.length += length
 
     return egs
 
