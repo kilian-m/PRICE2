@@ -26,7 +26,7 @@ pip install --no-deps .
 ### Data preparation
 PRICE 2 requires a reference annotation in GTF format, a reference genome in FASTA format and one or more mapped ribo-seq datasets in BAM format. Before you apply PRICE 2 you should check the quality of your fastqs, remove rRNA reads and clip adapters. Use the [STAR aligner](https://github.com/alexdobin/STAR) to map the reads and make sure to use 
 ```bash
---outSAMtype BAM SortedByCoordinate
+--outSAMtype BAM SortedByCoordinate --alignEndsType Local --outSAMattributes nM MD NH
 ```
 <!-- is this really relevant? are there other STAR parameters that should be considered -->
 

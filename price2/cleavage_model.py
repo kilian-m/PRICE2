@@ -1058,8 +1058,9 @@ def compute_ll(
             n = table[length, frame, untemplated_addition, c]
 
             if n > 0:
-                i = np.arange(frame1, min(len(pl), length - 3), 3)
-                p = (pl[i] * pr[length - i - 3 - 1]).sum()
+                # Visible soft-clip UTA -> plain footprint geometry (see repeat()).
+                i = np.arange(frame, min(len(pl), length - 2), 3)
+                p = (pl[i] * pr[length - i - 3]).sum()
                 ll += n * np.log(p)
 
             untemplated_addition = 0
@@ -1150,12 +1151,11 @@ def repeat(
                     frame1 = (frame - 1) % 3
                     left = np.arange(frame, length - 3, 3)
                     left1 = np.arange(frame1, length - 3, 3)
-                    total_p = eps
 
-                    total_p += (pl[left1] * pr[length - left1 - 3 - 1]).sum()
-                    s = pl[left1] * pr[length - left1 - 3 - 1] / total_p * n
-                    ql1[left1 + 1] += s
-                    qr1[length - left1 - 1 - 3] += s
+                    total_p = eps + (pl[left] * pr[length - left - 3]).sum()
+                    s = pl[left] * pr[length - left - 3] / total_p * n
+                    ql0[left] += s
+                    qr0[length - left - 3] += s
 
                     qu += n
 
