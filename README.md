@@ -28,7 +28,7 @@ PRICE 2 requires a reference annotation in GTF format, a reference genome in FAS
 ```bash
 --outSAMtype BAM SortedByCoordinate --alignEndsType Local --outSAMattributes nM MD NH
 ```
-<!-- is this really relevant? are there other STAR parameters that should be considered -->
+`--alignEndsType Local` is important to detect untemplated nucleotide additions / RT nucleotides
 
 ### Running PRICE 2
 PRICE 2 exposes many parameters but in most use cases the defaults should work well. We advice to set the parameters in a json config file (alternatively they can be set when calling PRICE 2 from the CLI).
