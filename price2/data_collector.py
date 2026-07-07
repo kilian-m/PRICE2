@@ -20,6 +20,7 @@ import pandas as pd
 import numpy as np
 from multiprocessing import Pool
 from collections import defaultdict
+from filelock import FileLock
 
 from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
@@ -580,29 +581,37 @@ def collect_mappings_run(
                 (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
             )
 
-    db = sql.connect(db_path, timeout=60)
-    cur = db.cursor()
-    cur.executemany(
-        """INSERT INTO reads (
-                     locus_id,
-                     run_id,
-                     reads_blob
-                     ) VALUES (?, ?, ?)""",
-        reads_rows,
-    )
-
-    cur.executemany(
-        """INSERT INTO transcript_read_counts (
-                     locus_id,
-                     run_id,
-                     transcript_read_counts_blob
-                     ) VALUES (?, ?, ?)""",
-        transcript_count_rows,
-    )
-    if multimap_rows:
+    # Serialise the per-run write: several BAM workers finish and flush
+    # their (large) blob batches at once, and recording multimapping
+    # alignments adds millions more rows per run, so a bare concurrent
+    # write raced past the busy-timeout ("database is locked").  A FileLock
+    # queues the writers; the long busy-timeout is a further backstop.
+    lock = FileLock(db_path + ".collect.lock")
+    with lock:
+        db = sql.connect(db_path, timeout=600)
+        cur = db.cursor()
+        cur.execute("PRAGMA busy_timeout = 600000")
         cur.executemany(
-            "INSERT INTO multimap_alignments VALUES (?, ?, ?, ?)",
-            multimap_rows,
+            """INSERT INTO reads (
+                         locus_id,
+                         run_id,
+                         reads_blob
+                         ) VALUES (?, ?, ?)""",
+            reads_rows,
         )
-    db.commit()
-    db.close()
+
+        cur.executemany(
+            """INSERT INTO transcript_read_counts (
+                         locus_id,
+                         run_id,
+                         transcript_read_counts_blob
+                         ) VALUES (?, ?, ?)""",
+            transcript_count_rows,
+        )
+        if multimap_rows:
+            cur.executemany(
+                "INSERT INTO multimap_alignments VALUES (?, ?, ?, ?)",
+                multimap_rows,
+            )
+        db.commit()
+        db.close()
