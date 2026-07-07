@@ -685,87 +685,120 @@ def e_step(db_path: str, iteration: int) -> float:
     Returns
     -------
     float
-        ``max |w_new - w_old| / (total mass)`` — 0.0 when there are no
-        multimap groups.
+        The L1 fraction of total read mass reassigned this iteration
+        (``Σ|w_new − w_old| / Σ w_new``) — 0.0 when there are no multimap
+        groups.
+
+    Notes
+    -----
+    Vectorised with pandas/numpy: the per-group normalisation and per-slot
+    accumulation are ``groupby`` reductions rather than a Python loop over
+    every multimap group, which matters at genome scale (tens of millions
+    of groups/slots).  The result is identical to the scalar formulation
+    up to floating-point summation order.
     """
+    import numpy as np
+    import pandas as pd
+
     db = _prepare_writer(db_path)
     cur = db.cursor()
+    it_next = iteration + 1
 
-    # λ for this iteration, keyed by slot.
-    lam: dict = {}
-    cur.execute(
+    def _frame(sql, params, cols):
+        # One bulk fetchall then build the frame: markedly faster than
+        # pandas.read_sql at tens of millions of rows.
+        return pd.DataFrame(cur.execute(sql, params).fetchall(), columns=cols)
+
+    slots = _frame(
+        "SELECT mmg_id, locus_id, group_key FROM multimap_group_slots",
+        (),
+        ["mmg_id", "locus_id", "group_key"],
+    )
+    if slots.empty:
+        db.close()
+        return 0.0
+    groups = _frame(
+        "SELECT mmg_id, run_id, count FROM multimap_groups",
+        (),
+        ["mmg_id", "run_id", "count"],
+    )
+    lam = _frame(
         "SELECT run_id, locus_id, group_key, lam FROM group_lambdas "
         "WHERE iteration = ?",
         (iteration,),
+        ["run_id", "locus_id", "group_key", "lam"],
     )
-    for run_id, locus_id, gk, l in cur.fetchall():
-        lam[(run_id, locus_id, gk)] = l
 
-    # MMG membership + counts.
-    slots_by_mmg: dict = defaultdict(list)
-    cur.execute("SELECT mmg_id, locus_id, group_key FROM multimap_group_slots")
-    for mmg_id, locus_id, gk in cur.fetchall():
-        slots_by_mmg[mmg_id].append((locus_id, gk))
+    # Attach each slot's run_id + MMG read count (via mmg_id), then its λ
+    # (via the slot key); a slot with no λ this iteration defaults to 0.
+    df = slots.merge(groups, on="mmg_id", how="left")
+    df = df.merge(lam, on=["run_id", "locus_id", "group_key"], how="left")
+    df["lam"] = df["lam"].fillna(0.0)
 
-    counts: dict = {}
-    runs: dict = {}
-    cur.execute("SELECT mmg_id, run_id, count FROM multimap_groups")
-    for mmg_id, run_id, count in cur.fetchall():
-        counts[mmg_id] = count
-        runs[mmg_id] = run_id
+    # Responsibility per slot: λ / Σλ within its group, or a uniform 1/n
+    # split when the group's λ sums to zero (its read fits no ORF anywhere,
+    # so it is neither lost nor arbitrarily concentrated).
+    grp = df.groupby("mmg_id", sort=False)["lam"]
+    lam_sum = grp.transform("sum").to_numpy()
+    n_slots = grp.transform("size").to_numpy()
+    lam_arr = df["lam"].to_numpy()
+    pos = lam_sum > 0.0
+    frac = np.where(pos, lam_arr / np.where(pos, lam_sum, 1.0), 1.0 / n_slots)
+    df["weight"] = df["count"].to_numpy() * frac
 
-    new_weight: dict = defaultdict(float)
-    for mmg_id, slots in slots_by_mmg.items():
-        run_id = runs[mmg_id]
-        count = counts[mmg_id]
-        lams = [lam.get((run_id, locus_id, gk), 0.0) for locus_id, gk in slots]
-        total = sum(lams)
-        if total <= 0.0:
-            # No ORF explains the read anywhere → split uniformly so the
-            # read is neither lost nor arbitrarily concentrated.
-            fracs = [1.0 / len(slots)] * len(slots)
-        else:
-            fracs = [l / total for l in lams]
-        for (locus_id, gk), frac in zip(slots, fracs):
-            new_weight[(run_id, locus_id, gk)] += count * frac
+    # New weight per slot = Σ contributions across the MMGs sharing it.
+    new_w = df.groupby(
+        ["run_id", "locus_id", "group_key"], sort=False, as_index=False
+    )["weight"].sum()
 
-    # Previous weights (what this M-step actually used) for convergence.
-    old_weight: dict = {}
-    cur.execute(
+    # Convergence = fraction of total read mass reassigned vs the weights
+    # this M-step used (an L1 / total-variation measure, robust to the
+    # number of slots).  From iteration 1 on the total mass is conserved
+    # (each read's weight sums to one), so the denominator is stable;
+    # iteration 0's large value reflects the one-off removal of the classic
+    # full-weight double counting.
+    old = _frame(
         "SELECT run_id, locus_id, group_key, weight FROM group_weights "
         "WHERE iteration = ?",
         (iteration,),
+        ["run_id", "locus_id", "group_key", "weight"],
     )
-    for run_id, locus_id, gk, w in cur.fetchall():
-        old_weight[(run_id, locus_id, gk)] = w
-
-    # Convergence = fraction of total read mass reassigned this iteration
-    # (an L1 / total-variation measure).  Robust to the number of slots,
-    # unlike a single-slot maximum.  From iteration 1 on the total mass is
-    # conserved (each read's weight sums to one across its slots), so the
-    # denominator is stable; iteration 0's large value reflects the
-    # one-off removal of the classic full-weight double counting.
-    total_mass = sum(new_weight.values())
-    moved = 0.0
-    for slot, w_new in new_weight.items():
-        moved += abs(w_new - old_weight.get(slot, 0.0))
-    for slot, w_old in old_weight.items():
-        if slot not in new_weight:
-            moved += abs(w_old)
+    merged = new_w.merge(
+        old,
+        on=["run_id", "locus_id", "group_key"],
+        how="outer",
+        suffixes=("_new", "_old"),
+    )
+    w_new = np.nan_to_num(merged["weight_new"].to_numpy(), nan=0.0)
+    w_old = np.nan_to_num(merged["weight_old"].to_numpy(), nan=0.0)
+    total_mass = float(w_new.sum())
+    moved = float(np.abs(w_new - w_old).sum())
     rel = moved / total_mass if total_mass > 0 else 0.0
 
     # Clear any orphan rows for the target iteration before writing, so a
     # shrunken slot set cannot leave stale weights behind.
-    cur.execute(
-        "DELETE FROM group_weights WHERE iteration = ?", (iteration + 1,)
-    )
+    cur.execute("DELETE FROM group_weights WHERE iteration = ?", (it_next,))
+    n = len(new_w)
     cur.executemany(
-        "INSERT OR REPLACE INTO group_weights VALUES (?, ?, ?, ?, ?)",
-        [
-            (iteration + 1, run_id, locus_id, gk, w)
-            for (run_id, locus_id, gk), w in new_weight.items()
-        ],
+        "INSERT INTO group_weights VALUES (?, ?, ?, ?, ?)",
+        zip(
+            [it_next] * n,
+            new_w["run_id"].tolist(),
+            new_w["locus_id"].tolist(),
+            new_w["group_key"].astype("int64").tolist(),
+            new_w["weight"].astype("float64").tolist(),
+        ),
     )
+
+    # Prune spent iteration state.  Downstream only weights[it+1] (the next
+    # M-step's fractional response) and locus_activities[it] (its warm
+    # start) are still needed; keeping every past iteration would grow
+    # these tables by tens of millions of rows per iteration, bloating the
+    # database and making each subsequent 42M-row write progressively
+    # slower (B-tree index maintenance over an ever-larger table).
+    cur.execute("DELETE FROM group_weights WHERE iteration <= ?", (iteration,))
+    cur.execute("DELETE FROM group_lambdas WHERE iteration <= ?", (iteration,))
+    cur.execute("DELETE FROM locus_activities WHERE iteration < ?", (iteration,))
     db.commit()
     db.close()
     return rel
