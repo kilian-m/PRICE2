@@ -34,6 +34,7 @@ from scipy.sparse import csr_matrix, vstack as sp_vstack
 from scipy.stats import chi2
 from scipy.special import gammaln
 
+from price2 import multimap
 from price2.config import Config
 from price2.coverage_model import CoveragePosition
 from price2.equivalence_groups import EquivalenceGroup
@@ -1153,7 +1154,11 @@ class Locus:
 
         return {k for k, v in rgr_indices.items() if v not in all_kept}
 
-    def assign_reads_to_egs(self, runs: list[RiboSeqRun]) -> None:
+    def assign_reads_to_egs(
+        self,
+        runs: list[RiboSeqRun],
+        mm_data: dict | None = None,
+    ) -> None:
         """Assign reads to their equivalence groups.
 
         Each read is matched to its ``(rgr_frame_covpos, length, oua)``
@@ -1161,17 +1166,54 @@ class Locus:
         Reads whose key is absent (due to earlier filtering) are counted
         in :attr:`uncounted_reads`.
 
+        When ``mm_data`` is supplied (multimapping EM mode), each
+        cross-locus multimapping read contributes a *fractional* count at
+        this locus instead of its full count.  For a slot with collapsed
+        count ``c``, baseline cross-locus mass ``base`` and current
+        fractional weight ``weight`` the effective contribution is
+        ``c - base + weight`` (single-slot multimappers keep full weight;
+        cross-locus reads are down-weighted so their total mass across all
+        their loci sums to one).  The routing needed by the E-step is
+        cached in :attr:`mm_slots`.
+
         Parameters
         ----------
         runs : list[RiboSeqRun]
             Ribo-seq runs to process.
+        mm_data : dict, optional
+            ``{run_id: {group_key: (base, weight)}}`` for this locus's
+            multimapping slots, or ``None`` for classic full-weight
+            counting.
         """
+        # {run_id: {group_key: (rgr_frame_covpos, read_length, oua)}} —
+        # the compatibility routing the E-step needs to recompute λ.
+        self.mm_slots = {run.id: {} for run in runs}
         for run in runs:
             run_id = run.id
+            run_mm = mm_data.get(run_id) if mm_data else None
 
             for rsa in self.rsas_dict[run_id]:
                 rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
                 read_count = rsa.read_count
+
+                if run_mm is not None and not rsa.unique():
+                    gk = multimap.alignment_group_key(rsa)
+                    slot = run_mm.get(gk)
+                    if slot is not None:
+                        base, weight = slot
+                        # ``read_count`` (the collapsed slot count ``c``) is
+                        # stored as uint16 at collection, so at an extreme
+                        # repeat hotspot it can wrap below ``base`` (an
+                        # uncapped sum); clamp the non-cross-locus remainder
+                        # at zero so the Poisson response never goes negative.
+                        read_count = max(0.0, read_count - base) + weight
+                        if rgr_frame_covpos:
+                            self.mm_slots[run_id][gk] = (
+                                rgr_frame_covpos,
+                                len(rsa),
+                                rsa.untemplated_addition,
+                            )
+
                 if not rgr_frame_covpos:
                     continue
 
@@ -1186,7 +1228,7 @@ class Locus:
                 try:
                     self.read_counts[run] += read_count
                 except KeyError:
-                    self.read_counts[run] = int(read_count)
+                    self.read_counts[run] = read_count
 
         self.counted_reads = {}
         for run in runs:
@@ -1256,6 +1298,8 @@ class Locus:
         self,
         config: Config,
         runs: list[RiboSeqRun],
+        max_outer: int | None = None,
+        prune: bool = True,
     ) -> tuple[float, float]:
         """IRLS deconvolution with Huber weights on Pearson residuals.
 
@@ -1267,6 +1311,10 @@ class Locus:
         Converges when the relative change in w falls below
         ``config.irls_huber_tol``.
 
+        Warm-starts from ``self.result`` when present (via
+        :meth:`to_sparse_args`); with no prior result the initial guess is
+        all ones, identical to a cold start.
+
         Parameters
         ----------
         config : Config
@@ -1275,6 +1323,16 @@ class Locus:
             standard optimisation parameters.
         runs : list[RiboSeqRun]
             Ribo-seq runs to deconvolve jointly.
+        max_outer : int, optional
+            Cap on IRLS-Huber outer iterations.  ``None`` uses
+            ``config.irls_huber_max_outer``.  The EM light M-step passes a
+            small value (e.g. 1) so one Huber reweight interleaves with
+            each global E-step.
+        prune : bool, optional
+            When ``True`` (default) low-activity ORFs are removed after
+            the solve.  The EM light M-step passes ``False`` to keep the
+            ORF set — and hence the E-step targets and warm-start layout —
+            fixed across iterations.
 
         Returns
         -------
@@ -1301,10 +1359,14 @@ class Locus:
         bounds = [(config.pseudo_min, None)] * n
         c = config.irls_huber_c
 
-        w_current = np.ones(n)
+        w_current = args_dict["initial_guess"]
+
+        n_outer = (
+            config.irls_huber_max_outer if max_outer is None else max_outer
+        )
 
         s1 = time.time()
-        for outer in range(config.irls_huber_max_outer):
+        for outer in range(n_outer):
             # Compute fitted values and Pearson residuals
             delta = np.asarray(X @ w_current).ravel()
             delta_safe = np.maximum(delta, 1e-14)
@@ -1370,27 +1432,116 @@ class Locus:
         )
 
         # ── Post-optimisation RGR removal (same as deconvolve) ───────────
-        x = self.result
-        x_t = x.T
-        canonical_indices = (rgr_lengths * x_t).argmax(axis=1)
-        min_activities = np.maximum(
-            x_t[np.arange(x_t.shape[0]), canonical_indices]
-            * config.min_activity_fraction,
-            config.rgr_min_activity,
-        )
-        self.rgr_indices_to_remove = set(
-            np.where(np.all(x < min_activities, axis=1))[0]
-        )
-        rgrs_to_remove = set(
-            [
-                rgr
-                for rgr in self.rgr_set
-                if rgr.index in self.rgr_indices_to_remove and rgr.type == "ORF"
-            ]
-        )
-        self.remove_rgrs(rgrs_to_remove, runs=runs)
+        if prune:
+            x = self.result
+            x_t = x.T
+            canonical_indices = (rgr_lengths * x_t).argmax(axis=1)
+            min_activities = np.maximum(
+                x_t[np.arange(x_t.shape[0]), canonical_indices]
+                * config.min_activity_fraction,
+                config.rgr_min_activity,
+            )
+            self.rgr_indices_to_remove = set(
+                np.where(np.all(x < min_activities, axis=1))[0]
+            )
+            rgrs_to_remove = set(
+                [
+                    rgr
+                    for rgr in self.rgr_set
+                    if rgr.index in self.rgr_indices_to_remove
+                    and rgr.type == "ORF"
+                ]
+            )
+            self.remove_rgrs(rgrs_to_remove, runs=runs)
 
         return opt_time, data_time
+
+    def activities_by_id(self) -> dict:
+        """Return the current activity matrix keyed by stable ``rgr.id``.
+
+        Keying by ``rgr.id`` (rather than the volatile ``rgr.index``,
+        which index densification reassigns) lets the activities be
+        reloaded as a warm start in the next EM iteration.
+
+        Returns
+        -------
+        dict
+            ``{rgr_id: numpy.ndarray of shape (num_runs,)}``.
+        """
+        return {rgr.id: self.result[rgr.index].copy() for rgr in self.rgr_set}
+
+    def set_warm_start(self, activities: dict, num_runs: int) -> None:
+        """Seed :attr:`result` from persisted per-``rgr.id`` activities.
+
+        RGRs without a stored activity (new to this iteration) default to
+        ones.  Must be called once the RGR set is final for the iteration
+        (i.e. after all pre-deconvolution filters).
+
+        Parameters
+        ----------
+        activities : dict
+            ``{rgr_id: numpy.ndarray}`` from a previous M-step.
+        num_runs : int
+            Number of Ribo-seq runs (columns of the activity matrix).
+        """
+        result = np.ones((len(self.rgr_set), num_runs))
+        for rgr in self.rgr_set:
+            a = activities.get(rgr.id)
+            if a is not None:
+                result[rgr.index] = a
+        self.result = result
+
+    def compute_multimap_lambdas(self, runs: list[RiboSeqRun]) -> list:
+        """Compute the per-slot origin rate ``λ`` for multimapping reads.
+
+        For each recorded multimapping slot, ``λ`` is the read's design-
+        matrix row *without* the geometric ``length`` factor dotted with
+        the current activities — i.e. ``Σ cleavage · coverage · activity``
+        over the read's compatible ORFs, which is the per-read expected
+        rate the E-step normalises across a read's loci
+        (``λ = δ_EG / length_EG``).
+
+        Parameters
+        ----------
+        runs : list[RiboSeqRun]
+            Ribo-seq runs, in the order used to build :attr:`result`.
+
+        Returns
+        -------
+        list of (run_id, group_key, lam)
+            One entry per multimapping slot recorded at this locus.
+        """
+        if not any(self.mm_slots.get(run.id) for run in runs):
+            return []
+
+        num_runs = len(runs)
+        cm_lut = np.zeros(
+            (num_runs, runs[0].cleavage_model.cds_lut.shape[0], 4, 2)
+        )
+        for i, run in enumerate(runs):
+            cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut
+            cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
+
+        coverage_params = np.zeros((num_runs, 3))
+        for i, run in enumerate(runs):
+            coverage_params[i, 0] = run.coverage_model.start_factor
+            coverage_params[i, 1] = 1
+            coverage_params[i, 2] = run.coverage_model.stop_factor
+
+        out = []
+        for run_index, run in enumerate(runs):
+            for gk, (rfc, read_length, oua) in self.mm_slots[run.id].items():
+                oua_int = int(oua)
+                lam = 0.0
+                for rgr, frame, cov_pos in rfc:
+                    f = 3 if frame is None else frame
+                    lam += (
+                        cm_lut[run_index, read_length, f, oua_int]
+                        * coverage_params[run_index, cov_pos.value]
+                        * self.result[rgr.index, run_index]
+                    )
+                out.append((run.id, gk, float(lam)))
+        return out
 
     def remove_rgrs(
         self,

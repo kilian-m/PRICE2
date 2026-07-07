@@ -223,6 +223,32 @@ class Config:
     stop_codons: tuple[str, ...] = ("TAA", "TAG", "TGA")
 
     # ------------------------------------------------------------------ #
+    # Multimapping EM                                                       #
+    # ------------------------------------------------------------------ #
+    # When ``True`` the deconvolution runs inside an EM outer loop that
+    # fractionally re-assigns each multimapping read across the loci it
+    # maps to (E-step), with the existing per-locus optimisation as the
+    # M-step.  When ``False`` behaviour is identical to classic PRICE2
+    # (every read counted at full weight at every locus it overlaps).
+    multimap_em: bool = False
+    #: Maximum number of EM outer iterations (light M-step + global E-step).
+    em_max_iter: int = 10
+    #: Convergence tolerance on the relative change of fractional weights
+    #: between successive E-steps; the loop stops early once below this.
+    em_tol: float = 1e-3
+    #: Number of interleaved IRLS-Huber reweight steps per light M-step.
+    #: One keeps Huber and EM in a single shared loop (as intended); the
+    #: robust weights refine together with the fractional assignments.
+    em_huber_steps: int = 1
+    #: Background rate for a multimapping read's alignments that fall
+    #: outside any annotated locus.  ``0.0`` (default) means "loci-only":
+    #: weight is normalised across the annotated loci a read hits and
+    #: intergenic alignments are ignored.  A positive value discounts
+    #: repeat-heavy reads (currently reserved; intergenic alignments are
+    #: not recorded, so only loci-only normalisation is active).
+    multimap_background: float = 0.0
+
+    # ------------------------------------------------------------------ #
     # Export options                                                        #
     # ------------------------------------------------------------------ #
     warm_start: bool = False

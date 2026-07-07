@@ -25,6 +25,7 @@ from pyfaidx import Fasta
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+from price2 import multimap
 from price2.data_collector import build_rgrs
 from price2.equivalence_groups import make_equivalence_groups
 
@@ -89,7 +90,12 @@ class ORFActivityEstimator:
         cur.execute("SELECT locus_id FROM loci")
         self.loci_ids = [id for id, in cur.fetchall()]
 
-    def run_orf_deconvolution(self) -> None:
+    def run_orf_deconvolution(
+        self,
+        em_iteration: int | None = None,
+        em_final: bool = True,
+        loci_subset: set | None = None,
+    ) -> None:
         """Run the full per-locus ORF deconvolution pipeline.
 
         Dispatches each locus to a worker process via
@@ -104,9 +110,31 @@ class ORFActivityEstimator:
         When ``config.save_memory`` is ``False`` the in-memory
         attributes ``self.loci`` and ``self.performance_df`` are
         populated after the pool finishes.
+
+        Parameters
+        ----------
+        em_iteration : int, optional
+            Multimapping-EM iteration index.  ``None`` (default) runs the
+            classic single-pass pipeline.  When set, workers load this
+            iteration's fractional weights and the previous iteration's
+            activities (warm start).
+        em_final : bool, optional
+            ``True`` for a classic run or the final EM pass (full
+            deconvolution + filtering + export + resume bookkeeping).
+            ``False`` for a light intermediate EM pass (one Huber
+            reweight, no pruning/export; writes activities and λ for the
+            E-step).  Intermediate passes do not touch
+            ``processed_loci.txt``.
+        loci_subset : set, optional
+            When given, restrict the fan-out to these locus ids.  Light EM
+            passes pass the set of loci that carry multimap slots, since
+            loci with no multimapping reads never change across EM
+            iterations and only need computing once (in the final pass).
         """
         self.loci = {}
         loci_ids = set(self.loci_ids)
+        if loci_subset is not None:
+            loci_ids = loci_ids & loci_subset
 
         performance_measurements = {}
 
@@ -119,19 +147,28 @@ class ORFActivityEstimator:
         ra_dir = os.path.join(self.config.o_dir, "regions_activities")
         os.makedirs(ra_dir, exist_ok=True)
 
-        processed_loci_path = os.path.join(self.config.w_dir, "processed_loci.txt")
-        if os.path.exists(processed_loci_path):
-            with open(processed_loci_path) as fh:
-                processed_loc_ids = {line.strip() for line in fh if line.strip()}
-            loci_ids = loci_ids - processed_loc_ids
-        elif os.path.exists(f"{self.config.o_dir}/performance_measurements.tsv"):
-            processed_loc_ids = set(
-                pd.read_csv(
-                    f"{self.config.o_dir}/performance_measurements.tsv",
-                    sep="\t",
-                )["loc_id"]
+        # Resume-skip bookkeeping only applies to full passes; light EM
+        # passes intentionally re-run every locus each iteration.
+        if em_final:
+            processed_loci_path = os.path.join(
+                self.config.w_dir, "processed_loci.txt"
             )
-            loci_ids = loci_ids - processed_loc_ids
+            if os.path.exists(processed_loci_path):
+                with open(processed_loci_path) as fh:
+                    processed_loc_ids = {
+                        line.strip() for line in fh if line.strip()
+                    }
+                loci_ids = loci_ids - processed_loc_ids
+            elif os.path.exists(
+                f"{self.config.o_dir}/performance_measurements.tsv"
+            ):
+                processed_loc_ids = set(
+                    pd.read_csv(
+                        f"{self.config.o_dir}/performance_measurements.tsv",
+                        sep="\t",
+                    )["loc_id"]
+                )
+                loci_ids = loci_ids - processed_loc_ids
 
         loci_ids = list(loci_ids)
         log_level_num = logging.getLevelName(self.config.log_level)
@@ -149,7 +186,15 @@ class ORFActivityEstimator:
                 futures = {
                     pool.schedule(
                         process_loc,
-                        args=[(locus_id, self.config, log_queue)],
+                        args=[
+                            (
+                                locus_id,
+                                self.config,
+                                log_queue,
+                                em_iteration,
+                                em_final,
+                            )
+                        ],
                         timeout=self.config.timeout,
                     ): locus_id
                     for locus_id in loci_ids
@@ -218,7 +263,9 @@ def process_loc(arguments: tuple):
         ``(locus, performance_measurements)`` when
         ``config.save_memory`` is ``False``, otherwise ``None``.
     """
-    loc_id, config, log_queue = arguments
+    loc_id, config, log_queue, em_iteration, em_final = arguments
+    em_mode = em_iteration is not None
+    em_light = em_mode and not em_final
 
     # Route all price2 log records back to the main process.
     worker_logger = logging.getLogger("price2")
@@ -235,138 +282,217 @@ def process_loc(arguments: tuple):
     if not hasattr(config, "base_o_dir"):
         config.base_o_dir = os.path.join(config.o_dir, "regions_activities")
 
-    # --- Load locus and runs from database ---
+    # --- Load runs (always needed) ---
     db_path = f"{config.w_dir}/price.db"
     db = sql.connect(db_path, timeout=120)
     cur = db.cursor()
     cur.execute("PRAGMA busy_timeout = 120000")
-    cur.execute("SELECT * FROM loci WHERE locus_id = ?", (loc_id,))
-    loc = loads(cur.fetchone()[1])
-    performance_measurements["chrom"] = loc.iv.chrom
-    performance_measurements["strand"] = loc.iv.strand
-    performance_measurements["start"] = loc.iv.start
-    performance_measurements["end"] = loc.iv.end
-
     cur.execute("SELECT * FROM runs")
     runs = [loads(blob) for id, blob in cur.fetchall()]
     db.close()
 
-    t2 = time.time()
-    performance_measurements["db_time"] = t2 - t1
+    # In EM mode, reuse the weight-independent prepared state (RGRs,
+    # filters, equivalence-group geometry) cached by the first light pass;
+    # only the fractional response y changes between iterations, so later
+    # iterations and the final pass skip ORF generation, both filter passes
+    # and the EG build.  ``None`` on a miss: classic mode, the first light
+    # iteration, or a non-multimapping locus in the final pass.
+    loc = multimap.load_prepared_locus(db_path, loc_id) if em_mode else None
 
-    # --- Build ORF candidates (formerly DataCollector.collect_loci) ---
-    t1 = time.time()
-    genome = _get_genome(config.fasta_path)
-    min_explained_reads = config.min_explained_reads_per_run * len(runs)
-    has_transcripts = build_rgrs(
-        loc, db_path, genome, config, min_explained_reads
-    )
-    performance_measurements["build_rgrs_time"] = time.time() - t1
-    if not has_transcripts:
-        processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
-        lock = FileLock(processed_loci_path + ".lock")
-        with lock:
-            with open(processed_loci_path, "a") as f:
-                f.write(loc_id + "\n")
-        return None if config.save_memory else (loc, performance_measurements)
+    if loc is not None:
+        performance_measurements["chrom"] = loc.iv.chrom
+        performance_measurements["strand"] = loc.iv.strand
+        performance_measurements["start"] = loc.iv.start
+        performance_measurements["end"] = loc.iv.end
+        performance_measurements["db_time"] = time.time() - t1
+        # Reads are excluded from the cache blob; reload them.
+        t1 = time.time()
+        loc.get_reads_from_db(db_path)
+        performance_measurements["load_reads_time"] = time.time() - t1
+        # Keep perf columns aligned with the full-prepare path (the skipped
+        # stages report zero time).
+        performance_measurements["build_rgrs_time"] = 0.0
+        performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
+        performance_measurements["assign_reads_time"] = 0.0
+        performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
+        performance_measurements["coverage_filter_time"] = 0.0
+        performance_measurements["filtered_deconvolution_rgr_count"] = len(
+            loc.rgr_set
+        )
+        performance_measurements["filter_2_time"] = 0.0
+        performance_measurements["eg_time"] = 0.0
+        performance_measurements["eg_count"] = sum(
+            len(egs) for egs in loc.egs.values()
+        )
+    else:
+        # --- Load locus skeleton from database ---
+        db = sql.connect(db_path, timeout=120)
+        cur = db.cursor()
+        cur.execute("PRAGMA busy_timeout = 120000")
+        cur.execute("SELECT * FROM loci WHERE locus_id = ?", (loc_id,))
+        loc = loads(cur.fetchone()[1])
+        performance_measurements["chrom"] = loc.iv.chrom
+        performance_measurements["strand"] = loc.iv.strand
+        performance_measurements["start"] = loc.iv.start
+        performance_measurements["end"] = loc.iv.end
+        db.close()
 
-    if config.export_all_steps:
-        if config.export_gtf:
-            loc.to_gtf(
-                f"{config.base_o_dir}/all",
-                write_orfs=config.export_orfs,
-                write_loci=config.export_loci,
-                write_transcripts=config.export_transcripts,
+        t2 = time.time()
+        performance_measurements["db_time"] = t2 - t1
+
+        # --- Build ORF candidates (formerly DataCollector.collect_loci) ---
+        t1 = time.time()
+        genome = _get_genome(config.fasta_path)
+        min_explained_reads = config.min_explained_reads_per_run * len(runs)
+        has_transcripts = build_rgrs(
+            loc, db_path, genome, config, min_explained_reads
+        )
+        performance_measurements["build_rgrs_time"] = time.time() - t1
+        if not has_transcripts:
+            if not em_light:
+                processed_loci_path = os.path.join(
+                    config.w_dir, "processed_loci.txt"
+                )
+                lock = FileLock(processed_loci_path + ".lock")
+                with lock:
+                    with open(processed_loci_path, "a") as f:
+                        f.write(loc_id + "\n")
+            return None if config.save_memory else (loc, performance_measurements)
+
+        if config.export_all_steps and not em_light:
+            if config.export_gtf:
+                loc.to_gtf(
+                    f"{config.base_o_dir}/all",
+                    write_orfs=config.export_orfs,
+                    write_loci=config.export_loci,
+                    write_transcripts=config.export_transcripts,
+                )
+            if config.export_tsv and config.export_orfs:
+                loc.to_tsv(f"{config.base_o_dir}/all")
+            if config.export_bed and config.export_orfs:
+                loc.to_bed(f"{config.base_o_dir}/all")
+        loc.rgr_filter_sets = {}
+
+        # --- Load reads ---
+        t1 = time.time()
+        loc.get_reads_from_db(db_path)
+        t2 = time.time()
+        performance_measurements["load_reads_time"] = t2 - t1
+
+        # --- Assign reads to ORF candidates ---
+        t1 = time.time()
+        performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
+        loc.rgr_filter_sets["unfiltered"] = loc.rgr_set
+
+        if config.coverage_filter or config.deconvolution_filter:
+            loc.make_well_fitting_reads(runs)
+
+        t2 = time.time()
+        performance_measurements["assign_reads_time"] = t2 - t1
+
+        # --- Coverage filter ---
+        t1 = time.time()
+
+        if config.coverage_filter:
+            loc.coverage_filter_rgrs(config)
+
+        if config.export_all_steps and not em_light:
+            if config.export_gtf:
+                loc.to_gtf(
+                    f"{config.base_o_dir}/coverage_filtered",
+                    write_orfs=config.export_orfs,
+                    write_loci=config.export_loci,
+                    write_transcripts=config.export_transcripts,
+                )
+            if config.export_tsv and config.export_orfs:
+                loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
+            if config.export_bed and config.export_orfs:
+                loc.to_bed(f"{config.base_o_dir}/coverage_filtered")
+        loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
+
+        performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
+        t2 = time.time()
+        performance_measurements["coverage_filter_time"] = t2 - t1
+
+        # --- Deconvolution filter ---
+        t1 = time.time()
+        if config.deconvolution_filter:
+            loc.deconvolution_filter_rgrs(config)
+
+        loc.rgr_filter_sets["deconvolution_filtered"] = loc.rgr_set
+        performance_measurements["filtered_deconvolution_rgr_count"] = len(
+            loc.rgr_set
+        )
+        t2 = time.time()
+        performance_measurements["filter_2_time"] = t2 - t1
+
+        if config.export_all_steps and not em_light:
+            if config.export_gtf:
+                loc.to_gtf(
+                    f"{config.base_o_dir}/deconvolution_filtered",
+                    write_orfs=config.export_orfs,
+                    write_loci=config.export_loci,
+                    write_transcripts=config.export_transcripts,
+                )
+            if config.export_tsv and config.export_orfs:
+                loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
+            if config.export_bed and config.export_orfs:
+                loc.to_bed(f"{config.base_o_dir}/deconvolution_filtered")
+
+        # --- Equivalence groups ---
+        for tr in loc.transcripts:
+            tr.update_with_filtered_orfs(loc.rgr_set)
+
+        t1 = time.time()
+        loc.egs = make_equivalence_groups(loc, runs)
+        t2 = time.time()
+
+        performance_measurements["eg_time"] = t2 - t1
+        performance_measurements["eg_count"] = sum(
+            len(egs) for egs in loc.egs.values()
+        )
+
+        # --- Cache prepared state for subsequent EM iterations ---
+        if em_light and em_iteration == 0:
+            multimap.save_prepared_locus(db_path, loc_id, loc)
+
+    # --- Multimapping EM: warm start + fractional read weights ---
+    # The RGR set is final here (all pre-deconvolution filters have run),
+    # so warm-start activities align by rgr.id and fractional weights can
+    # be applied per multimapping slot.
+    mm_data = None
+    if em_mode:
+        if em_iteration > 0:
+            warm = multimap.load_warm_activities(
+                db_path, loc_id, em_iteration - 1
             )
-        if config.export_tsv and config.export_orfs:
-            loc.to_tsv(f"{config.base_o_dir}/all")
-        if config.export_bed and config.export_orfs:
-            loc.to_bed(f"{config.base_o_dir}/all")
-    loc.rgr_filter_sets = {}
-
-    # --- Load reads ---
-    t1 = time.time()
-    loc.get_reads_from_db(db_path)
-    t2 = time.time()
-    performance_measurements["load_reads_time"] = t2 - t1
-
-    # --- Assign reads to ORF candidates ---
-    t1 = time.time()
-    performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
-    loc.rgr_filter_sets["unfiltered"] = loc.rgr_set
-
-    if config.coverage_filter or config.deconvolution_filter:
-        loc.make_well_fitting_reads(runs)
-
-    t2 = time.time()
-    performance_measurements["assign_reads_time"] = t2 - t1
-
-    # --- Coverage filter ---
-    t1 = time.time()
-
-    if config.coverage_filter:
-        loc.coverage_filter_rgrs(config)
-
-    if config.export_all_steps:
-        if config.export_gtf:
-            loc.to_gtf(
-                f"{config.base_o_dir}/coverage_filtered",
-                write_orfs=config.export_orfs,
-                write_loci=config.export_loci,
-                write_transcripts=config.export_transcripts,
-            )
-        if config.export_tsv and config.export_orfs:
-            loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
-        if config.export_bed and config.export_orfs:
-            loc.to_bed(f"{config.base_o_dir}/coverage_filtered")
-    loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
-
-    performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
-    t2 = time.time()
-    performance_measurements["coverage_filter_time"] = t2 - t1
-
-    # --- Deconvolution filter ---
-    t1 = time.time()
-    if config.deconvolution_filter:
-        loc.deconvolution_filter_rgrs(config)
-
-    loc.rgr_filter_sets["deconvolution_filtered"] = loc.rgr_set
-    performance_measurements["filtered_deconvolution_rgr_count"] = len(loc.rgr_set)
-    t2 = time.time()
-    performance_measurements["filter_2_time"] = t2 - t1
-
-    if config.export_all_steps:
-        if config.export_gtf:
-            loc.to_gtf(
-                f"{config.base_o_dir}/deconvolution_filtered",
-                write_orfs=config.export_orfs,
-                write_loci=config.export_loci,
-                write_transcripts=config.export_transcripts,
-            )
-        if config.export_tsv and config.export_orfs:
-            loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
-        if config.export_bed and config.export_orfs:
-            loc.to_bed(f"{config.base_o_dir}/deconvolution_filtered")
-
-    # --- Equivalence groups ---
-    for tr in loc.transcripts:
-        tr.update_with_filtered_orfs(loc.rgr_set)
-
-    t1 = time.time()
-    loc.egs = make_equivalence_groups(loc, runs)
-    t2 = time.time()
-
-    performance_measurements["eg_time"] = t2 - t1
-    performance_measurements["eg_count"] = sum(len(egs) for egs in loc.egs.values())
+            if warm is not None:
+                loc.set_warm_start(warm, len(runs))
+        mm_data = multimap.load_locus_mm_data(db_path, loc_id, em_iteration)
 
     # --- Assign reads to equivalence groups ---
     t1 = time.time()
-    loc.assign_reads_to_egs(runs)
+    loc.assign_reads_to_egs(runs, mm_data)
     t2 = time.time()
     performance_measurements["proc_reads_2_time"] = t2 - t1
     performance_measurements["read_count"] = sum(
         rc for _, rc in loc.counted_reads.items()
     )
+
+    # --- EM light M-step: one Huber reweight, emit λ + activities, stop ---
+    if em_light:
+        loc.deconvolve(
+            config, runs=runs, max_outer=config.em_huber_steps, prune=False
+        )
+        lambdas = loc.compute_multimap_lambdas(runs)
+        multimap.write_locus_em_output(
+            db_path,
+            loc_id,
+            em_iteration,
+            loc.activities_by_id(),
+            lambdas,
+        )
+        return None if config.save_memory else (loc, performance_measurements)
 
     # --- Group-LASSO optimisation ---
     loc.deconvolve(config, runs=runs)
@@ -379,7 +505,7 @@ def process_loc(arguments: tuple):
     t2 = time.time()
     performance_measurements["optimization_time"] = t2 - t1
 
-    if config.export_all_steps:
+    if config.export_all_steps and not em_light:
         if config.export_gtf:
             loc.to_gtf(
                 f"{config.base_o_dir}/deconvoluted",

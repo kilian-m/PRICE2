@@ -19,6 +19,7 @@ import time
 import HTSeq
 from pyfaidx import Fasta
 
+from price2 import multimap
 from price2.config import Config
 from price2.data_collector import DataCollector
 from price2.ribo_seq_run import save_dataset_models
@@ -233,6 +234,13 @@ def run_pipeline(config: Config) -> None:
             data_collector.collect_loci,
         )
 
+        if config.multimap_em:
+            _timed(
+                "build multimapping linkage index... ",
+                multimap.build_multimap_index,
+                f"{config.w_dir}/price.db",
+            )
+
     # --- ORF deconvolution ---
     orf_activity_estimator = ORFActivityEstimator(config)
 
@@ -244,7 +252,10 @@ def run_pipeline(config: Config) -> None:
         n_proc,
     )
 
-    _timed("", orf_activity_estimator.run_orf_deconvolution)
+    if config.multimap_em:
+        _run_em_deconvolution(config, orf_activity_estimator)
+    else:
+        _timed("", orf_activity_estimator.run_orf_deconvolution)
 
     # --- TPM output ---
     _timed(
@@ -252,6 +263,84 @@ def run_pipeline(config: Config) -> None:
         generate_tpm_output,
         config.o_dir,
         export_tsv=config.export_tsv,
+    )
+
+
+def _run_em_deconvolution(
+    config: Config,
+    estimator: ORFActivityEstimator,
+) -> None:
+    """Drive the multimapping-EM outer loop around the per-locus fan-out.
+
+    Each iteration runs a light M-step fan-out (one interleaved Huber
+    reweight per locus, warm-started, writing activities and per-slot λ),
+    then a single global E-step that re-normalises each multimapping
+    read's fractional weight across its loci.  The loop stops when the
+    E-step's weight change falls below ``config.em_tol`` or after
+    ``config.em_max_iter`` iterations, followed by one final full M-step
+    (filtering + activity estimation + export) using the converged
+    weights.
+
+    Parameters
+    ----------
+    config : Config
+        Fully populated configuration object.
+    estimator : ORFActivityEstimator
+        Estimator bound to the run's database.
+    """
+    db_path = f"{config.w_dir}/price.db"
+
+    if not multimap.has_multimap_index(db_path):
+        logger.warning(
+            "multimap_em is enabled but no populated linkage index was "
+            "found in %s. Either no read maps to >=2 in-locus slots, or "
+            "price.db was collected with multimap_em disabled (re-run a "
+            "cold collection with multimap_em=true to build the linkage). "
+            "Running a single classic pass instead.",
+            db_path,
+        )
+        _timed("", estimator.run_orf_deconvolution)
+        return
+
+    multimap.enable_wal(db_path)
+    # Clear any per-iteration state from a previous run so a warm re-run
+    # cannot consume stale λ / weights / activities.
+    multimap.reset_em_state(db_path)
+
+    # Loci with no multimap slots do not change across EM iterations, so
+    # the light passes only need to touch the loci that carry slots.
+    slot_loci = multimap.slot_locus_ids(db_path)
+
+    last_it = 0
+    for it in range(config.em_max_iter):
+        last_it = it
+        _timed(
+            f"EM iteration {it} light M-step... ",
+            estimator.run_orf_deconvolution,
+            em_iteration=it,
+            em_final=False,
+            loci_subset=slot_loci,
+        )
+        delta = multimap.e_step(db_path, iteration=it)
+        logger.info(
+            "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
+            it,
+            delta,
+        )
+        if delta < config.em_tol:
+            logger.info(
+                "EM converged after %d iteration(s) (tol=%.1e).",
+                it + 1,
+                config.em_tol,
+            )
+            break
+
+    # Final full M-step with the converged fractional weights.
+    _timed(
+        "EM final full M-step... ",
+        estimator.run_orf_deconvolution,
+        em_iteration=last_it + 1,
+        em_final=True,
     )
 
 

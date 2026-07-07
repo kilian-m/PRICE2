@@ -21,6 +21,7 @@ import numpy as np
 from multiprocessing import Pool
 from collections import defaultdict
 
+from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
 from price2.locus import Locus
@@ -158,6 +159,12 @@ class DataCollector:
                          )"""
         )
 
+        record_multimap = self.config.multimap_em
+        if record_multimap:
+            # Fresh linkage each collection: derived EM tables are rebuilt
+            # afterwards from these rows (see build_multimap_index).
+            multimap.create_alignment_table(cur)
+
         db.commit()
 
         processed_run_ids = {
@@ -176,6 +183,7 @@ class DataCollector:
                             self.bam_dir,
                             self.db_path,
                             self.loci_set,
+                            record_multimap,
                         )
                         for run in self.runs
                         if run.id not in processed_run_ids
@@ -189,6 +197,7 @@ class DataCollector:
                         self.bam_dir,
                         self.db_path,
                         self.loci_set,
+                        record_multimap,
                     )
                 )
 
@@ -468,10 +477,11 @@ def collect_mappings_run(
         * ``loci_set`` – set of :class:`~price2.locus.Locus` objects to map
           reads against.
     """
-    run_id, bam_dir, db_path, loci_set = data
+    run_id, bam_dir, db_path, loci_set, record_multimap = data
 
     reads_rows: list = []
     transcript_count_rows: list = []
+    multimap_rows: list = []
 
     with pysam.AlignmentFile(f"{bam_dir}/{run_id}.bam", "rb") as sf:
         for locus in loci_set:
@@ -516,6 +526,20 @@ def collect_mappings_run(
                     mapping = (rsa.untemplated_addition, rsa.unique(), ivs_tuple)
                     mappings_dict[mapping] += 1
                     transcripts_counts[transcripts_ids] += 1
+
+                    # Record this multimapping alignment so its read can be
+                    # linked to its other in-locus slots for the EM E-step.
+                    if record_multimap and not rsa.unique():
+                        multimap_rows.append(
+                            (
+                                run_id,
+                                multimap.qname_hash(alignment.query_name),
+                                locus.id,
+                                multimap.group_key(
+                                    ivs_tuple, rsa.untemplated_addition
+                                ),
+                            )
+                        )
 
             read_list = []
             for entry, count in mappings_dict.items():
@@ -575,5 +599,10 @@ def collect_mappings_run(
                      ) VALUES (?, ?, ?)""",
         transcript_count_rows,
     )
+    if multimap_rows:
+        cur.executemany(
+            "INSERT INTO multimap_alignments VALUES (?, ?, ?, ?)",
+            multimap_rows,
+        )
     db.commit()
     db.close()
