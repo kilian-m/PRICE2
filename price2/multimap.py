@@ -188,33 +188,32 @@ def create_em_tables(cur: sql.Cursor) -> None:
     cur.execute(
         "CREATE INDEX idx_mgs_mmg ON multimap_group_slots(mmg_id)"
     )
+    # Per-slot state (baseline, weights, λ) is stored as ONE blob per
+    # slot-locus — a pickled ``{(run_id, group_key): value}`` dict — rather
+    # than one row per slot.  At genome scale that is ~40K rows instead of
+    # ~42M, so every E-step read/write/prune touches ~1000x fewer rows
+    # (the per-slot compute stays vectorised in memory).  The multimap_*
+    # linkage tables remain per-slot because the E-step needs them expanded.
     cur.execute(
         """CREATE TABLE multimap_slot_base (
-               run_id    TEXT    NOT NULL,
-               locus_id  TEXT    NOT NULL,
-               group_key INTEGER NOT NULL,
-               base      REAL    NOT NULL,
-               PRIMARY KEY (run_id, locus_id, group_key)
+               locus_id  TEXT PRIMARY KEY,
+               base_blob BLOB NOT NULL
            )"""
     )
     cur.execute(
         """CREATE TABLE group_weights (
-               iteration INTEGER NOT NULL,
-               run_id    TEXT    NOT NULL,
-               locus_id  TEXT    NOT NULL,
-               group_key INTEGER NOT NULL,
-               weight    REAL    NOT NULL,
-               PRIMARY KEY (iteration, run_id, locus_id, group_key)
+               iteration   INTEGER NOT NULL,
+               locus_id    TEXT    NOT NULL,
+               weight_blob BLOB    NOT NULL,
+               PRIMARY KEY (iteration, locus_id)
            )"""
     )
     cur.execute(
         """CREATE TABLE group_lambdas (
                iteration INTEGER NOT NULL,
-               run_id    TEXT    NOT NULL,
                locus_id  TEXT    NOT NULL,
-               group_key INTEGER NOT NULL,
-               lam       REAL    NOT NULL,
-               PRIMARY KEY (iteration, run_id, locus_id, group_key)
+               lam_blob  BLOB    NOT NULL,
+               PRIMARY KEY (iteration, locus_id)
            )"""
     )
     cur.execute(
@@ -230,15 +229,6 @@ def create_em_tables(cur: sql.Cursor) -> None:
                locus_id  TEXT PRIMARY KEY,
                prep_blob BLOB NOT NULL
            )"""
-    )
-    # Workers fetch a single locus's slots each iteration; index by
-    # locus_id so those lookups do not scan a whole iteration's rows.
-    cur.execute(
-        "CREATE INDEX idx_slot_base_locus ON multimap_slot_base(locus_id)"
-    )
-    cur.execute(
-        "CREATE INDEX idx_group_weights_locus "
-        "ON group_weights(locus_id, iteration)"
     )
 
 
@@ -306,7 +296,7 @@ def reset_em_state(db_path: str) -> None:
     cur.execute("DELETE FROM prepared_loci")
     cur.execute(
         "INSERT INTO group_weights "
-        "SELECT 0, run_id, locus_id, group_key, base FROM multimap_slot_base"
+        "SELECT 0, locus_id, base_blob FROM multimap_slot_base"
     )
     db.commit()
     db.close()
@@ -404,7 +394,6 @@ def build_multimap_index(db_path: str) -> int:
     group_rows: list = []
     slot_rows: list = []
     base: dict = defaultdict(float)
-    seed_rows: list = []
     mmg_id = 0
     for run_id, sigs in sig_counts.items():
         for slots, count in sigs.items():
@@ -414,8 +403,11 @@ def build_multimap_index(db_path: str) -> int:
                 base[(run_id, locus_id, gk)] += count
             mmg_id += 1
 
+    # Collapse per-slot baselines into one pickled dict per slot-locus.
+    base_by_locus: dict = defaultdict(dict)
     for (run_id, locus_id, gk), b in base.items():
-        seed_rows.append((run_id, locus_id, gk, b))
+        base_by_locus[locus_id][(run_id, gk)] = b
+    base_rows = [(locus_id, dumps(d)) for locus_id, d in base_by_locus.items()]
 
     cur.executemany(
         "INSERT INTO multimap_groups VALUES (?, ?, ?)", group_rows
@@ -424,11 +416,11 @@ def build_multimap_index(db_path: str) -> int:
         "INSERT INTO multimap_group_slots VALUES (?, ?, ?)", slot_rows
     )
     cur.executemany(
-        "INSERT INTO multimap_slot_base VALUES (?, ?, ?, ?)", seed_rows
+        "INSERT INTO multimap_slot_base VALUES (?, ?)", base_rows
     )
     # iteration-0 weights == baseline == full counts (classic behaviour).
     cur.executemany(
-        "INSERT INTO group_weights VALUES (0, ?, ?, ?, ?)", seed_rows
+        "INSERT INTO group_weights VALUES (0, ?, ?)", base_rows
     )
     db.commit()
     db.close()
@@ -484,29 +476,29 @@ def load_locus_mm_data(
     cur = db.cursor()
     cur.execute("PRAGMA busy_timeout = 120000")
 
-    base: dict = defaultdict(dict)
     cur.execute(
-        "SELECT run_id, group_key, base FROM multimap_slot_base "
-        "WHERE locus_id = ?",
+        "SELECT base_blob FROM multimap_slot_base WHERE locus_id = ?",
         (locus_id,),
     )
-    for run_id, gk, b in cur.fetchall():
-        base[run_id][gk] = [b, b]  # [base, weight] default weight=base
+    base_row = cur.fetchone()
+    if base_row is None:
+        db.close()
+        return {}
+    base_map = loads(base_row[0])  # {(run_id, group_key): base}
 
     cur.execute(
-        "SELECT run_id, group_key, weight FROM group_weights "
+        "SELECT weight_blob FROM group_weights "
         "WHERE locus_id = ? AND iteration = ?",
         (locus_id, iteration),
     )
-    for run_id, gk, w in cur.fetchall():
-        if gk in base[run_id]:
-            base[run_id][gk][1] = w
+    w_row = cur.fetchone()
     db.close()
+    weight_map = loads(w_row[0]) if w_row is not None else {}
 
-    return {
-        run_id: {gk: (bw[0], bw[1]) for gk, bw in slots.items()}
-        for run_id, slots in base.items()
-    }
+    out: dict = defaultdict(dict)
+    for (run_id, gk), b in base_map.items():
+        out[run_id][gk] = (b, weight_map.get((run_id, gk), b))
+    return dict(out)
 
 
 def load_warm_activities(
@@ -574,15 +566,14 @@ def write_locus_em_output(
         (iteration, locus_id, zlib.compress(dumps(activities))),
     )
     if lambdas:
-        cur.executemany(
-            "INSERT OR REPLACE INTO group_lambdas VALUES (?, ?, ?, ?, ?)",
-            [
-                (iteration, run_id, locus_id, gk, lam)
-                for run_id, gk, lam in lambdas
-            ],
+        lam_map = {(run_id, gk): lam for run_id, gk, lam in lambdas}
+        cur.execute(
+            "INSERT OR REPLACE INTO group_lambdas VALUES (?, ?, ?)",
+            (iteration, locus_id, dumps(lam_map)),
         )
     db.commit()
     db.close()
+
 
 
 def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
@@ -704,29 +695,34 @@ def e_step(db_path: str, iteration: int) -> float:
     cur = db.cursor()
     it_next = iteration + 1
 
-    def _frame(sql, params, cols):
-        # One bulk fetchall then build the frame: markedly faster than
-        # pandas.read_sql at tens of millions of rows.
-        return pd.DataFrame(cur.execute(sql, params).fetchall(), columns=cols)
+    # λ is stored one blob per locus; expand to per-slot records so it can
+    # be joined against the (per-slot) MMG membership.
+    lam_records: list = []
+    cur.execute(
+        "SELECT locus_id, lam_blob FROM group_lambdas WHERE iteration = ?",
+        (iteration,),
+    )
+    for locus_id, blob in cur.fetchall():
+        for (run_id, gk), lam_val in loads(blob).items():
+            lam_records.append((run_id, locus_id, gk, lam_val))
 
-    slots = _frame(
-        "SELECT mmg_id, locus_id, group_key FROM multimap_group_slots",
-        (),
-        ["mmg_id", "locus_id", "group_key"],
+    slots = pd.DataFrame(
+        cur.execute(
+            "SELECT mmg_id, locus_id, group_key FROM multimap_group_slots"
+        ).fetchall(),
+        columns=["mmg_id", "locus_id", "group_key"],
     )
     if slots.empty:
         db.close()
         return 0.0
-    groups = _frame(
-        "SELECT mmg_id, run_id, count FROM multimap_groups",
-        (),
-        ["mmg_id", "run_id", "count"],
+    groups = pd.DataFrame(
+        cur.execute(
+            "SELECT mmg_id, run_id, count FROM multimap_groups"
+        ).fetchall(),
+        columns=["mmg_id", "run_id", "count"],
     )
-    lam = _frame(
-        "SELECT run_id, locus_id, group_key, lam FROM group_lambdas "
-        "WHERE iteration = ?",
-        (iteration,),
-        ["run_id", "locus_id", "group_key", "lam"],
+    lam = pd.DataFrame(
+        lam_records, columns=["run_id", "locus_id", "group_key", "lam"]
     )
 
     # Attach each slot's run_id + MMG read count (via mmg_id), then its λ
@@ -751,51 +747,55 @@ def e_step(db_path: str, iteration: int) -> float:
         ["run_id", "locus_id", "group_key"], sort=False, as_index=False
     )["weight"].sum()
 
-    # Convergence = fraction of total read mass reassigned vs the weights
-    # this M-step used (an L1 / total-variation measure, robust to the
-    # number of slots).  From iteration 1 on the total mass is conserved
-    # (each read's weight sums to one), so the denominator is stable;
-    # iteration 0's large value reflects the one-off removal of the classic
-    # full-weight double counting.
-    old = _frame(
-        "SELECT run_id, locus_id, group_key, weight FROM group_weights "
-        "WHERE iteration = ?",
+    # Previous weights (one blob per locus) for the convergence metric.
+    old_by_locus: dict = {}
+    cur.execute(
+        "SELECT locus_id, weight_blob FROM group_weights WHERE iteration = ?",
         (iteration,),
-        ["run_id", "locus_id", "group_key", "weight"],
     )
-    merged = new_w.merge(
-        old,
-        on=["run_id", "locus_id", "group_key"],
-        how="outer",
-        suffixes=("_new", "_old"),
-    )
-    w_new = np.nan_to_num(merged["weight_new"].to_numpy(), nan=0.0)
-    w_old = np.nan_to_num(merged["weight_old"].to_numpy(), nan=0.0)
-    total_mass = float(w_new.sum())
-    moved = float(np.abs(w_new - w_old).sum())
+    for locus_id, blob in cur.fetchall():
+        old_by_locus[locus_id] = loads(blob)
+
+    # Collapse the new per-slot weights into one blob per locus, computing
+    # the L1 mass reassigned vs the previous weights in the same pass.
+    # Convergence = Σ|w_new − w_old| / Σ w_new — a total-variation measure
+    # robust to the slot count.  From iteration 1 on the total mass is
+    # conserved (each read's weight sums to one); iteration 0's large value
+    # reflects the one-off removal of the classic full-weight double count.
+    weight_rows: list = []
+    moved = 0.0
+    total_mass = 0.0
+    for locus_id, sub in new_w.groupby("locus_id", sort=False):
+        d = {
+            (r, int(g)): float(w)
+            for r, g, w in zip(
+                sub["run_id"], sub["group_key"], sub["weight"]
+            )
+        }
+        weight_rows.append((it_next, locus_id, dumps(d)))
+        old_d = old_by_locus.get(locus_id, {})
+        for k, w in d.items():
+            moved += abs(w - old_d.get(k, 0.0))
+            total_mass += w
+        for k, w in old_d.items():
+            if k not in d:
+                moved += abs(w)
+    # Loci in the old weights but absent from the new (slot set is fixed, so
+    # none in practice) — count their full mass as moved.
+    new_loci = set(new_w["locus_id"].unique())
+    for locus_id, old_d in old_by_locus.items():
+        if locus_id not in new_loci:
+            moved += sum(abs(w) for w in old_d.values())
     rel = moved / total_mass if total_mass > 0 else 0.0
 
-    # Clear any orphan rows for the target iteration before writing, so a
-    # shrunken slot set cannot leave stale weights behind.
+    # Write new weights (one blob per locus), then prune spent state.  Only
+    # weights[it+1] (the next M-step's response) and locus_activities[it]
+    # (its warm start) are still needed; with one blob per locus these
+    # writes and deletes touch ~40K rows, not tens of millions.
     cur.execute("DELETE FROM group_weights WHERE iteration = ?", (it_next,))
-    n = len(new_w)
     cur.executemany(
-        "INSERT INTO group_weights VALUES (?, ?, ?, ?, ?)",
-        zip(
-            [it_next] * n,
-            new_w["run_id"].tolist(),
-            new_w["locus_id"].tolist(),
-            new_w["group_key"].astype("int64").tolist(),
-            new_w["weight"].astype("float64").tolist(),
-        ),
+        "INSERT INTO group_weights VALUES (?, ?, ?)", weight_rows
     )
-
-    # Prune spent iteration state.  Downstream only weights[it+1] (the next
-    # M-step's fractional response) and locus_activities[it] (its warm
-    # start) are still needed; keeping every past iteration would grow
-    # these tables by tens of millions of rows per iteration, bloating the
-    # database and making each subsequent 42M-row write progressively
-    # slower (B-tree index maintenance over an ever-larger table).
     cur.execute("DELETE FROM group_weights WHERE iteration <= ?", (iteration,))
     cur.execute("DELETE FROM group_lambdas WHERE iteration <= ?", (iteration,))
     cur.execute("DELETE FROM locus_activities WHERE iteration < ?", (iteration,))
