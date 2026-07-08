@@ -89,6 +89,8 @@ class Params:
     huber_tol: float
     mu_inner_max_iter: int = 3000
     mu_inner_tol: float = 1e-5
+    #: Negative-binomial dispersion θ, or ``None`` for the Poisson model.
+    theta: float | None = None
 
 
 # ------------------------------------------------------------------ #
@@ -110,6 +112,8 @@ def _gpu_deconvolve(torch, job, dtype, check_every=25):
         m, n = job["X_shape"]
         nr, ns = p.num_rgrs, p.num_runs
         lam, pmin, c = p.lam, p.pseudo_min, p.huber_c
+        theta = p.theta
+        poisson = theta is None
 
         def csr(data, indices, indptr, shape):
             return torch.sparse_csr_tensor(
@@ -133,19 +137,28 @@ def _gpu_deconvolve(torch, job, dtype, check_every=25):
 
         for outer in range(p.max_outer):
             delta = torch.mv(Xc, w).clamp_min(1e-14)
-            pr = (yt - delta) / delta.sqrt()
+            # Pearson residual variance: δ (Poisson) or δ + δ²/θ (negative binomial)
+            var = delta if poisson else delta + delta * delta / theta
+            pr = (yt - delta) / var.sqrt()
             ar = pr.abs()
             omega = torch.where(ar <= c, torch.ones_like(ar), c / ar.clamp_min(1e-14))
             omega_y = omega * yt
-            Xt_omega = torch.mv(XcT, omega)
+            # Poisson denominator data term X^T ω is constant across inner iterations.
+            if poisson:
+                Xt_omega = torch.mv(XcT, omega)
             w_outer0 = w
             for it in range(p.mu_inner_max_iter):
                 delta = torch.mv(Xc, w).clamp_min(tiny)
                 num = torch.mv(XcT, omega_y / delta)
+                if poisson:
+                    data_den = Xt_omega
+                else:
+                    # NB denominator data term X^T(ω (y+θ)/(θ+δ)) depends on δ.
+                    data_den = torch.mv(XcT, omega * (yt + theta) / (theta + delta))
                 W = w.view(nr, ns)
                 norms = (W * W).sum(1).sqrt()
                 pen = (lam * (W / norms.clamp_min(tiny).view(-1, 1))).reshape(-1)
-                den = (Xt_omega + pen).clamp_min(tiny)
+                den = (data_den + pen).clamp_min(tiny)
                 w_new = (w * num / den).clamp_min(pmin)
                 if (it + 1) % check_every == 0:
                     rel = ((w_new - w).norm() / w.norm().clamp_min(1e-14)).item()
