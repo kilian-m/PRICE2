@@ -137,6 +137,43 @@ class ORFActivityEstimator:
         log_level_num = logging.getLevelName(self.config.log_level)
         pbar = tqdm(total=len(loci_ids), disable=log_level_num > logging.INFO)
 
+        # Optional single-context GPU deconvolution broker: started once here and
+        # shared across the whole worker pool via ``config.mu_broker_req_q`` (a
+        # Manager queue proxy that pickles to each process_loc worker). One broker
+        # holds one CUDA context and serves every worker over shared memory, so
+        # device VRAM does not scale with ``config.processes``. Falls back to the
+        # configured per-worker MU path if the broker cannot start.
+        broker = None
+        self.config.mu_broker_req_q = None
+        if (
+            getattr(self.config, "inner_solver", "lbfgs") == "mu"
+            and getattr(self.config, "mu_broker", False)
+        ):
+            try:
+                from price2.gpu_broker import GpuBroker
+
+                broker = GpuBroker(
+                    n_procs=getattr(self.config, "mu_broker_procs", 4),
+                    n_streams=getattr(self.config, "mu_broker_streams", 2),
+                    dtype_str=getattr(self.config, "mu_dtype", "float32"),
+                )
+                broker.start()
+                self.config.mu_broker_req_q = broker.req_q
+                logger.info(
+                    "GPU deconvolution broker pool started (%d procs x %d streams, %s)",
+                    getattr(self.config, "mu_broker_procs", 4),
+                    getattr(self.config, "mu_broker_streams", 2),
+                    getattr(self.config, "mu_dtype", "float32"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "GPU broker unavailable (%s); workers use the configured "
+                    "per-worker MU path",
+                    exc,
+                )
+                broker = None
+                self.config.mu_broker_req_q = None
+
         price2_logger = logging.getLogger("price2")
         manager = mp.Manager()
         log_queue = manager.Queue()
@@ -177,6 +214,9 @@ class ORFActivityEstimator:
         finally:
             listener.stop()
             manager.shutdown()
+            if broker is not None:
+                broker.stop()
+                self.config.mu_broker_req_q = None
 
         pbar.close()
 

@@ -1131,18 +1131,28 @@ class Locus:
                 dtype=np.float64,
             )
 
-            result = minimize(
-                poisson_nll_grad,
-                initial_guess,
-                args=(X_filter, eg_read_counts),
-                bounds=bounds,
-                method="L-BFGS-B",
-                jac=True,
-                options={"maxiter": 10_000},
-            )
+            if getattr(config, "inner_solver", "lbfgs") == "mu":
+                from price2 import mu_solver
+
+                result_x = mu_solver.mu_inner_cpu(
+                    X_filter, X_filter.T.tocsr(), eg_read_counts,
+                    np.ones(X_filter.shape[0]), initial_guess, 0.0,
+                    len(initial_guess), 1, config.pseudo_min,
+                    getattr(config, "mu_inner_max_iter", 3000),
+                    getattr(config, "mu_inner_tol", 1e-5))
+            else:
+                result_x = minimize(
+                    poisson_nll_grad,
+                    initial_guess,
+                    args=(X_filter, eg_read_counts),
+                    bounds=bounds,
+                    method="L-BFGS-B",
+                    jac=True,
+                    options={"maxiter": 10_000},
+                ).x
 
             rgr_indices_to_keep_one_run = set(
-                np.where(result.x >= config.deconvolution_filter_min_activity)[0]
+                np.where(result_x >= config.deconvolution_filter_min_activity)[0]
             )
             rgr_indices_to_keep.append(rgr_indices_to_keep_one_run)
 
@@ -1303,8 +1313,49 @@ class Locus:
 
         w_current = np.ones(n)
 
+        # Inner-solver setup. "mu" swaps the scipy L-BFGS-B inner solve for
+        # multiplicative (weighted Richardson-Lucy) updates, optionally on GPU.
+        use_mu = getattr(config, "inner_solver", "lbfgs") == "mu"
+        if use_mu:
+            from price2 import mu_solver
+
+            XT = X.T.tocsr()
+            gpu = None
+            if (
+                getattr(config, "mu_gpu", False)
+                and X.shape[0] >= getattr(config, "mu_gpu_min_rows", 50_000)
+            ):
+                try:
+                    gpu = mu_solver.GpuMuSolver(
+                        X, y, getattr(config, "mu_dtype", "float32")
+                    )
+                except Exception as exc:  # torch/CUDA missing -> CPU fallback
+                    logger.warning("GPU MU unavailable (%s); using CPU", exc)
+
+        # Optional single-context GPU broker: when config carries a broker
+        # request queue, ship the whole system to the broker (one shared CUDA
+        # context for the entire pool) instead of each worker holding its own.
+        # The broker runs the full IRLS-Huber MU loop and returns w.
+        broker_req_q = getattr(config, "mu_broker_req_q", None)
+        use_broker = (
+            use_mu and broker_req_q is not None
+            and X.shape[0] >= getattr(config, "mu_gpu_min_rows", 50_000)
+        )
+
         s1 = time.time()
-        for outer in range(config.irls_huber_max_outer):
+        n_outer = 0 if use_broker else config.irls_huber_max_outer
+        if use_broker:
+            from price2.gpu_broker import BrokerClient, Params as _BParams
+            _bp = _BParams(
+                num_rgrs=num_rgrs, num_runs=num_runs, lam=config.lam,
+                pseudo_min=config.pseudo_min, huber_c=c,
+                max_outer=config.irls_huber_max_outer,
+                huber_tol=config.irls_huber_tol,
+                mu_inner_max_iter=getattr(config, "mu_inner_max_iter", 3000),
+                mu_inner_tol=getattr(config, "mu_inner_tol", 1e-5))
+            w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp)
+        outer = -1
+        for outer in range(n_outer):
             # Compute fitted values and Pearson residuals
             delta = np.asarray(X @ w_current).ravel()
             delta_safe = np.maximum(delta, 1e-14)
@@ -1315,30 +1366,41 @@ class Locus:
             weights = np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
 
             # Solve weighted group-LASSO Poisson NLL
-            cb = Callback(
-                w_current,
-                num_runs,
-                config,
-                remove_rgrs=False,
-                rgr_lengths=rgr_lengths,
-            )
-            result = minimize(
-                weighted_poisson_nll_grad_lasso,
-                w_current,
-                args=(X, y, weights, config.lam, num_rgrs, num_runs),
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                callback=cb,
-                options={
-                    "maxiter": 10_000,
-                    "ftol": config.ftol,
-                    "gtol": config.gtol,
-                    "maxls": config.maxls,
-                },
-            )
+            if use_mu:
+                mi = getattr(config, "mu_inner_max_iter", 3000)
+                mt = getattr(config, "mu_inner_tol", 1e-5)
+                if gpu is not None:
+                    w_new = gpu.solve(weights, w_current, config.lam,
+                                      num_rgrs, num_runs, config.pseudo_min, mi, mt)
+                else:
+                    w_new = mu_solver.mu_inner_cpu(
+                        X, XT, y, weights, w_current, config.lam,
+                        num_rgrs, num_runs, config.pseudo_min, mi, mt)
+            else:
+                cb = Callback(
+                    w_current,
+                    num_runs,
+                    config,
+                    remove_rgrs=False,
+                    rgr_lengths=rgr_lengths,
+                )
+                result = minimize(
+                    weighted_poisson_nll_grad_lasso,
+                    w_current,
+                    args=(X, y, weights, config.lam, num_rgrs, num_runs),
+                    method="L-BFGS-B",
+                    jac=True,
+                    bounds=bounds,
+                    callback=cb,
+                    options={
+                        "maxiter": 10_000,
+                        "ftol": config.ftol,
+                        "gtol": config.gtol,
+                        "maxls": config.maxls,
+                    },
+                )
+                w_new = result.x
 
-            w_new = result.x
             rel_change = np.linalg.norm(w_new - w_current) / max(
                 np.linalg.norm(w_current), 1e-14
             )
@@ -1348,7 +1410,9 @@ class Locus:
 
         s2 = time.time()
         opt_time += s2 - s1
-        self.irls_outer_iterations = outer + 1
+        self.irls_outer_iterations = (
+            config.irls_huber_max_outer if use_broker else outer + 1
+        )
         logger.debug(
             "IRLS-Huber: converged in %d outer iterations (c=%.1f)",
             outer + 1,
@@ -1518,29 +1582,48 @@ class Locus:
 
         def run_weighted_likelihood_optimization(initial_guess, bounds, optim_args):
             X_lr, y_lr, ftol, gtol = optim_args
-            cb = Callback(initial_guess, num_runs, config)
-            optimization_result = minimize(
-                weighted_poisson_nll_grad,
-                initial_guess,
-                args=(X_lr, y_lr, weights),
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                callback=cb,
-                options={
-                    "maxiter": 10_000,
-                    "ftol": ftol,
-                    "gtol": gtol,
-                    "maxls": config.maxls,
-                },
-            )
-            if cb.success:
-                optimization_result.success = True
-            if not optimization_result.success:
-                raise RuntimeError(
-                    f"Weighted LRT filtering failed to converge. "
-                    f"{optimization_result.message}"
+            if getattr(config, "inner_solver", "lbfgs") == "mu":
+                # Weighted Poisson MLE via MU. A (pmin, pmin) box pins a coord to
+                # ~0 (the reduced hypothesis); map those to a fixed_mask.
+                import types
+
+                from price2 import mu_solver
+
+                pmin = config.pseudo_min
+                fixed = np.array(
+                    [b[1] is not None and b[1] <= pmin for b in bounds])
+                w_lr = mu_solver.mu_inner_cpu(
+                    X_lr, XT_lr, y_lr, weights,
+                    np.asarray(initial_guess, dtype=np.float64), 0.0,
+                    len(initial_guess), 1, pmin,
+                    getattr(config, "mu_inner_max_iter", 3000),
+                    getattr(config, "mu_inner_tol", 1e-5),
+                    fixed_mask=fixed)
+                optimization_result = types.SimpleNamespace(x=w_lr, success=True)
+            else:
+                cb = Callback(initial_guess, num_runs, config)
+                optimization_result = minimize(
+                    weighted_poisson_nll_grad,
+                    initial_guess,
+                    args=(X_lr, y_lr, weights),
+                    method="L-BFGS-B",
+                    jac=True,
+                    bounds=bounds,
+                    callback=cb,
+                    options={
+                        "maxiter": 10_000,
+                        "ftol": ftol,
+                        "gtol": gtol,
+                        "maxls": config.maxls,
+                    },
                 )
+                if cb.success:
+                    optimization_result.success = True
+                if not optimization_result.success:
+                    raise RuntimeError(
+                        f"Weighted LRT filtering failed to converge. "
+                        f"{optimization_result.message}"
+                    )
             ll = weighted_poisson_log_likelihood_sparse(
                 optimization_result.x, X_lr, y_lr, weights
             )
@@ -1548,6 +1631,10 @@ class Locus:
 
         sparse_args = self.to_sparse_args(runs)
         X_lr = sparse_args["X"]
+        # Transpose once for the MU LRT solver (referenced by the closure above);
+        # only needed when inner_solver="mu".
+        XT_lr = (X_lr.T.tocsr()
+                 if getattr(config, "inner_solver", "lbfgs") == "mu" else None)
         y_lr = sparse_args["y"]
         num_rgrs = sparse_args["num_rgrs"]
         initial_guess = sparse_args["initial_guess"]
@@ -1720,28 +1807,40 @@ class Locus:
 
             bounds = [(config.pseudo_min, None)] * len(initial_guess)
 
-            cb = Callback(initial_guess, num_runs, config)
-            optimization_result = minimize(
-                obj_fn,
-                initial_guess,
-                args=obj_args,
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                callback=cb,
-                options={
-                    "maxiter": 10_000,
-                    "gtol": config.gtol,
-                    "ftol": config.ftol,
-                    "maxls": config.maxls,
-                },
-            )
-            if cb.success:
-                optimization_result.success = True
-            if not optimization_result.success:
-                raise RuntimeError(f"Activity estimation failed to converge.")
+            if getattr(config, "inner_solver", "lbfgs") == "mu":
+                # Unregularised Poisson MLE via Richardson-Lucy (weights=1, lam=0),
+                # consistent with the MU group-LASSO deconvolution.
+                from price2 import mu_solver
 
-            tmp = optimization_result.x.copy()
+                XT_ea = X_ea.T.tocsr()
+                w_ea = mu_solver.mu_inner_cpu(
+                    X_ea, XT_ea, y_ea, np.ones(X_ea.shape[0]),
+                    initial_guess, 0.0, len(initial_guess), 1, config.pseudo_min,
+                    getattr(config, "mu_inner_max_iter", 3000),
+                    getattr(config, "mu_inner_tol", 1e-5))
+                tmp = w_ea.copy()
+            else:
+                cb = Callback(initial_guess, num_runs, config)
+                optimization_result = minimize(
+                    obj_fn,
+                    initial_guess,
+                    args=obj_args,
+                    method="L-BFGS-B",
+                    jac=True,
+                    bounds=bounds,
+                    callback=cb,
+                    options={
+                        "maxiter": 10_000,
+                        "gtol": config.gtol,
+                        "ftol": config.ftol,
+                        "maxls": config.maxls,
+                    },
+                )
+                if cb.success:
+                    optimization_result.success = True
+                if not optimization_result.success:
+                    raise RuntimeError(f"Activity estimation failed to converge.")
+                tmp = optimization_result.x.copy()
             tmp = tmp.reshape(num_rgrs, num_runs)
             tmp[tmp <= config.pseudo_min] = 0
             self.result = tmp

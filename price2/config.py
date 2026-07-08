@@ -206,6 +206,42 @@ class Config:
     irls_huber_tol: float = 1e-4
 
     # ------------------------------------------------------------------ #
+    # Inner solver for the group-LASSO Poisson deconvolution              #
+    # ------------------------------------------------------------------ #
+    #: ``"lbfgs"`` (default) uses scipy L-BFGS-B, matching legacy behaviour.
+    #: ``"mu"`` uses multiplicative (weighted Richardson-Lucy) updates, which
+    #: converge to the true optimum far faster on demanding loci (see
+    #: playground/deconvolution_performance). NOTE: because L-BFGS-B stops
+    #: loosely, switching to ``"mu"`` changes some borderline ORF activities;
+    #: validate downstream before adopting as the default.
+    inner_solver: str = "lbfgs"
+    #: Use the GPU (PyTorch + CUDA) multiplicative-update path when available
+    #: and the system is at least ``mu_gpu_min_rows`` rows; else run on CPU.
+    mu_gpu: bool = False
+    #: Only offload to the GPU above this row count (transfer overhead makes
+    #: small systems faster on the CPU).
+    mu_gpu_min_rows: int = 50_000
+    #: GPU dtype for the multiplicative updates (``"float32"`` or ``"float64"``).
+    mu_dtype: str = "float32"
+    #: Multiplicative-update inner-loop cap and relative-change tolerance.
+    mu_inner_max_iter: int = 3000
+    mu_inner_tol: float = 1e-5
+    #: Route GPU deconvolution through a single-context broker process instead of
+    #: giving each worker its own CUDA context. Requires ``inner_solver="mu"``.
+    #: One broker holds one context and serves the whole worker pool over shared
+    #: memory, so device VRAM does not scale with ``processes`` (see
+    #: playground/deconvolution_performance/gpu_broker). Falls back to the
+    #: configured per-worker path if the broker cannot start.
+    mu_broker: bool = False
+    #: Number of broker PROCESSES (independent CUDA contexts / GILs). A single
+    #: process is GIL-bound and cannot saturate the GPU or feed a large worker
+    #: pool; a few processes fix that while keeping the context count bounded.
+    mu_broker_procs: int = 4
+    #: CUDA stream-threads per broker process (intra-process overlap; limited by
+    #: that process's GIL, so scale mu_broker_procs first).
+    mu_broker_streams: int = 2
+
+    # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #
     # ------------------------------------------------------------------ #
     likelihood_ratio_filter: bool = True
