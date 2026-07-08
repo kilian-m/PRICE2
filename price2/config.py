@@ -204,6 +204,18 @@ class Config:
     )
     irls_huber_max_outer: int = 10
     irls_huber_tol: float = 1e-4
+    #: Experimental alternative stopping rule for the IRLS-Huber outer loop.
+    #: The default ``irls_huber_tol`` measures the L2 change of the whole
+    #: weight vector, which shrinks only geometrically (group-LASSO drags many
+    #: coordinates slowly toward ``pseudo_min``) and so rarely fires before
+    #: ``irls_huber_max_outer`` on read-dense loci. When ``True`` the loop
+    #: instead stops once the set of ORFs above
+    #: ``deconvolution_filter_min_activity`` (i.e. the ones that survive
+    #: filtering) is unchanged for ``irls_active_patience`` consecutive outer
+    #: iterations — the reported call set converges far earlier than the raw
+    #: parameter norm.
+    irls_stop_on_active_set: bool = True
+    irls_active_patience: int = 3
 
     # ------------------------------------------------------------------ #
     # Inner solver for the group-LASSO Poisson deconvolution              #
@@ -266,16 +278,26 @@ class Config:
     # ------------------------------------------------------------------ #
     # Multimapping EM                                                       #
     # ------------------------------------------------------------------ #
-    # When ``True`` the deconvolution runs inside an EM outer loop that
-    # fractionally re-assigns each multimapping read across the loci it
+    # When ``True`` (default) the deconvolution runs inside an EM outer loop
+    # that fractionally re-assigns each multimapping read across the loci it
     # maps to (E-step), with the existing per-locus optimisation as the
     # M-step.  When ``False`` behaviour is identical to classic PRICE2
-    # (every read counted at full weight at every locus it overlaps).
-    multimap_em: bool = False
-    #: Maximum number of EM outer iterations (light M-step + global E-step).
-    em_max_iter: int = 10
-    #: Convergence tolerance on the relative change of fractional weights
-    #: between successive E-steps; the loop stops early once below this.
+    # (every read counted at full weight at every locus it overlaps).  Note:
+    # enabling this makes read collection record per-alignment multimap
+    # linkage (extra time/disk) and adds the EM outer iterations below.
+    multimap_em: bool = True
+    #: Safety cap on EM outer iterations (light M-step + global E-step). The
+    #: EM converges only *linearly* (the L1 read-mass reassigned per E-step
+    #: shrinks by a roughly constant factor ~0.8 each iteration), so reaching
+    #: ``em_tol`` takes ~18-20 iterations on tested data. The loop is meant to
+    #: stop on ``em_tol``; this cap is a backstop, not the normal exit — set it
+    #: high enough that the tolerance governs. (A cap of 10 truncated the loop
+    #: at ~5x em_tol, i.e. before it converged; see
+    #: playground/em_stopping_criterion.)
+    em_max_iter: int = 30
+    #: Convergence tolerance on the L1 fraction of read mass reassigned between
+    #: successive E-steps; the loop stops once below this. This — not
+    #: ``em_max_iter`` — should be what ends the loop in a normal run.
     em_tol: float = 1e-3
     #: Number of interleaved IRLS-Huber reweight steps per light M-step.
     #: One keeps Huber and EM in a single shared loop (as intended); the
