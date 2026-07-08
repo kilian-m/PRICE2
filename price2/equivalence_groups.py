@@ -911,6 +911,12 @@ def make_equivalence_intervals(
         Populated intervals for assignment of reads to RGRs on this transcript.
     """
     egi = EquivalenceGroupIntervals()
+    # Bind the enum members once: ``CoveragePosition.start`` etc. is a
+    # DynamicClassAttribute lookup, and this loop accesses them millions of
+    # times across a run.  Local names are the identical singleton objects.
+    cov_start = CoveragePosition.start
+    cov_middle = CoveragePosition.middle
+    cov_stop = CoveragePosition.stop
     for rgr in transcript.rgr_set:
         if rgr.type == "NOISE":
             try:
@@ -953,7 +959,7 @@ def make_equivalence_intervals(
                 start = max(0, rgr.iv_on_transcript[0] + rsos)
                 end = max(0, rgr.iv_on_transcript[0] + 3 + rsoe)
                 try:
-                    egi.add_rgr(rgr, start, end, phase, frame, CoveragePosition.start)
+                    egi.add_rgr(rgr, start, end, phase, frame, cov_start)
                 except (IndexError, ValueError):
                     pass
 
@@ -964,7 +970,7 @@ def make_equivalence_intervals(
                     rgr.iv_on_transcript[1] - 3 + rsoe,
                 )
                 try:
-                    egi.add_rgr(rgr, start, end, phase, frame, CoveragePosition.middle)
+                    egi.add_rgr(rgr, start, end, phase, frame, cov_middle)
                 except (IndexError, ValueError):
                     pass
 
@@ -975,7 +981,7 @@ def make_equivalence_intervals(
                     rgr.iv_on_transcript[1] + rsoe,
                 )
                 try:
-                    egi.add_rgr(rgr, start, end, phase, frame, CoveragePosition.stop)
+                    egi.add_rgr(rgr, start, end, phase, frame, cov_stop)
                 except (IndexError, ValueError):
                     pass
     return egi

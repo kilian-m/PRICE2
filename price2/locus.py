@@ -270,10 +270,31 @@ class Locus:
             return self._transcript_breakpoint_index
 
     def __getstate__(self) -> dict:
-        """Return pickle state, excluding the breakpoint index cache."""
+        """Return pickle state, excluding lazily-rebuilt caches."""
         state = self.__dict__.copy()
         state.pop("_transcript_breakpoint_index", None)
+        state.pop("_rgr_intervals", None)
         return state
+
+    @property
+    def rgr_intervals(self) -> HTSeq.GenomicArrayOfSets:
+        """Per-position ``GenomicArrayOfSets`` over the current RGR set.
+
+        Built lazily from :attr:`rgr_set` on first access and cached; the cache
+        is invalidated whenever the RGR set changes (see :meth:`remove_rgrs`).
+        Nothing in the core pipeline reads this structure, so it is normally
+        never materialised — building it eagerly in :meth:`make_rgrs` was an
+        O(n_rgr^2) hot-spot on dense loci (hundreds of seconds on the largest
+        Yewdell locus) for no downstream benefit.
+        """
+        ri = getattr(self, "_rgr_intervals", None)
+        if ri is None:
+            ri = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
+            for rgr in self.rgr_set:
+                for iv in rgr.genomic_region.intervals:
+                    ri[iv] += rgr
+            self._rgr_intervals = ri
+        return ri
 
     def make_rgrs(
         self,
@@ -401,12 +422,13 @@ class Locus:
             orf.transcript.add_orf(orf)
         self.rgr_set |= set(orf_dict.values())
 
-        self.rgr_intervals = HTSeq.GenomicArrayOfSets(
-            "auto", stranded=True, storage="step"
-        )
-        for rgr in self.rgr_set:
-            for iv in rgr.genomic_region.intervals:
-                self.rgr_intervals[iv] += rgr
+        # ``rgr_intervals`` (a per-position GenomicArrayOfSets over every RGR)
+        # is built lazily on first access (see the ``rgr_intervals`` property)
+        # rather than eagerly here.  Building it eagerly is O(n_rgr^2) for the
+        # heavily-overlapping ORF candidates of large loci (~275 s on the
+        # densest Yewdell locus alone) and nothing in the pipeline reads it, so
+        # the eager build was pure overhead on the critical path.
+        self._rgr_intervals = None
 
         self.gene_ids_complete = {
             rgr.transcript.gene_id for rgr in self.rgr_set
@@ -453,154 +475,148 @@ class Locus:
                 overlap_transcripts &= bp_sets[i]
                 i += 1
 
+        # Hoist per-read / per-run invariants out of the transcript x rgr
+        # loops.  ``len(rsa) == len(rsa.genomic_region)`` (a cached value) and
+        # the untemplated-addition flag are the same for every candidate RGR,
+        # so compute them once.  The full-overlap cleavage likelihood is an
+        # exact lookup-table entry (verified bit-identical to
+        # ``CleavageModel.pmf`` across the whole domain), so index the LUT
+        # directly instead of paying a pmf() call frame per RGR — only the
+        # partial-overlap (region-bounded) likelihoods still call pmf.
+        pmf = run.cleavage_model.pmf
+        cds_lut = run.cleavage_model.cds_lut
+        noise_lut = run.cleavage_model.noise_lut
+        lut_len = cds_lut.shape[0]
+        read_length = len(rsa)
+        oua = rsa.untemplated_addition
+        oua_i = int(oua)
+        thr = overlap_likelihood_ratio_threshold
+        cov_middle = CoveragePosition.middle
+        cov_start = CoveragePosition.start
+        cov_stop = CoveragePosition.stop
+        in_lut = read_length < lut_len
+        noise_cl = noise_lut[read_length, oua_i] if in_lut else 0.0
+
         for tr in overlap_transcripts:
             try:
                 rsa_iv_on_tr = tr.exons.map_to_local(rsa.genomic_region)
             except ValueError:
                 continue
+            rsa_lo, rsa_hi = rsa_iv_on_tr
             for rgr in tr.rgr_set:
+                rgr_lo, rgr_hi = rgr.iv_on_transcript
                 # full overlap with orf
                 if rgr.type == "NOISE":
                     frame = None
-                    if (rgr.iv_on_transcript[0] <= rsa_iv_on_tr[0]) and (
-                        rgr.iv_on_transcript[1] >= rsa_iv_on_tr[1]
+                    if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
+                        if noise_cl > 0:
+                            rgr_frame_covpos.add((rgr, frame, cov_middle))
+                    elif (rsa_lo <= rgr_lo <= rsa_hi) or (
+                        rsa_lo <= rgr_hi <= rsa_hi
                     ):
+                        region_start = rgr_lo - rsa_lo
+                        region_end = rgr_hi - rsa_lo
                         if (
-                            run.cleavage_model.pmf(
-                                len(rsa.genomic_region), rsa.untemplated_addition, frame
-                            )
-                            > 0
-                        ):
-                            rgr_frame_covpos.add((rgr, frame, CoveragePosition.middle))
-                    elif (
-                        rsa_iv_on_tr[0] <= rgr.iv_on_transcript[0] <= rsa_iv_on_tr[1]
-                    ) or (
-                        rsa_iv_on_tr[0] <= rgr.iv_on_transcript[1] <= rsa_iv_on_tr[1]
-                    ):
-                        region_start = rgr.iv_on_transcript[0] - rsa_iv_on_tr[0]
-                        region_end = rgr.iv_on_transcript[1] - rsa_iv_on_tr[0]
-                        if (
-                            ol := run.cleavage_model.pmf(
-                                len(rsa),
-                                rsa.untemplated_addition,
+                            ol := pmf(
+                                read_length,
+                                oua,
                                 frame,
                                 region_start=region_start,
                                 region_end=region_end,
                             )
                         ) > 0:
-                            cl = run.cleavage_model.pmf(
-                                len(rsa), rsa.untemplated_addition, frame
-                            )
+                            cl = noise_cl
                             if cl == 0:
                                 continue
-                            if ol / cl > overlap_likelihood_ratio_threshold:
+                            if ol / cl > thr:
                                 rgr_frame_covpos.add(
                                     (
                                         rgr,
                                         frame,
-                                        CoveragePosition.middle,
+                                        cov_middle,
                                     )
                                 )
                 elif rgr.type == "ORF":
                     orf = rgr
-                    if (
-                        orf.iv_on_transcript[0] <= rsa_iv_on_tr[0]
-                        and orf.iv_on_transcript[1] >= rsa_iv_on_tr[1]
-                    ):
-                        frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
-                        if (
-                            run.cleavage_model.pmf(
-                                len(rsa.genomic_region), rsa.untemplated_addition, frame
-                            )
-                            > 0
-                        ):
-                            rgr_frame_covpos.add((orf, frame, CoveragePosition.middle))
+                    if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
+                        frame = (rsa_lo - rgr_lo) % 3
+                        if (cds_lut[read_length, frame, oua_i] if in_lut else 0.0) > 0:
+                            rgr_frame_covpos.add((orf, frame, cov_middle))
                     # part overlap with orf
-                    elif (
-                        rsa_iv_on_tr[0] <= orf.iv_on_transcript[0] <= rsa_iv_on_tr[1]
-                    ) or (
-                        rsa_iv_on_tr[0] <= orf.iv_on_transcript[1] <= rsa_iv_on_tr[1]
+                    elif (rsa_lo <= rgr_lo <= rsa_hi) or (
+                        rsa_lo <= rgr_hi <= rsa_hi
                     ):
-                        frame = (rsa_iv_on_tr[0] - orf.iv_on_transcript[0]) % 3
+                        frame = (rsa_lo - rgr_lo) % 3
+                        cl = cds_lut[read_length, frame, oua_i] if in_lut else 0.0
+                        cl_ok = not cl == 0
                         # consider overlap likelihood
                         # compute at which position in the read the orf starts
-                        region_start = orf.iv_on_transcript[0] + 3 - rsa_iv_on_tr[0]
+                        region_start = rgr_lo + 3 - rsa_lo
                         # compute at which position in the read the orf ends
-                        region_end = orf.iv_on_transcript[1] - 3 - rsa_iv_on_tr[0]
+                        region_end = rgr_hi - 3 - rsa_lo
                         if (
-                            ol := run.cleavage_model.pmf(
-                                len(rsa),
-                                rsa.untemplated_addition,
+                            ol := pmf(
+                                read_length,
+                                oua,
                                 frame,
                                 region_start=region_start,
                                 region_end=region_end,
                             )
                         ) > 0:
-                            cl = run.cleavage_model.pmf(
-                                len(rsa), rsa.untemplated_addition, frame
-                            )
-                            if (not cl == 0) and (
-                                ol / cl > overlap_likelihood_ratio_threshold
-                            ):
+                            if cl_ok and (ol / cl > thr):
                                 rgr_frame_covpos.add(
                                     (
                                         orf,
                                         frame,
-                                        CoveragePosition.middle,
+                                        cov_middle,
                                     )
                                 )
                         # consider coverage profile - start
                         # compute where the orf starts relative to the read
                         start_position = (
-                            orf.iv_on_transcript[0] - rsa_iv_on_tr[0],
-                            orf.iv_on_transcript[0] + 3 - rsa_iv_on_tr[0],
+                            rgr_lo - rsa_lo,
+                            rgr_lo + 3 - rsa_lo,
                         )
                         if (
-                            ol := run.cleavage_model.pmf(
-                                len(rsa),
-                                rsa.untemplated_addition,
+                            ol := pmf(
+                                read_length,
+                                oua,
                                 frame,
                                 region_start=start_position[0],
                                 region_end=start_position[1],
                             )
                         ) > 0:
-                            cl = run.cleavage_model.pmf(
-                                len(rsa), rsa.untemplated_addition, frame
-                            )
-                            if (not cl == 0) and (
+                            if cl_ok and (
                                 # ol * run.coverage_model.start_factor / cl
                                 ol / cl
-                                > overlap_likelihood_ratio_threshold
+                                > thr
                             ):
                                 rgr_frame_covpos.add(
-                                    (orf, frame, CoveragePosition.start)
+                                    (orf, frame, cov_start)
                                 )
 
                         # consider coverage profile - stop
                         # compute where the orf ends relative to the read
                         stop_position = (
-                            orf.iv_on_transcript[1] - 3 - rsa_iv_on_tr[0],
-                            orf.iv_on_transcript[1] - rsa_iv_on_tr[0],
+                            rgr_hi - 3 - rsa_lo,
+                            rgr_hi - rsa_lo,
                         )
                         if (
-                            ol := run.cleavage_model.pmf(
-                                len(rsa),
-                                rsa.untemplated_addition,
+                            ol := pmf(
+                                read_length,
+                                oua,
                                 frame,
                                 region_start=stop_position[0],
                                 region_end=stop_position[1],
                             )
                         ) > 0:
-                            cl = run.cleavage_model.pmf(
-                                len(rsa), rsa.untemplated_addition, frame
-                            )
-                            if (not cl == 0) and (
+                            if cl_ok and (
                                 # ol * run.coverage_model.stop_factor / cl
                                 ol / cl
-                                > overlap_likelihood_ratio_threshold
+                                > thr
                             ):
                                 rgr_frame_covpos.add(
-                                    (orf, frame, CoveragePosition.stop)
+                                    (orf, frame, cov_stop)
                                 )
 
         if not rgr_frame_covpos:
@@ -1641,9 +1657,9 @@ class Locus:
     ) -> None:
         """Remove a set of RGRs and update all dependent data structures.
 
-        Updates :attr:`rgr_set`, re-indexes remaining RGRs, rebuilds
-        :attr:`rgr_intervals`, collapses equivalence groups (if present),
-        and re-slices :attr:`result` (if present).
+        Updates :attr:`rgr_set`, re-indexes remaining RGRs, invalidates the
+        lazy :attr:`rgr_intervals` cache, collapses equivalence groups (if
+        present), and re-slices :attr:`result` (if present).
 
         Parameters
         ----------
@@ -1659,11 +1675,9 @@ class Locus:
         for c, rgr in enumerate(self.rgr_set):
             rgr.index = c
 
-        # rgr_intervals
-        rgr_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
-        for step, step_set in self.rgr_intervals.steps():
-            rgr_intervals[step] = step_set & self.rgr_set
-        self.rgr_intervals = rgr_intervals
+        # Invalidate the lazily-built rgr_intervals cache; it is rebuilt from
+        # the current rgr_set on next access (nothing in the pipeline reads it).
+        self._rgr_intervals = None
 
         # egs
         if hasattr(self, "egs"):
