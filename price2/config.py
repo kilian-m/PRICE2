@@ -235,8 +235,9 @@ class Config:
     #: One broker holds one context and serves the whole worker pool over shared
     #: memory, so device VRAM does not scale with ``processes`` (see
     #: playground/deconvolution_performance/gpu_broker). Falls back to the
-    #: configured per-worker path if the broker cannot start.
-    mu_broker: bool = False
+    #: configured per-worker path (CPU MU, or per-worker GPU when ``mu_gpu``)
+    #: if the broker cannot start (no PyTorch/CUDA).
+    mu_broker: bool = True
     #: Number of broker PROCESSES (independent CUDA contexts / GILs). A single
     #: process is GIL-bound and cannot saturate the GPU or feed a large worker
     #: pool; a few processes fix that while keeping the context count bounded.
