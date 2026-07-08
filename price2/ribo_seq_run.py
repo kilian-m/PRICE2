@@ -32,6 +32,9 @@ from price2.reference_annotation import ReferenceAnnotation
 
 logger = logging.getLogger(__name__)
 
+#: Number of threads ``samtools view`` uses when downsampling a BAM file.
+_SAMPLE_THREADS = 8
+
 
 def _init_worker_logging(log_queue, log_level: str) -> None:
     """Configure logging in a Pool worker process."""
@@ -217,6 +220,8 @@ def ribo_seq_run_from_bam(
         [
             "samtools",
             "view",
+            "-@",
+            str(_SAMPLE_THREADS),
             "-b",
             "-s",
             str(fraction_of_reads),
