@@ -1422,6 +1422,15 @@ class Locus:
             w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp, w0=w_current)
             broker_outer = n_outer
             n_outer = 0
+        # Active-set-plateau stopping criterion (flag-gated). The IRLS-Huber
+        # rel-change metric keeps shrinking geometrically long after the set of
+        # ORFs above the activity filter has stabilised; stop once that set is
+        # unchanged for `irls_active_patience` consecutive outer iterations.
+        _use_active_stop = getattr(config, "irls_stop_on_active_set", False)
+        _active_patience = getattr(config, "irls_active_patience", 2)
+        _thr_hi = getattr(config, "deconvolution_filter_min_activity", 0.1)
+        _prev_active = None
+        _stable_count = 0
         outer = -1
         for outer in range(n_outer):
             # Compute fitted values and Pearson residuals
@@ -1475,6 +1484,18 @@ class Locus:
             w_current = w_new
             if rel_change < config.irls_huber_tol:
                 break
+            if _use_active_stop:
+                _g = np.sqrt(
+                    (w_new.reshape(num_rgrs, num_runs) ** 2).sum(axis=1)
+                )
+                _active = frozenset(np.nonzero(_g > _thr_hi)[0].tolist())
+                if _active == _prev_active:
+                    _stable_count += 1
+                else:
+                    _stable_count = 0
+                _prev_active = _active
+                if _stable_count >= _active_patience:
+                    break
 
         s2 = time.time()
         opt_time += s2 - s1
