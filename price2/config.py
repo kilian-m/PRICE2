@@ -208,13 +208,17 @@ class Config:
     # ------------------------------------------------------------------ #
     # Inner solver for the group-LASSO Poisson deconvolution              #
     # ------------------------------------------------------------------ #
-    #: ``"lbfgs"`` (default) uses scipy L-BFGS-B, matching legacy behaviour.
-    #: ``"mu"`` uses multiplicative (weighted Richardson-Lucy) updates, which
-    #: converge to the true optimum far faster on demanding loci (see
-    #: playground/deconvolution_performance). NOTE: because L-BFGS-B stops
-    #: loosely, switching to ``"mu"`` changes some borderline ORF activities;
-    #: validate downstream before adopting as the default.
-    inner_solver: str = "lbfgs"
+    #: ``"mu"`` (default) uses multiplicative (weighted Richardson-Lucy +
+    #: group-LASSO) updates at every solve site; they converge to the true
+    #: optimum that scipy L-BFGS-B stalls short of. ``"lbfgs"`` selects the legacy
+    #: L-BFGS-B path. Two consequences of the default:
+    #:  (1) it CHANGES the call set vs the legacy loose L-BFGS-B — the converged
+    #:      solve is sparser (~19% fewer ORFs on Yewdell); re-calibrate ``lam`` if
+    #:      you want to preserve the old recall.
+    #:  (2) on CPU it is slower than L-BFGS-B (tight convergence costs iterations);
+    #:      enable ``mu_gpu``/``mu_broker`` (needs PyTorch+CUDA) for the speedup.
+    #: See playground/deconvolution_performance.
+    inner_solver: str = "mu"
     #: Use the GPU (PyTorch + CUDA) multiplicative-update path when available
     #: and the system is at least ``mu_gpu_min_rows`` rows; else run on CPU.
     mu_gpu: bool = False
