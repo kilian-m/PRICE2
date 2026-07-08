@@ -187,7 +187,12 @@ class Config:
     ftol: float = 0
     gtol: float = 0
     maxls: int = 200
-    lam: float = 100
+    #: Group-LASSO penalty λ. Recalibrated from 100 -> 10 after the switch to
+    #: ``inner_solver="mu"``: the tighter solver applies the penalty cleanly, and
+    #: an AIC/BIC scan (playground/lambda_aic) shows λ=100 over-penalises
+    #: (ΔAIC≈5e3 on tiny chr22; BIC-optimal λ=10, AIC-optimal λ=3). λ=10 is the
+    #: conservative (BIC) choice; confirm on a production-scale dataset.
+    lam: float = 10
 
     # ------------------------------------------------------------------ #
     # RGR activity thresholds                                              #
@@ -213,8 +218,9 @@ class Config:
     #: optimum that scipy L-BFGS-B stalls short of. ``"lbfgs"`` selects the legacy
     #: L-BFGS-B path. Two consequences of the default:
     #:  (1) it CHANGES the call set vs the legacy loose L-BFGS-B — the converged
-    #:      solve is sparser (~19% fewer ORFs on Yewdell); re-calibrate ``lam`` if
-    #:      you want to preserve the old recall.
+    #:      solve is sparser (~19% fewer ORFs on Yewdell). ``lam`` was
+    #:      recalibrated for it (100 -> 10) via an AIC/BIC scan; see
+    #:      playground/lambda_aic.
     #:  (2) on CPU it is slower than L-BFGS-B (tight convergence costs iterations);
     #:      enable ``mu_gpu``/``mu_broker`` (needs PyTorch+CUDA) for the speedup.
     #: See playground/deconvolution_performance.
