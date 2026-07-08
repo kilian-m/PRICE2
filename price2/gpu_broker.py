@@ -12,8 +12,9 @@ longer scales with the pool size.
 
 Protocol per job (small metadata over a plain mp.Queue; big arrays via
 multiprocessing.shared_memory, never pickled):
-  worker: put X, Xᵀ (CSR arrays), y into shm; pre-allocate a result-w shm and a
-          1-byte status shm; enqueue the job; spin on the status byte; read w.
+  worker: put X, Xᵀ (CSR arrays), y (and an optional warm-start w0) into shm;
+          pre-allocate a result-w shm and a 1-byte status shm; enqueue the job;
+          spin on the status byte; read w.
   broker: N worker threads, each with its own torch.cuda.Stream, pull jobs, run
           the IRLS-Huber MU loop on the GPU, write w, set status=1 (or 2 on
           error).
@@ -120,7 +121,15 @@ def _gpu_deconvolve(torch, job, dtype, check_every=25):
         Xc = csr(Xd, Xi, Xp, (m, n))
         XcT = csr(Td, Ti, Tp, (n, m))
         yt = torch.from_numpy(np.ascontiguousarray(y)).to(dtype).cuda()
-        w = torch.ones(n, dtype=dtype, device="cuda")
+        # Warm-start from the caller's w0 when provided (the EM light M-step,
+        # which runs a single non-converged outer iteration, relies on it);
+        # otherwise fall back to an all-ones cold start.
+        w0_meta = job.get("w0")
+        if w0_meta is not None:
+            sw0, w0arr = _shm_get(w0_meta); shms.append(sw0)
+            w = torch.from_numpy(np.ascontiguousarray(w0arr)).to(dtype).cuda()
+        else:
+            w = torch.ones(n, dtype=dtype, device="cuda")
 
         for outer in range(p.max_outer):
             delta = torch.mv(Xc, w).clamp_min(1e-14)
@@ -278,7 +287,7 @@ class BrokerClient:
         self.req_q = req_q
         self._counter = 0
 
-    def solve(self, X, XT, y, params: Params, poll=0.0005, timeout=1200.0):
+    def solve(self, X, XT, y, params: Params, w0=None, poll=0.0005, timeout=1200.0):
         self._counter += 1
         n = params.num_rgrs * params.num_runs
         shms = []
@@ -290,6 +299,9 @@ class BrokerClient:
             sTi, mTi = _shm_put(XT.indices.astype(np.int64)); shms.append(sTi)
             sTp, mTp = _shm_put(XT.indptr.astype(np.int64)); shms.append(sTp)
             sy, my = _shm_put(y.astype(np.float64)); shms.append(sy)
+            mw0 = None
+            if w0 is not None:
+                sw0, mw0 = _shm_put(np.asarray(w0, dtype=np.float64)); shms.append(sw0)
             sr = _shm_create(n * 8); shms.append(sr)
             wr = np.ndarray((n,), dtype=np.float64, buffer=sr.buf); wr[...] = 0.0
             ss = _shm_create(1); shms.append(ss)
@@ -300,6 +312,7 @@ class BrokerClient:
                 "X_data": mXd, "X_indices": mXi, "X_indptr": mXp,
                 "XT_data": mTd, "XT_indices": mTi, "XT_indptr": mTp,
                 "y": my, "X_shape": tuple(int(s) for s in X.shape),
+                "w0": mw0,
                 "result": (sr.name, (n,), "float64"),
                 "status": (ss.name, (1,), "uint8"),
                 "params": params,

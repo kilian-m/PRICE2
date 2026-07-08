@@ -1419,7 +1419,7 @@ class Locus:
                 huber_tol=config.irls_huber_tol,
                 mu_inner_max_iter=getattr(config, "mu_inner_max_iter", 3000),
                 mu_inner_tol=getattr(config, "mu_inner_tol", 1e-5))
-            w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp)
+            w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp, w0=w_current)
             broker_outer = n_outer
             n_outer = 0
         outer = -1
