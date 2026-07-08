@@ -206,6 +206,26 @@ class Config:
     irls_huber_tol: float = 1e-4
 
     # ------------------------------------------------------------------ #
+    # Count distribution for the deconvolution likelihood                  #
+    # ------------------------------------------------------------------ #
+    #: Count model assumed for the read counts in every deconvolution solve.
+    #: ``"poisson"`` (default) is the classic PRICE2 model (variance = mean).
+    #: ``"nb"`` uses a negative-binomial likelihood (variance = μ + μ²/θ) to
+    #: absorb the overdispersion typical of Ribo-seq counts; ``θ`` is the fixed
+    #: global dispersion set by ``nb_dispersion``. As ``θ → ∞`` the NB model
+    #: collapses back to the Poisson, so ``"nb"`` with a large ``nb_dispersion``
+    #: reproduces the Poisson results. The choice threads through every solve
+    #: site (deconvolution filter, group-LASSO IRLS-Huber deconvolution, the
+    #: weighted likelihood-ratio filter and final activity estimation) and both
+    #: the CPU and GPU multiplicative-update paths.
+    distribution: str = "poisson"
+    #: Negative-binomial dispersion ``θ`` (a.k.a. the "size"/``r`` parameter),
+    #: used only when ``distribution == "nb"``. Smaller values mean stronger
+    #: overdispersion; larger values approach the Poisson limit. Ignored for the
+    #: Poisson model.
+    nb_dispersion: float = 10.0
+
+    # ------------------------------------------------------------------ #
     # Inner solver for the group-LASSO Poisson deconvolution              #
     # ------------------------------------------------------------------ #
     #: ``"mu"`` (default) uses multiplicative (weighted Richardson-Lucy +

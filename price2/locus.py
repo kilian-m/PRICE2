@@ -1087,6 +1087,7 @@ class Locus:
         min_reads = self.wfr_df.sum().sum() / self.wfr_df.shape[1] * 0.1
 
         number_of_runs = self.wfr_df.shape[1]
+        theta = _distribution_theta(config)
 
         for run_idx in range(number_of_runs):
             rgr_read_counts = self.wfr_df.iloc[:, run_idx].to_dict()
@@ -1140,12 +1141,12 @@ class Locus:
                     np.ones(X_filter.shape[0]), initial_guess, 0.0,
                     len(initial_guess), 1, config.pseudo_min,
                     getattr(config, "mu_inner_max_iter", 3000),
-                    getattr(config, "mu_inner_tol", 1e-5))
+                    getattr(config, "mu_inner_tol", 1e-5), theta=theta)
             else:
                 result_x = minimize(
                     poisson_nll_grad,
                     initial_guess,
-                    args=(X_filter, eg_read_counts),
+                    args=(X_filter, eg_read_counts, theta),
                     bounds=bounds,
                     method="L-BFGS-B",
                     jac=True,
@@ -1368,6 +1369,7 @@ class Locus:
         n = num_rgrs * num_runs
         bounds = [(config.pseudo_min, None)] * n
         c = config.irls_huber_c
+        theta = _distribution_theta(config)
 
         w_current = args_dict["initial_guess"]
 
@@ -1418,32 +1420,30 @@ class Locus:
                 max_outer=n_outer,
                 huber_tol=config.irls_huber_tol,
                 mu_inner_max_iter=getattr(config, "mu_inner_max_iter", 3000),
-                mu_inner_tol=getattr(config, "mu_inner_tol", 1e-5))
+                mu_inner_tol=getattr(config, "mu_inner_tol", 1e-5),
+                theta=theta)
             w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp, w0=w_current)
             broker_outer = n_outer
             n_outer = 0
         outer = -1
         for outer in range(n_outer):
-            # Compute fitted values and Pearson residuals
+            # Fitted values and Huber weights on (NB-aware) Pearson residuals
             delta = np.asarray(X @ w_current).ravel()
-            delta_safe = np.maximum(delta, 1e-14)
-            pearson_r = (y - delta_safe) / np.sqrt(delta_safe)
+            weights = _huber_weights(y, delta, c, theta)
 
-            # Huber weights: ω_i = min(1, c / |r_i|)
-            abs_r = np.abs(pearson_r)
-            weights = np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
-
-            # Solve weighted group-LASSO Poisson NLL
+            # Solve weighted group-LASSO count-model NLL
             if use_mu:
                 mi = getattr(config, "mu_inner_max_iter", 3000)
                 mt = getattr(config, "mu_inner_tol", 1e-5)
                 if gpu is not None:
                     w_new = gpu.solve(weights, w_current, config.lam,
-                                      num_rgrs, num_runs, config.pseudo_min, mi, mt)
+                                      num_rgrs, num_runs, config.pseudo_min, mi, mt,
+                                      theta=theta)
                 else:
                     w_new = mu_solver.mu_inner_cpu(
                         X, XT, y, weights, w_current, config.lam,
-                        num_rgrs, num_runs, config.pseudo_min, mi, mt)
+                        num_rgrs, num_runs, config.pseudo_min, mi, mt,
+                        theta=theta)
             else:
                 cb = Callback(
                     w_current,
@@ -1455,7 +1455,7 @@ class Locus:
                 result = minimize(
                     weighted_poisson_nll_grad_lasso,
                     w_current,
-                    args=(X, y, weights, config.lam, num_rgrs, num_runs),
+                    args=(X, y, weights, config.lam, num_rgrs, num_runs, theta),
                     method="L-BFGS-B",
                     jac=True,
                     bounds=bounds,
@@ -1494,12 +1494,7 @@ class Locus:
 
         # Store Huber weights for use in weighted LRT
         delta = np.asarray(X @ w_current).ravel()
-        delta_safe = np.maximum(delta, 1e-14)
-        pearson_r = (y - delta_safe) / np.sqrt(delta_safe)
-        abs_r = np.abs(pearson_r)
-        self.irls_huber_weights = np.where(
-            abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14)
-        )
+        self.irls_huber_weights = _huber_weights(y, delta, c, theta)
 
         # ── Post-optimisation RGR removal (same as deconvolve) ───────────
         if prune:
@@ -1736,6 +1731,7 @@ class Locus:
         """
 
         weights = self.irls_huber_weights
+        theta = _distribution_theta(config)
 
         def run_weighted_likelihood_optimization(initial_guess, bounds, optim_args):
             X_lr, y_lr, ftol, gtol = optim_args
@@ -1755,14 +1751,14 @@ class Locus:
                     len(initial_guess), 1, pmin,
                     getattr(config, "mu_inner_max_iter", 3000),
                     getattr(config, "mu_inner_tol", 1e-5),
-                    fixed_mask=fixed)
+                    fixed_mask=fixed, theta=theta)
                 optimization_result = types.SimpleNamespace(x=w_lr, success=True)
             else:
                 cb = Callback(initial_guess, num_runs, config)
                 optimization_result = minimize(
                     weighted_poisson_nll_grad,
                     initial_guess,
-                    args=(X_lr, y_lr, weights),
+                    args=(X_lr, y_lr, weights, theta),
                     method="L-BFGS-B",
                     jac=True,
                     bounds=bounds,
@@ -1782,7 +1778,7 @@ class Locus:
                         f"{optimization_result.message}"
                     )
             ll = weighted_poisson_log_likelihood_sparse(
-                optimization_result.x, X_lr, y_lr, weights
+                optimization_result.x, X_lr, y_lr, weights, theta
             )
             return optimization_result, ll
 
@@ -1799,12 +1795,9 @@ class Locus:
         args = (X_lr, y_lr, config.ftol, config.gtol)
 
         # Recompute weights on the current sparse system
-        delta = np.asarray(X_lr @ initial_guess).ravel()
-        delta_safe = np.maximum(delta, 1e-14)
-        pearson_r = (y_lr - delta_safe) / np.sqrt(delta_safe)
-        abs_r = np.abs(pearson_r)
         c = config.irls_huber_c
-        weights = np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
+        delta = np.asarray(X_lr @ initial_guess).ravel()
+        weights = _huber_weights(y_lr, delta, c, theta)
 
         noise_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"}
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
@@ -1845,7 +1838,7 @@ class Locus:
             reduced_activities = reduced_activities.flatten()
 
             reduced_log_likelihood = weighted_poisson_log_likelihood_sparse(
-                reduced_activities, X_lr, y_lr, weights
+                reduced_activities, X_lr, y_lr, weights, theta
             )
 
             log_p = wilks_test_p(
@@ -1950,13 +1943,14 @@ class Locus:
         config : Config
             Configuration providing convergence and threshold parameters.
         """
+        theta = _distribution_theta(config)
         rgrs_removed = True
         while rgrs_removed:
             args_dict = self.to_sparse_args(runs)
             X_ea = args_dict["X"]
             y_ea = args_dict["y"]
             obj_fn = poisson_nll_grad
-            obj_args = (X_ea, y_ea)
+            obj_args = (X_ea, y_ea, theta)
 
             num_runs = args_dict["num_runs"]
             num_rgrs = args_dict["num_rgrs"]
@@ -1974,7 +1968,7 @@ class Locus:
                     X_ea, XT_ea, y_ea, np.ones(X_ea.shape[0]),
                     initial_guess, 0.0, len(initial_guess), 1, config.pseudo_min,
                     getattr(config, "mu_inner_max_iter", 3000),
-                    getattr(config, "mu_inner_tol", 1e-5))
+                    getattr(config, "mu_inner_tol", 1e-5), theta=theta)
                 tmp = w_ea.copy()
             else:
                 cb = Callback(initial_guess, num_runs, config)
@@ -2181,16 +2175,93 @@ def egs_to_sparse(
     return X, y
 
 
+def _distribution_theta(config: Config) -> float | None:
+    """Return the negative-binomial dispersion θ, or ``None`` for Poisson.
+
+    Reads ``config.distribution``; when it is ``"nb"`` the fixed global
+    ``config.nb_dispersion`` is returned, otherwise ``None`` (the classic
+    Poisson model).  Every deconvolution solve site funnels the count-model
+    choice through this single helper, so the flag has one source of truth.
+
+    Parameters
+    ----------
+    config : Config
+        Parsed PRICE configuration object.
+
+    Returns
+    -------
+    float or None
+        The dispersion θ for the negative-binomial model, or ``None`` when
+        the Poisson model is selected.
+    """
+    if getattr(config, "distribution", "poisson") == "nb":
+        return float(getattr(config, "nb_dispersion", 10.0))
+    return None
+
+
+def _huber_weights(
+    y: np.ndarray,
+    delta: np.ndarray,
+    c: float,
+    theta: float | None = None,
+) -> np.ndarray:
+    """Huber weights ``ω_i = min(1, c / |r_i|)`` on Pearson residuals.
+
+    The standardised residual is ``r_i = (y_i − δ_i) / √v_i`` with the
+    count-model variance ``v_i``: ``δ_i`` for the Poisson model
+    (``theta is None``) and ``δ_i + δ_i² / θ`` for the negative binomial.
+    Using the NB variance keeps the robustness threshold ``c`` on the same
+    standardised scale as the NB likelihood, so overdispersed-but-inlying
+    observations are not spuriously down-weighted.
+
+    Parameters
+    ----------
+    y : np.ndarray, shape ``(n_samples,)``
+        Observed read counts.
+    delta : np.ndarray, shape ``(n_samples,)``
+        Fitted means ``δ = X @ w``.
+    c : float
+        Huber tuning constant.
+    theta : float or None, optional
+        Negative-binomial dispersion.  ``None`` selects the Poisson variance.
+
+    Returns
+    -------
+    np.ndarray, shape ``(n_samples,)``
+        Per-observation Huber weights in ``(0, 1]``.
+    """
+    delta_safe = np.maximum(delta, 1e-14)
+    if theta is None:
+        var = delta_safe
+    else:
+        var = delta_safe + delta_safe**2 / theta
+    pearson_r = (y - delta_safe) / np.sqrt(var)
+    abs_r = np.abs(pearson_r)
+    return np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
+
+
 def poisson_nll_grad(
     w: np.ndarray,
     X: csr_matrix,
     y: np.ndarray,
+    theta: float | None = None,
 ) -> tuple[float, np.ndarray]:
-    """Identity-link Poisson NLL and gradient using a sparse design matrix.
+    """Identity-link Poisson (or negative-binomial) NLL and gradient.
 
-    Model:  δ = X @ w
-    Loss:   Σ_i [δ_i − y_i · ln δ_i]  (zero-zero pairs excluded)
-    Grad:   X.T @ r,  r_i = 1 − y_i / δ_i
+    With ``theta is None`` (default) this is the classic identity-link
+    Poisson model.  When ``theta`` is a positive float the identity-link
+    **negative-binomial** NLL and gradient are returned instead, with the
+    same mean but variance ``δ + δ²/θ``.  As ``θ → ∞`` the two coincide.
+
+    Model:  δ = X @ w  (mean of the count model)
+    Poisson loss:  Σ_i [δ_i − y_i · ln δ_i]        (zero-zero pairs excluded)
+    Poisson score: r_i = 1 − y_i / δ_i
+    NB loss:       Σ_i [(y_i + θ) · ln(θ + δ_i) − y_i · ln δ_i]
+    NB score:      r_i = (y_i + θ) / (θ + δ_i) − y_i / δ_i
+    Grad (both):   X.T @ r
+
+    (Constants that do not depend on ``w`` are dropped from the loss; they
+    do not affect the gradient or the minimiser.)
 
     Parameters
     ----------
@@ -2200,6 +2271,8 @@ def poisson_nll_grad(
         Non-negative sparse design matrix.
     y : np.ndarray, shape ``(n_samples,)``
         Observed read counts.
+    theta : float or None, optional
+        Negative-binomial dispersion.  ``None`` selects the Poisson model.
 
     Returns
     -------
@@ -2210,9 +2283,16 @@ def poisson_nll_grad(
     active = ~((delta == 0.0) & (y == 0.0))
     d_act = delta[active]
     y_act = y[active]
-    loss = float(d_act.sum() - (y_act * np.log(d_act)).sum())
+    if theta is None:
+        loss = float(d_act.sum() - (y_act * np.log(d_act)).sum())
+        r_act = 1.0 - y_act / d_act
+    else:
+        loss = float(
+            ((y_act + theta) * np.log(theta + d_act) - y_act * np.log(d_act)).sum()
+        )
+        r_act = (y_act + theta) / (theta + d_act) - y_act / d_act
     r = np.zeros(len(y), dtype=np.float64)
-    r[active] = 1.0 - y_act / d_act
+    r[active] = r_act
     grad = np.asarray(X.T @ r).ravel()
     return loss, grad
 
@@ -2222,11 +2302,14 @@ def weighted_poisson_nll_grad(
     X: csr_matrix,
     y: np.ndarray,
     weights: np.ndarray,
+    theta: float | None = None,
 ) -> tuple[float, np.ndarray]:
-    """Weighted identity-link Poisson NLL and gradient.
+    """Weighted identity-link Poisson (or negative-binomial) NLL and gradient.
 
-    Loss:   Σ_i ω_i · [δ_i − y_i · ln δ_i]
-    Grad:   X.T @ [ω_i · (1 − y_i / δ_i)]
+    Poisson loss:  Σ_i ω_i · [δ_i − y_i · ln δ_i]
+    Poisson grad:  X.T @ [ω_i · (1 − y_i / δ_i)]
+    NB loss:       Σ_i ω_i · [(y_i + θ) · ln(θ + δ_i) − y_i · ln δ_i]
+    NB grad:       X.T @ [ω_i · ((y_i + θ) / (θ + δ_i) − y_i / δ_i)]
 
     Parameters
     ----------
@@ -2235,6 +2318,8 @@ def weighted_poisson_nll_grad(
     y : np.ndarray, shape ``(n_samples,)``
     weights : np.ndarray, shape ``(n_samples,)``
         Per-observation Huber weights in [0, 1].
+    theta : float or None, optional
+        Negative-binomial dispersion.  ``None`` selects the Poisson model.
 
     Returns
     -------
@@ -2246,9 +2331,19 @@ def weighted_poisson_nll_grad(
     d_act = delta[active]
     y_act = y[active]
     w_act = weights[active]
-    loss = float((w_act * (d_act - y_act * np.log(d_act))).sum())
+    if theta is None:
+        loss = float((w_act * (d_act - y_act * np.log(d_act))).sum())
+        r_act = w_act * (1.0 - y_act / d_act)
+    else:
+        loss = float(
+            (
+                w_act
+                * ((y_act + theta) * np.log(theta + d_act) - y_act * np.log(d_act))
+            ).sum()
+        )
+        r_act = w_act * ((y_act + theta) / (theta + d_act) - y_act / d_act)
     r = np.zeros(len(y), dtype=np.float64)
-    r[active] = w_act * (1.0 - y_act / d_act)
+    r[active] = r_act
     grad = np.asarray(X.T @ r).ravel()
     return loss, grad
 
@@ -2261,8 +2356,9 @@ def weighted_poisson_nll_grad_lasso(
     lam: float,
     num_rgrs: int,
     num_runs: int,
+    theta: float | None = None,
 ) -> tuple[float, np.ndarray]:
-    """Weighted Poisson NLL with group-LASSO penalty.
+    """Weighted Poisson (or negative-binomial) NLL with group-LASSO penalty.
 
     Parameters
     ----------
@@ -2273,13 +2369,15 @@ def weighted_poisson_nll_grad_lasso(
     lam : float
     num_rgrs : int
     num_runs : int
+    theta : float or None, optional
+        Negative-binomial dispersion.  ``None`` selects the Poisson model.
 
     Returns
     -------
     loss : float
     grad : np.ndarray, shape ``(num_rgrs * num_runs,)``
     """
-    loss, grad = weighted_poisson_nll_grad(w, X, y, weights)
+    loss, grad = weighted_poisson_nll_grad(w, X, y, weights, theta)
     W = w.reshape(num_rgrs, num_runs)
     norms = np.sqrt((W**2).sum(axis=1))
     safe_norms = np.maximum(norms, 1e-300)
@@ -2294,8 +2392,14 @@ def weighted_poisson_log_likelihood_sparse(
     X: csr_matrix,
     y: np.ndarray,
     weights: np.ndarray,
+    theta: float | None = None,
 ) -> float:
-    """Weighted Poisson log-likelihood for likelihood-ratio tests.
+    """Weighted Poisson (or negative-binomial) log-likelihood for LRTs.
+
+    The full log-likelihood (including the ``y``-dependent normalising
+    constants) is returned so the Wilks statistic is comparable across
+    models.  The constants cancel in the full-vs-reduced difference, but
+    are kept so the absolute value is a genuine log-likelihood.
 
     Parameters
     ----------
@@ -2303,6 +2407,8 @@ def weighted_poisson_log_likelihood_sparse(
     X : csr_matrix
     y : np.ndarray
     weights : np.ndarray, shape ``(n_samples,)``
+    theta : float or None, optional
+        Negative-binomial dispersion.  ``None`` selects the Poisson model.
 
     Returns
     -------
@@ -2312,7 +2418,23 @@ def weighted_poisson_log_likelihood_sparse(
     delta = np.asarray(X @ w).ravel()
     active = ~((delta == 0.0) & (y == 0.0))
     d_act, y_act, w_act = delta[active], y[active], weights[active]
-    return float((w_act * (y_act * np.log(d_act) - d_act - gammaln(y_act + 1))).sum())
+    if theta is None:
+        return float(
+            (w_act * (y_act * np.log(d_act) - d_act - gammaln(y_act + 1))).sum()
+        )
+    return float(
+        (
+            w_act
+            * (
+                gammaln(y_act + theta)
+                - gammaln(theta)
+                - gammaln(y_act + 1)
+                + theta * np.log(theta)
+                + y_act * np.log(d_act)
+                - (y_act + theta) * np.log(theta + d_act)
+            )
+        ).sum()
+    )
 
 
 # ------------------------------------------------------------------ #

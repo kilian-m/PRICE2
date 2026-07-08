@@ -44,8 +44,8 @@ def _torch():
 
 
 def mu_inner_cpu(X, XT, y, weights, w0, lam, num_rgrs, num_runs, pmin,
-                 max_iter=3000, tol=1e-5, fixed_mask=None):
-    """Weighted (+optional group-LASSO) Poisson solve via multiplicative updates.
+                 max_iter=3000, tol=1e-5, fixed_mask=None, theta=None):
+    """Weighted (+optional group-LASSO) count solve via multiplicative updates.
 
     Covers every solve in the pipeline once ``inner_solver="mu"``:
       * group-LASSO deconvolution: lam>0, weights=Huber weights;
@@ -55,22 +55,41 @@ def mu_inner_cpu(X, XT, y, weights, w0, lam, num_rgrs, num_runs, pmin,
         at ~0 exactly as the reduced hypothesis requires.
 
     The group-norm term is skipped entirely when ``lam == 0``.
+
+    ``theta is None`` (default) is the Poisson multiplicative update; a positive
+    ``theta`` selects the negative-binomial model. The numerator ``X^T(ω y/δ)``
+    is identical for both; only the denominator data term differs — Poisson uses
+    the iteration-invariant ``X^T ω``, whereas the negative binomial uses
+    ``X^T(ω (y+θ)/(θ+δ))``, which depends on ``δ`` and is recomputed each step.
+    As ``θ → ∞`` the two updates coincide (``(y+θ)/(θ+δ) → 1``). Both share the
+    fixed point of the true optimum (numerator = denominator at a stationary
+    point), so the update converges to the same solution the L-BFGS-B path finds.
     """
-    Xt_omega = np.asarray(XT @ weights).ravel()
+    poisson = theta is None
     omega_y = weights * y
+    if poisson:
+        # Poisson denominator data term X^T ω is constant across iterations.
+        Xt_omega = np.asarray(XT @ weights).ravel()
     w = w0.astype(np.float64, copy=True)
     if fixed_mask is not None:
         w[fixed_mask] = pmin
     for _ in range(max_iter):
         delta = np.maximum(np.asarray(X @ w).ravel(), 1e-300)
         num = np.asarray(XT @ (omega_y / delta)).ravel()
+        if poisson:
+            data_den = Xt_omega
+        else:
+            # NB denominator data term X^T(ω (y+θ)/(θ+δ)) depends on δ.
+            data_den = np.asarray(
+                XT @ (weights * (y + theta) / (theta + delta))
+            ).ravel()
         if lam > 0.0:
             W = w.reshape(num_rgrs, num_runs)
             norms = np.sqrt((W**2).sum(axis=1))
             pen = lam * (W / np.maximum(norms, 1e-300)[:, None]).ravel()
-            den = np.maximum(Xt_omega + pen, 1e-300)
+            den = np.maximum(data_den + pen, 1e-300)
         else:
-            den = np.maximum(Xt_omega, 1e-300)
+            den = np.maximum(data_den, 1e-300)
         w_new = np.maximum(w * num / den, pmin)
         if fixed_mask is not None:
             w_new[fixed_mask] = pmin
@@ -109,19 +128,27 @@ class GpuMuSolver:
             size=tuple(int(s) for s in A.shape), device="cuda", dtype=self.dtype)
 
     def solve(self, weights, w0, lam, num_rgrs, num_runs, pmin,
-              max_iter=3000, tol=1e-5):
+              max_iter=3000, tol=1e-5, theta=None):
         t = self.t
+        poisson = theta is None
         omega = t.from_numpy(np.ascontiguousarray(weights)).to(self.dtype).cuda()
         w = t.from_numpy(np.ascontiguousarray(w0)).to(self.dtype).cuda()
         omega_y = omega * self.yt
-        Xt_omega = t.mv(self.XcT, omega)
+        if poisson:
+            # Poisson denominator data term X^T ω is constant across iterations.
+            Xt_omega = t.mv(self.XcT, omega)
         for _ in range(max_iter):
             delta = t.mv(self.Xc, w).clamp_min(self.tiny)
             num = t.mv(self.XcT, omega_y / delta)
+            if poisson:
+                data_den = Xt_omega
+            else:
+                # NB denominator data term X^T(ω (y+θ)/(θ+δ)) depends on δ.
+                data_den = t.mv(self.XcT, omega * (self.yt + theta) / (theta + delta))
             W = w.view(num_rgrs, num_runs)
             norms = (W * W).sum(1).sqrt()
             pen = (lam * (W / norms.clamp_min(self.tiny).view(-1, 1))).reshape(-1)
-            den = (Xt_omega + pen).clamp_min(self.tiny)
+            den = (data_den + pen).clamp_min(self.tiny)
             w_new = (w * num / den).clamp_min(pmin)
             rel = (w_new - w).norm() / w.norm().clamp_min(1e-14)
             w = w_new
