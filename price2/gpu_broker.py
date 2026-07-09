@@ -42,6 +42,8 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
+from price2.mu_solver import silence_sparse_beta_warning
+
 
 # ------------------------------------------------------------------ #
 # job completion signalling (abstract AF_UNIX socket, no fd passing)   #
@@ -229,6 +231,9 @@ def _gpu_deconvolve(torch, job, dtype, check_every=25):
 # Broker server process                                               #
 # ------------------------------------------------------------------ #
 def _broker_main(req_q, stop_evt, ready_val, n_streams, dtype_str):
+    # Before any stream-thread builds its first CSR tensor, and in the broker
+    # process only: the parent and the CPU workers keep their own filters.
+    silence_sparse_beta_warning()
     import torch
     dtype = getattr(torch, dtype_str)
     torch.zeros(1, device="cuda")  # create THIS process's context (one per broker)

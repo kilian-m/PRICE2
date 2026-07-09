@@ -23,11 +23,32 @@ PyTorch with CUDA is importable; otherwise the NumPy path runs on the CPU.
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy.sparse import csr_matrix
 
 _TORCH = None
 _TORCH_OK = None
+
+
+def silence_sparse_beta_warning() -> None:
+    """Mute torch's "sparse CSR tensor support is in beta state" notice.
+
+    torch emits it once per process, the first time a CSR tensor is built, which
+    means one line of log per broker process and per GPU worker.  The design
+    matrices are sparse by nature and CSR is the layout torch's own sparse
+    matmul wants, so the notice is not actionable.
+
+    Call this in any process that is about to build sparse tensors, before the
+    first one.  The filter is process-global, so it must not be installed in a
+    process that does not want it.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message="Sparse CSR tensor support is in beta state",
+        category=UserWarning,
+    )
 
 
 def _torch():
@@ -38,6 +59,7 @@ def _torch():
             import torch  # noqa: F401
             _TORCH = torch
             _TORCH_OK = torch.cuda.is_available()
+            silence_sparse_beta_warning()
         except Exception:
             _TORCH, _TORCH_OK = None, False
     return _TORCH if _TORCH_OK else None
