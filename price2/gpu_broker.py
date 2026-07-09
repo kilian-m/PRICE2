@@ -13,11 +13,18 @@ longer scales with the pool size.
 Protocol per job (small metadata over a plain mp.Queue; big arrays via
 multiprocessing.shared_memory, never pickled):
   worker: put X, Xᵀ (CSR arrays), y (and an optional warm-start w0) into shm;
-          pre-allocate a result-w shm and a 1-byte status shm; enqueue the job;
-          spin on the status byte; read w.
+          pre-allocate a result-w shm and a 1-byte status shm; listen on a
+          private abstract AF_UNIX address; enqueue the job; block in accept()
+          until the broker connects; read the status byte and w.
   broker: N worker threads, each with its own torch.cuda.Stream, pull jobs, run
           the IRLS-Huber MU loop on the GPU, write w, set status=1 (or 2 on
-          error).
+          error), then connect to the job's address to wake the worker.
+
+The wake-up is a socket rather than a polled flag so a worker queued behind a
+busy GPU blocks in the kernel instead of waking thousands of times a second.
+The address lives in Linux's abstract namespace, so it needs no filesystem
+entry, no cleanup, and — unlike a semaphore or an fd — it is just a string and
+travels through the ordinary job dict.
 
 Numerics match price2.mu_solver / solvers.py (weighted Richardson-Lucy +
 group-LASSO), so broker results equal the in-worker GPU/CPU MU results.
@@ -25,12 +32,49 @@ group-LASSO), so broker results equal the in-worker GPU/CPU MU results.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 
 import numpy as np
+
+
+# ------------------------------------------------------------------ #
+# job completion signalling (abstract AF_UNIX socket, no fd passing)   #
+# ------------------------------------------------------------------ #
+def _done_listener(timeout):
+    """Bind a private abstract-namespace socket the broker can connect to.
+
+    Returns ``(server_socket, address)``.  Binding and listening happen before
+    the job is enqueued, so a broker that finishes immediately still lands in
+    the backlog rather than racing the worker's ``accept()``.
+    """
+    address = f"\0price2-mu-{os.getpid()}-{uuid.uuid4().hex}"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(address)
+        server.listen(1)
+        server.settimeout(timeout)
+    except BaseException:
+        server.close()
+        raise
+    return server, address
+
+
+def _signal_done(address):
+    """Wake the worker waiting on *address*; ignore a worker that gave up."""
+    if not address:
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5.0)
+            client.connect(address)
+    except OSError:
+        pass  # worker timed out or died; its shm is unlinked either way
 
 
 # ------------------------------------------------------------------ #
@@ -213,6 +257,9 @@ def _broker_main(req_q, stop_evt, ready_val, n_streams, dtype_str):
                 status[0] = 2
             finally:
                 status_shm.close()
+                # Always wake the worker, including on failure — otherwise it
+                # blocks in accept() until its (long) timeout.
+                _signal_done(job.get("done"))
 
     threads = [threading.Thread(target=worker_thread, daemon=True)
                for _ in range(n_streams)]
@@ -300,10 +347,11 @@ class BrokerClient:
         self.req_q = req_q
         self._counter = 0
 
-    def solve(self, X, XT, y, params: Params, w0=None, poll=0.0005, timeout=1200.0):
+    def solve(self, X, XT, y, params: Params, w0=None, timeout=1200.0):
         self._counter += 1
         n = params.num_rgrs * params.num_runs
         shms = []
+        server = None
         try:
             sXd, mXd = _shm_put(X.data.astype(np.float64)); shms.append(sXd)
             sXi, mXi = _shm_put(X.indices.astype(np.int64)); shms.append(sXi)
@@ -320,6 +368,10 @@ class BrokerClient:
             ss = _shm_create(1); shms.append(ss)
             status = np.ndarray((1,), dtype=np.uint8, buffer=ss.buf); status[0] = 0
 
+            # Listen before enqueuing, so the broker cannot signal into a
+            # socket that does not exist yet.
+            server, done_address = _done_listener(timeout)
+
             job = {
                 "req_id": self._counter,
                 "X_data": mXd, "X_indices": mXi, "X_indptr": mXp,
@@ -328,18 +380,25 @@ class BrokerClient:
                 "w0": mw0,
                 "result": (sr.name, (n,), "float64"),
                 "status": (ss.name, (1,), "uint8"),
+                "done": done_address,
                 "params": params,
             }
             self.req_q.put(job)
-            t0 = time.time()
-            while status[0] == 0:
-                if time.time() - t0 > timeout:
-                    raise TimeoutError("broker job timed out")
-                time.sleep(poll)
+
+            try:
+                conn, _ = server.accept()  # blocks in the kernel, no wake-ups
+                conn.close()
+            except (socket.timeout, TimeoutError):
+                raise TimeoutError("broker job timed out") from None
+
             if status[0] == 2:
                 raise RuntimeError("broker reported job failure")
+            if status[0] == 0:
+                raise RuntimeError("broker signalled without writing a status")
             return wr.copy()
         finally:
+            if server is not None:
+                server.close()
             for s in shms:
                 try:
                     s.close(); s.unlink()

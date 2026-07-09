@@ -146,6 +146,75 @@ def get_orf_type(
     return "other ORF"
 
 
+class EgRoutingCache:
+    """Weight-independent per-locus state reused across EM iterations.
+
+    Between multimapping-EM iterations only the fractional read weights
+    change: the RGR set, the equivalence groups and hence the design matrix
+    ``X`` are fixed (the light M-step runs with ``prune=False``).  This
+    caches everything a light M-step would otherwise re-derive from the
+    reads — the read → design-matrix-row routing and the geometry of ``X`` —
+    so an iteration reduces to a weighted ``bincount`` plus a vectorised
+    rebuild of ``X.data``.
+
+    Invalidated (set to ``None`` on the locus) whenever the RGR set changes,
+    since that re-indexes RGRs and collapses equivalence groups.
+
+    It holds only arrays, ints and strings — no RGR, transcript or
+    equivalence-group objects — so it can be pickled on its own.  A light
+    M-step therefore loads just this blob (a few numpy ``memcpy``s) instead
+    of unpickling the locus's whole object graph, which is ~96% of the cost
+    of restoring a prepared locus.
+
+    Attributes
+    ----------
+    n_rows : int
+        Number of design-matrix rows (non-empty equivalence groups).
+    n_reads : dict[str, int]
+        Reads per run at build time; guards against a changed read order.
+    eg_row : dict[str, numpy.ndarray]
+        Per run, the row each read feeds: ``>=0`` a row index, ``-1`` the
+        read's key is absent from ``egs`` (uncounted), ``-2`` the read is
+        compatible with no RGR.
+    counts0 : dict[str, numpy.ndarray]
+        Per run, each read's raw (unweighted) count.
+    mm_idx, mm_gk, mm_base : dict[str, numpy.ndarray]
+        Per run, the read positions that carry a multimapping slot, their
+        group keys, and their baseline cross-locus mass.
+    slot_gk, slot_rl, slot_oua, slot_nnz : dict[str, numpy.ndarray]
+        Per run, one entry per multimapping slot: group key, read length,
+        untemplated-addition flag, and number of compatible RGR cells.
+    slot_rgr, slot_code : dict[str, numpy.ndarray]
+        Per run, the flattened slot cells: RGR index and packed
+        ``frame * 3 + coverage_position``.  Replaces the object-valued
+        ``mm_slots`` routing that :meth:`compute_multimap_lambdas` used.
+    cell_rgr, cell_code : numpy.ndarray
+        One entry per design-matrix cell: the RGR index, and
+        ``frame * 3 + coverage_position`` packed into a byte.
+    row_nnz, row_len, row_rl, row_oua, row_run : numpy.ndarray
+        Per row: cell count, EG length, read length, untemplated-addition
+        flag, and run index.
+    num_rgrs : int
+        RGR count at build time (design-matrix column blocks).
+    rgr_ids : tuple[str, ...]
+        RGR identifiers, indexed by ``rgr.index``.
+    rgr_lengths : numpy.ndarray
+        RGR lengths, indexed by ``rgr.index``.
+    """
+
+    __slots__ = (
+        "n_rows", "n_reads", "eg_row", "counts0", "mm_idx", "mm_gk",
+        "mm_base", "slot_gk", "slot_rl", "slot_oua", "slot_nnz",
+        "slot_rgr", "slot_code", "cell_rgr", "cell_code", "row_nnz",
+        "row_len", "row_rl", "row_oua", "row_run", "num_rgrs",
+        "rgr_ids", "rgr_lengths",
+    )
+
+    def __init__(self, **fields: object) -> None:
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
 class Locus:
     """A genomic locus containing overlapping transcripts and ORF candidates.
 
@@ -214,6 +283,8 @@ class Locus:
         self.iv = iv
         self.read_counts: dict[RiboSeqRun, int] = {}
         self.uncounted_reads = 0
+        self.eg_cache: EgRoutingCache | None = None
+        self._eg_y: np.ndarray | None = None
         self.id = f"loc_{loci_number}"
 
         self.transcript_intervals = HTSeq.GenomicArrayOfSets(
@@ -1185,6 +1256,7 @@ class Locus:
         self,
         runs: list[RiboSeqRun],
         mm_data: dict | None = None,
+        build_cache: bool = False,
     ) -> None:
         """Assign reads to their equivalence groups.
 
@@ -1211,7 +1283,37 @@ class Locus:
             ``{run_id: {group_key: (base, weight)}}`` for this locus's
             multimapping slots, or ``None`` for classic full-weight
             counting.
+        build_cache : bool, optional
+            Record the weight-independent read routing and design-matrix
+            geometry in :attr:`eg_cache` while assigning.  Later EM
+            iterations then take :meth:`_assign_reads_from_cache`, which
+            skips the per-read :meth:`get_rgr_frame_covpos` recomputation.
         """
+        cache = getattr(self, "eg_cache", None)
+        if cache is not None and not build_cache:
+            self._assign_reads_from_cache(runs, mm_data, cache)
+            return
+
+        # Row layout of the design matrix, in the order ``egs_to_sparse``
+        # emits rows.  Built up-front so each read can record the row it
+        # feeds instead of re-deriving its equivalence-group key later.
+        if build_cache:
+            row_of_key: dict = {}
+            n_rows = 0
+            for run in runs:
+                d: dict = {}
+                for key in self.egs[run]:
+                    if not key[0]:
+                        continue
+                    d[key] = n_rows
+                    n_rows += 1
+                row_of_key[run.id] = d
+            eg_row: dict = {}
+            counts0: dict = {}
+            mm_idx: dict = {}
+            mm_gk: dict = {}
+            mm_base: dict = {}
+
         # {run_id: {group_key: (rgr_frame_covpos, read_length, oua)}} —
         # the compatibility routing the E-step needs to recompute λ.
         self.mm_slots = {run.id: {} for run in runs}
@@ -1219,9 +1321,30 @@ class Locus:
             run_id = run.id
             run_mm = mm_data.get(run_id) if mm_data else None
 
-            for rsa in self.rsas_dict[run_id]:
+            if build_cache:
+                n_reads = len(self.rsas_dict[run_id])
+                rows_arr = np.full(n_reads, -2, dtype=np.int32)
+                counts_arr = np.zeros(n_reads, dtype=np.float64)
+                run_rows = row_of_key[run_id]
+                mi: list = []
+                mg: list = []
+                mb: list = []
+
+            for i, rsa in enumerate(self.rsas_dict[run_id]):
                 rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
                 read_count = rsa.read_count
+
+                if build_cache:
+                    counts_arr[i] = rsa.read_count
+                    if rgr_frame_covpos:
+                        rows_arr[i] = run_rows.get(
+                            (
+                                rgr_frame_covpos,
+                                len(rsa),
+                                rsa.untemplated_addition,
+                            ),
+                            -1,
+                        )
 
                 if run_mm is not None and not rsa.unique():
                     gk = multimap.alignment_group_key(rsa)
@@ -1234,6 +1357,10 @@ class Locus:
                         # uncapped sum); clamp the non-cross-locus remainder
                         # at zero so the Poisson response never goes negative.
                         read_count = max(0.0, read_count - base) + weight
+                        if build_cache:
+                            mi.append(i)
+                            mg.append(gk)
+                            mb.append(base)
                         if rgr_frame_covpos:
                             self.mm_slots[run_id][gk] = (
                                 rgr_frame_covpos,
@@ -1257,11 +1384,221 @@ class Locus:
                 except KeyError:
                     self.read_counts[run] = read_count
 
+            if build_cache:
+                eg_row[run_id] = rows_arr
+                counts0[run_id] = counts_arr
+                mm_idx[run_id] = np.array(mi, dtype=np.int32)
+                mm_gk[run_id] = np.array(mg, dtype=np.int64)
+                mm_base[run_id] = np.array(mb, dtype=np.float64)
+
         self.counted_reads = {}
         for run in runs:
             self.counted_reads[run.id] = 0
             for v in self.egs[run].values():
                 self.counted_reads[run.id] += v.read_count
+
+        if build_cache:
+            self.eg_cache = self._make_eg_cache(
+                runs, n_rows, eg_row, counts0, mm_idx, mm_gk, mm_base
+            )
+
+    def _make_eg_cache(
+        self,
+        runs: list[RiboSeqRun],
+        n_rows: int,
+        eg_row: dict,
+        counts0: dict,
+        mm_idx: dict,
+        mm_gk: dict,
+        mm_base: dict,
+    ) -> EgRoutingCache:
+        """Freeze the design-matrix geometry into a compact cell encoding.
+
+        Storing ``X`` itself would add ~1.1 MB per locus; instead the cells
+        are stored as ``(rgr index, frame*3 + coverage position)`` pairs plus
+        per-row ``(length, read length, oua, run)``, from which ``X.data``
+        is recomputed with a handful of vectorised look-ups.
+
+        The multimapping-slot routing is encoded the same way, so that the
+        cache holds no references to RGR objects and can be loaded without
+        the rest of the locus.
+        """
+        cell_rgr: list = []
+        cell_code: list = []
+        row_nnz: list = []
+        row_len: list = []
+        row_rl: list = []
+        row_oua: list = []
+        row_run: list = []
+        for run_index, run in enumerate(runs):
+            for (rgr_frame_covpos, read_length, oua), eg in self.egs[run].items():
+                if not rgr_frame_covpos:
+                    continue
+                row_nnz.append(len(rgr_frame_covpos))
+                row_len.append(eg.length)
+                row_rl.append(read_length)
+                row_oua.append(int(oua))
+                row_run.append(run_index)
+                for rgr, frame, cov_pos in rgr_frame_covpos:
+                    cell_rgr.append(rgr.index)
+                    cell_code.append(
+                        (3 if frame is None else frame) * 3 + cov_pos.value
+                    )
+
+        slot_gk: dict = {}
+        slot_rl: dict = {}
+        slot_oua: dict = {}
+        slot_nnz: dict = {}
+        slot_rgr: dict = {}
+        slot_code: dict = {}
+        for run in runs:
+            gks, rls, ouas, nnzs, srgr, scode = [], [], [], [], [], []
+            for gk, (rfc, read_length, oua) in self.mm_slots[run.id].items():
+                gks.append(gk)
+                rls.append(read_length)
+                ouas.append(int(oua))
+                nnzs.append(len(rfc))
+                for rgr, frame, cov_pos in rfc:
+                    srgr.append(rgr.index)
+                    scode.append((3 if frame is None else frame) * 3 + cov_pos.value)
+            slot_gk[run.id] = np.array(gks, dtype=np.int64)
+            slot_rl[run.id] = np.array(rls, dtype=np.int32)
+            slot_oua[run.id] = np.array(ouas, dtype=np.uint8)
+            slot_nnz[run.id] = np.array(nnzs, dtype=np.int32)
+            slot_rgr[run.id] = np.array(srgr, dtype=np.int32)
+            slot_code[run.id] = np.array(scode, dtype=np.uint8)
+
+        num_rgrs = len(self.rgr_set)
+        rgr_ids: list = [None] * num_rgrs
+        rgr_lengths = np.empty(num_rgrs, dtype=np.int64)
+        for rgr in self.rgr_set:
+            rgr_ids[rgr.index] = rgr.id
+            rgr_lengths[rgr.index] = len(rgr)
+
+        return EgRoutingCache(
+            n_rows=n_rows,
+            n_reads={r.id: len(self.rsas_dict[r.id]) for r in runs},
+            eg_row=eg_row,
+            counts0=counts0,
+            mm_idx=mm_idx,
+            mm_gk=mm_gk,
+            mm_base=mm_base,
+            slot_gk=slot_gk,
+            slot_rl=slot_rl,
+            slot_oua=slot_oua,
+            slot_nnz=slot_nnz,
+            slot_rgr=slot_rgr,
+            slot_code=slot_code,
+            num_rgrs=num_rgrs,
+            rgr_ids=tuple(rgr_ids),
+            rgr_lengths=rgr_lengths,
+            cell_rgr=np.array(cell_rgr, dtype=np.int32),
+            cell_code=np.array(cell_code, dtype=np.uint8),
+            row_nnz=np.array(row_nnz, dtype=np.int32),
+            row_len=np.array(row_len, dtype=np.int64),
+            row_rl=np.array(row_rl, dtype=np.int32),
+            row_oua=np.array(row_oua, dtype=np.uint8),
+            row_run=np.array(row_run, dtype=np.uint8),
+        )
+
+    def _assign_reads_from_cache(
+        self,
+        runs: list[RiboSeqRun],
+        mm_data: dict | None,
+        cache: EgRoutingCache,
+    ) -> None:
+        """Re-derive the response ``y`` from cached routing (no per-read work).
+
+        Only the fractional weights change between EM iterations, so the
+        per-read equivalence-group routing recorded in *cache* stays valid and
+        the response reduces to a weighted ``bincount`` over rows.
+        """
+        y = np.zeros(cache.n_rows, dtype=np.float64)
+        self.read_counts = {}
+        self.counted_reads = {}
+        self.uncounted_reads = 0.0
+
+        for run in runs:
+            run_id = run.id
+            if len(self.rsas_dict[run_id]) != cache.n_reads[run_id]:
+                raise RuntimeError(
+                    f"locus {self.id}: cached routing has "
+                    f"{cache.n_reads[run_id]} reads for run {run_id} but "
+                    f"{len(self.rsas_dict[run_id])} were loaded"
+                )
+            counts = cache.counts0[run_id].copy()
+            run_mm = mm_data.get(run_id) if mm_data else None
+            idx = cache.mm_idx[run_id]
+            if run_mm is not None and idx.size:
+                weights = np.fromiter(
+                    (run_mm[gk][1] for gk in cache.mm_gk[run_id]),
+                    dtype=np.float64,
+                    count=idx.size,
+                )
+                counts[idx] = (
+                    np.maximum(0.0, counts[idx] - cache.mm_base[run_id]) + weights
+                )
+
+            rows = cache.eg_row[run_id]
+            counted = rows >= 0
+            y += np.bincount(
+                rows[counted], weights=counts[counted], minlength=cache.n_rows
+            )
+            counted_sum = float(counts[counted].sum())
+            uncounted = rows == -1
+            self.uncounted_reads += float(counts[uncounted].sum())
+            self.counted_reads[run_id] = counted_sum
+            run.read_count += counted_sum
+            # ``read_counts`` gains an entry only when the run has at least one
+            # read compatible with some RGR, matching the uncached path.
+            compatible = counted | uncounted
+            if compatible.any():
+                self.read_counts[run] = float(counts[compatible].sum())
+
+        # Downstream consumers (the final pass's pruning, the likelihood-ratio
+        # test, ``estimate_activities``) read counts off the EG objects.  A
+        # light M-step loads only the cache, so there are no EG objects and
+        # nothing downstream that reads them.
+        if getattr(self, "egs", None):
+            i = 0
+            for run in runs:
+                for key, eg in self.egs[run].items():
+                    if not key[0]:
+                        continue
+                    eg.read_count = y[i]
+                    i += 1
+        self._eg_y = y
+
+    def _design_matrix_from_cache(
+        self,
+        cache: EgRoutingCache,
+        cm_lut: np.ndarray,
+        coverage_params: np.ndarray,
+        num_runs: int,
+    ) -> csr_matrix:
+        """Rebuild ``X`` from the cached cell encoding, fully vectorised."""
+        nnz_per_row = cache.row_nnz
+        run_c = np.repeat(cache.row_run, nnz_per_row)
+        rl_c = np.repeat(cache.row_rl, nnz_per_row)
+        oua_c = np.repeat(cache.row_oua, nnz_per_row)
+        len_c = np.repeat(cache.row_len, nnz_per_row)
+        code = cache.cell_code.astype(np.int64)
+        frame_c, cov_c = code // 3, code % 3
+
+        data = (
+            len_c
+            * cm_lut[run_c, rl_c, frame_c, oua_c]
+            * coverage_params[run_c, cov_c]
+        )
+        rows_idx = np.repeat(np.arange(cache.n_rows, dtype=np.int64), nnz_per_row)
+        cols_idx = cache.cell_rgr.astype(np.int64) * num_runs + run_c
+        # COO construction (as in ``egs_to_sparse``) so that a row touching the
+        # same RGR at several coverage positions sums those cells.
+        return csr_matrix(
+            (data, (rows_idx, cols_idx)),
+            shape=(cache.n_rows, cache.num_rgrs * num_runs),
+            dtype=np.float64,
+        )
 
     def to_sparse_args(
         self,
@@ -1297,8 +1634,19 @@ class Locus:
             coverage_params[i, 1] = 1
             coverage_params[i, 2] = run.coverage_model.stop_factor
 
-        num_rgrs = len(self.rgr_set)
-        rgr_lengths = np.array([len(rgr) for rgr in self.rgr_set])
+        # Must be aligned with ``rgr.index`` (the design-matrix column blocks
+        # and the rows of ``result``), not with ``rgr_set`` iteration order:
+        # the two are different permutations, and ``deconvolve`` multiplies
+        # ``rgr_lengths`` against the index-aligned activity matrix.
+        cache = getattr(self, "eg_cache", None)
+        if cache is not None:
+            num_rgrs = cache.num_rgrs
+            rgr_lengths = cache.rgr_lengths
+        else:
+            num_rgrs = len(self.rgr_set)
+            rgr_lengths = np.empty(num_rgrs, dtype=np.int64)
+            for rgr in self.rgr_set:
+                rgr_lengths[rgr.index] = len(rgr)
 
         if hasattr(self, "result"):
             initial_guess = self.result
@@ -1306,9 +1654,19 @@ class Locus:
             initial_guess = np.ones((num_rgrs, num_runs))
         initial_guess = initial_guess.flatten()
 
-        X, y = egs_to_sparse(
-            self.egs, runs, cm_lut, coverage_params, num_rgrs, num_runs
-        )
+        # ``X`` depends only on the equivalence-group geometry and the
+        # cleavage/coverage models, all fixed across EM iterations, so a
+        # cached locus rebuilds it vectorised instead of walking every cell
+        # in Python.  ``y`` came out of the cached read routing.
+        y = getattr(self, "_eg_y", None)
+        if cache is not None and y is not None:
+            X = self._design_matrix_from_cache(
+                cache, cm_lut, coverage_params, num_runs
+            )
+        else:
+            X, y = egs_to_sparse(
+                self.egs, runs, cm_lut, coverage_params, num_rgrs, num_runs
+            )
 
         return {
             "X": X,
@@ -1564,6 +1922,12 @@ class Locus:
         dict
             ``{rgr_id: numpy.ndarray of shape (num_runs,)}``.
         """
+        cache = getattr(self, "eg_cache", None)
+        if cache is not None:
+            return {
+                rgr_id: self.result[index].copy()
+                for index, rgr_id in enumerate(cache.rgr_ids)
+            }
         return {rgr.id: self.result[rgr.index].copy() for rgr in self.rgr_set}
 
     def set_warm_start(self, activities: dict, num_runs: int) -> None:
@@ -1580,11 +1944,19 @@ class Locus:
         num_runs : int
             Number of Ribo-seq runs (columns of the activity matrix).
         """
-        result = np.ones((len(self.rgr_set), num_runs))
-        for rgr in self.rgr_set:
-            a = activities.get(rgr.id)
-            if a is not None:
-                result[rgr.index] = a
+        cache = getattr(self, "eg_cache", None)
+        if cache is not None:
+            result = np.ones((cache.num_rgrs, num_runs))
+            for index, rgr_id in enumerate(cache.rgr_ids):
+                a = activities.get(rgr_id)
+                if a is not None:
+                    result[index] = a
+        else:
+            result = np.ones((len(self.rgr_set), num_runs))
+            for rgr in self.rgr_set:
+                a = activities.get(rgr.id)
+                if a is not None:
+                    result[rgr.index] = a
         self.result = result
 
     def compute_multimap_lambdas(self, runs: list[RiboSeqRun]) -> list:
@@ -1607,7 +1979,8 @@ class Locus:
         list of (run_id, group_key, lam)
             One entry per multimapping slot recorded at this locus.
         """
-        if not any(self.mm_slots.get(run.id) for run in runs):
+        cache = getattr(self, "eg_cache", None)
+        if cache is None and not any(self.mm_slots.get(run.id) for run in runs):
             return []
 
         num_runs = len(runs)
@@ -1624,6 +1997,11 @@ class Locus:
             coverage_params[i, 1] = 1
             coverage_params[i, 2] = run.coverage_model.stop_factor
 
+        if cache is not None:
+            return self._multimap_lambdas_from_cache(
+                runs, cache, cm_lut, coverage_params
+            )
+
         out = []
         for run_index, run in enumerate(runs):
             for gk, (rfc, read_length, oua) in self.mm_slots[run.id].items():
@@ -1637,6 +2015,37 @@ class Locus:
                         * self.result[rgr.index, run_index]
                     )
                 out.append((run.id, gk, float(lam)))
+        return out
+
+    def _multimap_lambdas_from_cache(
+        self,
+        runs: list[RiboSeqRun],
+        cache: EgRoutingCache,
+        cm_lut: np.ndarray,
+        coverage_params: np.ndarray,
+    ) -> list:
+        """Vectorised :meth:`compute_multimap_lambdas` over the cached slots."""
+        out: list = []
+        for run_index, run in enumerate(runs):
+            gks = cache.slot_gk[run.id]
+            if gks.size == 0:
+                continue
+            nnz = cache.slot_nnz[run.id]
+            read_length = np.repeat(cache.slot_rl[run.id], nnz)
+            oua = np.repeat(cache.slot_oua[run.id], nnz)
+            code = cache.slot_code[run.id].astype(np.int64)
+            contribution = (
+                cm_lut[run_index, read_length, code // 3, oua]
+                * coverage_params[run_index, code % 3]
+                * self.result[cache.slot_rgr[run.id], run_index]
+            )
+            slot_of_cell = np.repeat(np.arange(gks.size), nnz)
+            lam = np.bincount(
+                slot_of_cell, weights=contribution, minlength=gks.size
+            )
+            out.extend(
+                (run.id, int(gk), float(value)) for gk, value in zip(gks, lam)
+            )
         return out
 
     def remove_rgrs(
@@ -1660,6 +2069,17 @@ class Locus:
         old_rgr_set = self.rgr_set
         self.rgr_set = self.rgr_set - rgrs_to_remove
 
+        # The cached routing keys off rgr.index and the equivalence-group
+        # layout, both of which this method invalidates.
+        self.eg_cache = None
+        self._eg_y = None
+
+        # Rows of ``result`` are keyed by the *old* rgr.index, which the
+        # re-indexing below overwrites.  ``rgr_set`` iteration order is not
+        # the index order (it changes across a pickle round-trip), so the old
+        # indices have to be captured rather than re-derived by enumeration.
+        old_indices = {rgr: rgr.index for rgr in old_rgr_set}
+
         # rgr indices
         for c, rgr in enumerate(self.rgr_set):
             rgr.index = c
@@ -1675,9 +2095,8 @@ class Locus:
         # results
         if hasattr(self, "result"):
             index_array = np.zeros(len(self.rgr_set), dtype=int)
-            for c, rgr in enumerate(old_rgr_set):
-                if rgr in self.rgr_set:
-                    index_array[rgr.index] = c
+            for rgr in self.rgr_set:
+                index_array[rgr.index] = old_indices[rgr]
             self.result = self.result[index_array]
 
     def collapse_egs(

@@ -574,7 +574,7 @@ class CleavageModel:
             return (likelihoods + likelihoods_ua).argmax() * 3 + f0
 
 
-@njit
+@njit(cache=True)
 def read_in_cds_likelihood(
     pl: np.ndarray,
     pr: np.ndarray,
@@ -654,7 +654,7 @@ def read_in_cds_likelihood(
     return likelihood * 3
 
 
-@njit
+@njit(cache=True)
 def read_in_noise_likelihood(
     pl: np.ndarray,
     pr: np.ndarray,
@@ -1052,7 +1052,7 @@ class CleavageEstimator:
         self.best_pr = pr / pr.sum()
 
 
-@njit
+@njit(cache=True)
 def compute_ll(
     table: np.ndarray,
     obs_min_len: int,
@@ -1111,7 +1111,7 @@ def compute_ll(
     return ll
 
 
-@njit
+@njit(cache=True)
 def repeat(
     repeats: int,
     obs_max_len: int,

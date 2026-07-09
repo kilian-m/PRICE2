@@ -44,6 +44,9 @@ class Config:
         ``None`` all BAM files found in ``bam_dir`` are used.
     processes : int
         Number of parallel worker processes.
+    worker_max_tasks : int
+        Number of loci a worker process handles before being replaced
+        (``0`` means never replaced).
     timeout : int
         Per-locus timeout in seconds.
     memory_limit_gb : int
@@ -159,6 +162,14 @@ class Config:
     timeout: int = 60 * 30
     memory_limit_gb: int = 5
     pseudo_min: float = 1e-14
+    #: Loci a worker handles before it is replaced (``0`` = never replaced).
+    #: A fresh process costs ~2 CPU-seconds before it does any useful work:
+    #: numba cache load, imports, and a cold interpreter/allocator on its first
+    #: locus.  At ``1`` that was charged to every one of the ~39K loci in every
+    #: EM iteration.  Reuse amortises it (measured ``0.70 + 1.97/worker_max_tasks``
+    #: CPU-seconds per locus) while still recycling processes often enough to
+    #: bound RSS growth from the occasional very large locus.
+    worker_max_tasks: int = 50
 
     # ------------------------------------------------------------------ #
     # Transcript pre-filtering                                             #
@@ -325,6 +336,15 @@ class Config:
     #: One keeps Huber and EM in a single shared loop (as intended); the
     #: robust weights refine together with the fractional assignments.
     em_huber_steps: int = 1
+    #: Cache the weight-independent read → design-matrix-row routing and the
+    #: geometry of ``X`` beside each prepared locus.  Only the fractional
+    #: weights change between light M-steps, so an iteration then reduces to a
+    #: weighted ``bincount`` plus a vectorised ``X.data`` rebuild, instead of
+    #: re-deriving ``get_rgr_frame_covpos`` for every read and walking every
+    #: design-matrix cell in Python.  The cache holds no locus objects, so an
+    #: intermediate pass loads it alone rather than unpickling the locus.
+    #: Costs ~65% more space per prepared locus (~95 KB on top of ~148 KB).
+    eg_cache: bool = True
     #: Background rate for a multimapping read's alignments that fall
     #: outside any annotated locus.  ``0.0`` (default) means "loci-only":
     #: weight is normalised across the annotated loci a read hits and

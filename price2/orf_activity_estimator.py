@@ -44,9 +44,8 @@ _pebble_consts.channel_lock_timeout = 600
 
 logger = logging.getLogger(__name__)
 
-# Worker-local pyfaidx handle cache.  ``max_tasks=1`` means each worker
-# handles one locus, so this typically opens once per worker; the cache
-# keeps the code defensive if that ever changes.
+# Worker-local pyfaidx handle cache, shared by every locus a worker handles
+# (see ``Config.worker_max_tasks``).
 _genome_cache: dict[str, Fasta] = {}
 
 
@@ -219,7 +218,10 @@ class ORFActivityEstimator:
         )
         listener.start()
         try:
-            with ProcessPool(max_workers=self.config.processes, max_tasks=1) as pool:
+            with ProcessPool(
+                max_workers=self.config.processes,
+                max_tasks=self.config.worker_max_tasks,
+            ) as pool:
                 futures = {
                     pool.schedule(
                         process_loc,
@@ -331,13 +333,24 @@ def process_loc(arguments: tuple):
     runs = [loads(blob) for id, blob in cur.fetchall()]
     db.close()
 
-    # In EM mode, reuse the weight-independent prepared state (RGRs,
-    # filters, equivalence-group geometry) cached by the first light pass;
-    # only the fractional response y changes between iterations, so later
-    # iterations and the final pass skip ORF generation, both filter passes
-    # and the EG build.  ``None`` on a miss: classic mode, the first light
-    # iteration, or a non-multimapping locus in the final pass.
-    loc = multimap.load_prepared_locus(db_path, loc_id) if em_mode else None
+    # In EM mode, reuse the weight-independent prepared state (RGRs, filters,
+    # equivalence-group geometry) cached by the first light pass; only the
+    # fractional response y changes between iterations, so later iterations and
+    # the final pass skip ORF generation, both filter passes and the EG build.
+    # An intermediate light pass touches none of the locus's object graph, so
+    # where a routing cache exists it loads that alone (arrays only) rather
+    # than unpickling transcripts, RGRs and equivalence groups.  ``None`` on a
+    # miss: classic mode, the first light iteration, or a non-multimapping
+    # locus in the final pass.
+    needs_prepared_save = False
+    use_eg_cache = getattr(config, "eg_cache", False)
+    loc = None
+    if em_light and em_iteration > 0 and use_eg_cache:
+        loc = multimap.load_light_locus(db_path, loc_id)
+    if loc is None and em_mode:
+        loc = multimap.load_prepared_locus(
+            db_path, loc_id, with_cache=use_eg_cache
+        )
 
     if loc is not None:
         performance_measurements["chrom"] = loc.iv.chrom
@@ -350,20 +363,23 @@ def process_loc(arguments: tuple):
         loc.get_reads_from_db(db_path)
         performance_measurements["load_reads_time"] = time.time() - t1
         # Keep perf columns aligned with the full-prepare path (the skipped
-        # stages report zero time).
+        # stages report zero time).  A light locus carries no rgr_set/egs, so
+        # the counts come off its routing cache.
+        if hasattr(loc, "rgr_set"):
+            n_rgrs = len(loc.rgr_set)
+            n_egs = sum(len(egs) for egs in loc.egs.values())
+        else:
+            n_rgrs = loc.eg_cache.num_rgrs
+            n_egs = loc.eg_cache.n_rows
         performance_measurements["build_rgrs_time"] = 0.0
-        performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
+        performance_measurements["unfiltered_rgr_count"] = n_rgrs
         performance_measurements["assign_reads_time"] = 0.0
-        performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
+        performance_measurements["filtered_coverage_rgr_count"] = n_rgrs
         performance_measurements["coverage_filter_time"] = 0.0
-        performance_measurements["filtered_deconvolution_rgr_count"] = len(
-            loc.rgr_set
-        )
+        performance_measurements["filtered_deconvolution_rgr_count"] = n_rgrs
         performance_measurements["filter_2_time"] = 0.0
         performance_measurements["eg_time"] = 0.0
-        performance_measurements["eg_count"] = sum(
-            len(egs) for egs in loc.egs.values()
-        )
+        performance_measurements["eg_count"] = n_egs
     else:
         # --- Load locus skeleton from database ---
         db = sql.connect(db_path, timeout=120)
@@ -492,9 +508,9 @@ def process_loc(arguments: tuple):
             len(egs) for egs in loc.egs.values()
         )
 
-        # --- Cache prepared state for subsequent EM iterations ---
-        if em_light and em_iteration == 0:
-            multimap.save_prepared_locus(db_path, loc_id, loc)
+        # The prepared state is persisted after ``assign_reads_to_egs`` below,
+        # so that the routing cache it builds is stored with it.
+        needs_prepared_save = em_light and em_iteration == 0
 
     # --- Multimapping EM: warm start + fractional read weights ---
     # The RGR set is final here (all pre-deconvolution filters have run),
@@ -512,12 +528,20 @@ def process_loc(arguments: tuple):
 
     # --- Assign reads to equivalence groups ---
     t1 = time.time()
-    loc.assign_reads_to_egs(runs, mm_data)
+    loc.assign_reads_to_egs(
+        runs, mm_data, build_cache=needs_prepared_save and use_eg_cache
+    )
     t2 = time.time()
     performance_measurements["proc_reads_2_time"] = t2 - t1
     performance_measurements["read_count"] = sum(
         rc for _, rc in loc.counted_reads.items()
     )
+
+    # --- Cache prepared state for subsequent EM iterations ---
+    if needs_prepared_save:
+        multimap.save_prepared_locus(db_path, loc_id, loc)
+        if use_eg_cache:
+            multimap.save_locus_cache(db_path, loc_id, loc)
 
     # --- EM light M-step: one Huber reweight, emit λ + activities, stop ---
     if em_light:
@@ -531,6 +555,7 @@ def process_loc(arguments: tuple):
             em_iteration,
             loc.activities_by_id(),
             lambdas,
+            mm_data,
         )
         return None if config.save_memory else (loc, performance_measurements)
 
