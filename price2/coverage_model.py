@@ -65,6 +65,87 @@ _START_WINDOW: tuple[int, int] = (-30, 330)
 # the stop-codon histogram.
 _STOP_WINDOW: tuple[int, int] = (-330, 30)
 
+# ---------------------------------------------------------------------------
+# P-site lookup table
+# ---------------------------------------------------------------------------
+
+#: Sentinel stored in the P-site table for reads that carry no dominant codon.
+_REJECT: int = -1
+
+
+def _p_site_table(cm: CleavageModel) -> list[Optional[int]]:
+    """Return the memo table for *cm*, creating it on first use.
+
+    The table is indexed by ``(length * 3 + frame) * 2 + oua`` and holds the
+    winning codon index, :data:`_REJECT`, or ``None`` when the entry has not
+    been computed yet.  Its length bounds the read length at
+    ``len(pl) + len(pr) + 4``, the longest read the cleavage model can produce
+    (see :class:`~price2.cleavage_model.CleavageModel`); longer reads have zero
+    likelihood under the model.
+    """
+    try:
+        return cm._p_site_table_cache
+    except AttributeError:
+        max_len = len(cm.pl) + len(cm.pr) + 4
+        table: list[Optional[int]] = [None] * (max_len * 6)
+        cm._p_site_table_cache = table
+        return table
+
+
+def _compute_p_site_codon(
+    cm: CleavageModel, length: int, frame: int, oua: bool
+) -> int:
+    """Return the index of the codon carrying the P-site, or :data:`_REJECT`.
+
+    The per-codon likelihood vector of a read depends only on its matching
+    length, its reading frame and whether it carries an untemplated addition —
+    never on *where* the read sits.  Both acceptance criteria
+    (:data:`_MIN_CODON_LIKELIHOOD`, :data:`_MIN_DOMINANT_FRACTION`) and the
+    winning codon are therefore functions of that triple alone.
+
+    Relative to the *read start* the CDS codon boundaries sit at ``f0``,
+    ``f0 + 3``, ... with ``f0 = (-frame) % 3``, which is the offset convention
+    :func:`read_in_cds_likelihood` uses internally.  Only codons that fit
+    entirely inside the read can carry the P-site.
+    """
+    f0 = (-frame) % 3
+    n_codons = (length - f0) // 3
+    if n_codons <= 0:
+        return _REJECT
+
+    likelihoods = np.array(
+        [
+            read_in_cds_likelihood(
+                cm.pl, cm.pr, cm.pu, length, frame, oua, f0 + 3 * i, f0 + 3 * i + 3
+            )
+            for i in range(n_codons)
+        ]
+    )
+
+    if likelihoods.max() < _MIN_CODON_LIKELIHOOD:
+        return _REJECT
+
+    likelihoods /= likelihoods.sum()
+
+    if likelihoods.max() < _MIN_DOMINANT_FRACTION:
+        return _REJECT
+
+    return int(np.argmax(likelihoods))
+
+
+def _p_site_codon(cm: CleavageModel, length: int, frame: int, oua: int) -> int:
+    """Memoised :func:`_compute_p_site_codon`."""
+    table = _p_site_table(cm)
+    key = (length * 3 + frame) * 2 + oua
+    if key >= len(table):
+        # Longer than any read the cleavage model can generate.
+        return _REJECT
+    winner = table[key]
+    if winner is None:
+        winner = _compute_p_site_codon(cm, length, frame, bool(oua))
+        table[key] = winner
+    return winner
+
 
 # ---------------------------------------------------------------------------
 # Module-level helper
@@ -104,67 +185,116 @@ def _try_assign_p_site(
         return None
 
     # Project the read onto CDS coordinates for every candidate transcript.
-    # Accept only reads that map to exactly one unique CDS interval.
-    cds_intervals: list[tuple[int, int]] = []
-    transcripts = []
+    # Accept only reads that map to exactly one unique CDS interval; a second
+    # successful projection already disqualifies the read.
+    transcript = None
+    iv_on_cds = None
     for tr in transcript_candidates:
         try:
             iv_on_exons = tr.exons.map_to_local(aln.genomic_region)
-            iv_on_cds = (
-                iv_on_exons[0] - tr.annotated_cds_iv[0],
-                iv_on_exons[1] - tr.annotated_cds_iv[0],
-            )
         except ValueError:
             continue
-        cds_intervals.append(iv_on_cds)
-        transcripts.append(tr)
+        if transcript is not None:
+            return None
+        transcript = tr
+        iv_on_cds = (
+            iv_on_exons[0] - tr.annotated_cds_iv[0],
+            iv_on_exons[1] - tr.annotated_cds_iv[0],
+        )
 
-    if len(cds_intervals) != 1:
+    if transcript is None:
         return None
-
-    iv_on_cds = cds_intervals[0]
-    transcript = transcripts[0]
 
     frame = iv_on_cds[0] % 3
-
-    # A P-site sits on a CDS codon boundary, i.e. at a CDS position divisible
-    # by 3.  Relative to the *read start* the codon boundaries are therefore at
-    # f0, f0 + 3, f0 + 6, ... with f0 = (-frame) % 3, which is the offset
-    # convention read_in_cds_likelihood() uses internally.  Only codons that fit
-    # entirely inside the read can carry the P-site.
-    f0 = (-frame) % 3
-    n_codons = (len(aln) - f0) // 3
-    if n_codons <= 0:
+    winner = _p_site_codon(cm, len(aln), frame, int(aln.untemplated_addition))
+    if winner == _REJECT:
         return None
 
-    # Compute the likelihood that the P-site lies in each codon spanned by
-    # the read.
-    likelihoods = np.array(
-        [
-            read_in_cds_likelihood(
-                cm.pl,
-                cm.pr,
-                cm.pu,
-                len(aln),
-                frame,
-                aln.untemplated_addition,
-                f0 + 3 * i,
-                f0 + 3 * i + 3,
-            )
-            for i in range(n_codons)
-        ]
-    )
-
-    if likelihoods.max() < _MIN_CODON_LIKELIHOOD:
-        return None
-
-    likelihoods /= likelihoods.sum()
-
-    if likelihoods.max() < _MIN_DOMINANT_FRACTION:
-        return None
-
-    p_site_cds_pos = iv_on_cds[0] + f0 + int(np.argmax(likelihoods)) * 3
+    p_site_cds_pos = iv_on_cds[0] + (-frame) % 3 + winner * 3
     return transcript, iv_on_cds, p_site_cds_pos
+
+
+def build_histograms(
+    ra: ReferenceAnnotation,
+    bam: "pysam.AlignmentFile",
+    cm: CleavageModel,
+    region: Optional[tuple[str, int, int]] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Accumulate P-site counts around the CDS start and stop codons.
+
+    Both histograms are filled in a single pass: assigning a read to a P-site
+    is by far the most expensive step and its result serves both.
+
+    A read contributes to the start histogram when its P-site falls within
+    :data:`_START_WINDOW` of CDS position 0 and its matching range does not
+    span the CDS end, and to the stop histogram when its P-site falls within
+    :data:`_STOP_WINDOW` of the CDS end and its matching range does not span
+    the CDS start.  The two conditions are not exclusive.
+
+    Parameters
+    ----------
+    ra : ReferenceAnnotation
+        Reference annotation.
+    bam : pysam.AlignmentFile
+        Open, coordinate-sorted BAM file.
+    cm : CleavageModel
+        Cleavage model used to assign reads to P-site positions.
+    region : tuple[str, int, int] or None, optional
+        Restrict the pass to ``(contig, start, end)``.  Requires *bam* to be
+        indexed.  Only reads whose leftmost mapped base lies in ``[start, end)``
+        are counted, so the histograms of a set of regions tiling the genome sum
+        to those of the whole file.  When *None* the whole file is scanned.
+
+    Returns
+    -------
+    start_hist : np.ndarray
+        Histogram of shape ``(_HIST_SIZE,)``; index :data:`_START_CODON_IDX`
+        corresponds to CDS position 0.
+    stop_hist : np.ndarray
+        Histogram of shape ``(_HIST_SIZE,)``; index :data:`_STOP_PEAK_IDX`
+        corresponds to CDS position ``len(cds) − 3``.
+    """
+    start_hist = np.zeros(_HIST_SIZE)
+    stop_hist = np.zeros(_HIST_SIZE)
+    start_lo, start_hi = _START_WINDOW
+    stop_lo, stop_hi = _STOP_WINDOW
+
+    if region is None:
+        alns = bam.fetch(until_eof=True)
+        lo = hi = None
+    else:
+        contig, lo, hi = region
+        alns = bam.fetch(contig, lo, hi)
+
+    for raw_aln in alns:
+        if raw_aln.is_unmapped:
+            continue
+        # fetch() also yields reads that merely overlap the window; count each
+        # read in exactly one region.
+        if lo is not None and not (lo <= raw_aln.reference_start < hi):
+            continue
+
+        result = _try_assign_p_site(RiboSeqAlignment.from_pysam(raw_aln), ra, cm)
+        if result is None:
+            continue
+        transcript, iv_on_cds, p_site = result
+
+        coding_length = transcript.coding_length
+
+        if start_lo < iv_on_cds[0] < start_hi and not (
+            iv_on_cds[0] < coding_length < iv_on_cds[1]
+        ):
+            idx = p_site // 3 + _START_CODON_IDX
+            if 0 <= idx < _HIST_SIZE:
+                start_hist[idx] += 1
+
+        dist_to_end = iv_on_cds[1] - coding_length
+        if stop_lo < dist_to_end < stop_hi and not (iv_on_cds[0] < 0 < iv_on_cds[1]):
+            idx = p_site // 3 - coding_length // 3 + _STOP_HIST_OFFSET
+            if 0 <= idx < _HIST_SIZE:
+                stop_hist[idx] += 1
+
+    return start_hist, stop_hist
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +383,8 @@ class CoverageModel:
         CoverageModel
             Model with all attributes (including optional histograms) set.
         """
-        start_hist = cls._build_start_histogram(ra, sample_bam_path, cm)
-        stop_hist = cls._build_stop_histogram(ra, sample_bam_path, cm)
+        with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
+            start_hist, stop_hist = build_histograms(ra, bam, cm)
         start_factor = cls._compute_start_factor(start_hist, sample_bam_path)
         stop_factor = cls._compute_stop_factor(stop_hist, sample_bam_path)
         return cls(start_factor, stop_factor, start_hist, stop_hist)
@@ -264,111 +394,6 @@ class CoverageModel:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_start_histogram(
-        ra: ReferenceAnnotation,
-        bam_path: str,
-        cm: CleavageModel,
-    ) -> np.ndarray:
-        """Accumulate P-site counts relative to the start codon.
-
-        Only reads whose P-site falls within ``_START_WINDOW`` of CDS
-        position 0, and that do not span the CDS end, are included.
-
-        Parameters
-        ----------
-        ra : ReferenceAnnotation
-            Reference annotation.
-        bam_path : str
-            Path to the BAM file.
-        cm : CleavageModel
-            Cleavage model.
-
-        Returns
-        -------
-        np.ndarray
-            Histogram of shape ``(_HIST_SIZE,)``.  Index
-            ``_START_CODON_IDX`` corresponds to CDS position 0.
-        """
-        hist = np.zeros(_HIST_SIZE)
-        with pysam.AlignmentFile(bam_path, "rb") as bam:
-            for raw_aln in bam.fetch(until_eof=True):
-                if raw_aln.is_unmapped:
-                    continue
-                result = _try_assign_p_site(
-                    RiboSeqAlignment.from_pysam(raw_aln), ra, cm
-                )
-                if result is None:
-                    continue
-                transcript, iv_on_cds, p_site = result
-
-                lo, hi = _START_WINDOW
-                if not (lo < iv_on_cds[0] < hi):
-                    continue
-
-                # Exclude reads whose matching range spans the CDS end.
-                if iv_on_cds[0] < transcript.coding_length < iv_on_cds[1]:
-                    continue
-
-                idx = p_site // 3 + _START_CODON_IDX
-                if 0 <= idx < _HIST_SIZE:
-                    hist[idx] += 1
-
-        return hist
-
-    @staticmethod
-    def _build_stop_histogram(
-        ra: ReferenceAnnotation,
-        bam_path: str,
-        cm: CleavageModel,
-    ) -> np.ndarray:
-        """Accumulate P-site counts relative to the stop codon.
-
-        Only reads whose P-site falls within ``_STOP_WINDOW`` of the CDS end,
-        and that do not span the CDS start, are included.
-
-        Parameters
-        ----------
-        ra : ReferenceAnnotation
-            Reference annotation.
-        bam_path : str
-            Path to the BAM file.
-        cm : CleavageModel
-            Cleavage model.
-
-        Returns
-        -------
-        np.ndarray
-            Histogram of shape ``(_HIST_SIZE,)``.  Index ``_STOP_PEAK_IDX``
-            corresponds to CDS position ``len(cds) − 3``.
-        """
-        hist = np.zeros(_HIST_SIZE)
-        with pysam.AlignmentFile(bam_path, "rb") as bam:
-            for raw_aln in bam.fetch(until_eof=True):
-                if raw_aln.is_unmapped:
-                    continue
-                result = _try_assign_p_site(
-                    RiboSeqAlignment.from_pysam(raw_aln), ra, cm
-                )
-                if result is None:
-                    continue
-                transcript, iv_on_cds, p_site = result
-
-                dist_to_end = iv_on_cds[1] - transcript.coding_length
-                lo, hi = _STOP_WINDOW
-                if not (lo < dist_to_end < hi):
-                    continue
-
-                # Exclude reads whose matching range spans the CDS start.
-                if iv_on_cds[0] < 0 < iv_on_cds[1]:
-                    continue
-
-                idx = p_site // 3 - transcript.coding_length // 3 + _STOP_HIST_OFFSET
-                if 0 <= idx < _HIST_SIZE:
-                    hist[idx] += 1
-
-        return hist
-
-    @staticmethod
     def _compute_start_factor(hist: np.ndarray, bam_path: str) -> float:
         """Compute the start-codon enrichment factor from *hist*.
 
@@ -376,7 +401,7 @@ class CoverageModel:
         ----------
         hist : np.ndarray
             Start-codon P-site histogram as returned by
-            :meth:`_build_start_histogram`.
+            :func:`build_histograms`.
         bam_path : str
             BAM path used only for warning messages.
 
@@ -423,7 +448,7 @@ class CoverageModel:
         ----------
         hist : np.ndarray
             Stop-codon P-site histogram as returned by
-            :meth:`_build_stop_histogram`.
+            :func:`build_histograms`.
         bam_path : str
             BAM path used only for warning messages.
 

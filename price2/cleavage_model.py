@@ -14,7 +14,7 @@ import pysam
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
-from numba import njit
+from numba import njit, prange
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
@@ -1112,6 +1112,176 @@ def compute_ll(
 
 
 @njit(cache=True)
+def _init_restarts(
+    repeats: int, obs_max_len: int, peak: int, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw the initial ``pl``/``pr`` of every restart.
+
+    Kept separate from the EM itself so that the random draws stay sequential
+    and the restarts remain reproducible no matter how they are scheduled.
+
+    Returns
+    -------
+    pls, prs : np.ndarray
+        Arrays of shape ``(repeats, obs_max_len + 1)``, one normalised
+        distribution per restart.
+    """
+    np.random.seed(seed)
+    pls = np.empty((repeats, obs_max_len + 1))
+    prs = np.empty((repeats, obs_max_len + 1))
+    for rep in range(repeats):
+        pl = np.random.rand(obs_max_len + 1)
+        pr = np.random.rand(obs_max_len + 1)
+
+        pl[peak - 1] *= 4
+        pl[peak] *= 10
+        pl[peak + 1] *= 4
+
+        pls[rep] = pl / pl.sum()
+        prs[rep] = pr / pr.sum()
+    return pls, prs
+
+
+@njit(cache=True)
+def _em_restart(
+    obs_max_len: int,
+    obs_min_len: int,
+    table: np.ndarray,
+    maxiter: int,
+    c: int,
+    delta_cutoff: float,
+    total: int,
+    pl: np.ndarray,
+    pr: np.ndarray,
+) -> tuple[float, float]:
+    """Run the EM to convergence from one starting point.
+
+    *pl* and *pr* are updated in place and hold the fitted distributions on
+    return.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(log_likelihood, u)`` of the fitted model.
+    """
+    N = table[obs_min_len : obs_max_len + 1, :, 1, c].sum()
+    u = N * 4 / 3
+
+    N += table[obs_min_len : obs_max_len + 1, :, 0, c].sum()
+    u /= N
+
+    for it in range(maxiter):
+        eps = 1e-14
+
+        ql0 = np.zeros(obs_max_len + 1)
+        qr0 = np.zeros(obs_max_len + 1)
+        ql1 = np.zeros(obs_max_len + 1)
+        qr1 = np.zeros(obs_max_len + 1)
+
+        qu = 0
+
+        for length in range(obs_min_len, obs_max_len + 1):
+            for frame in range(3):
+                untemplated_addition = 1
+
+                n = table[length, frame, untemplated_addition, c]
+
+                frame1 = (frame - 1) % 3
+                # left indexes the footprint left cleavage: it may reach
+                # length - 3, which pairs with a right cleavage of 0.
+                left = np.arange(frame, length - 2, 3)
+                # left1 belongs to the one-shorter hidden-UTA footprint, so
+                # it stops one codon earlier.
+                left1 = np.arange(frame1, length - 3, 3)
+
+                total_p = eps + (pl[left] * pr[length - left - 3]).sum()
+                s = pl[left] * pr[length - left - 3] / total_p * n
+                ql0[left] += s
+                qr0[length - left - 3] += s
+
+                qu += n
+
+                untemplated_addition = 0
+
+                n = table[length, frame, untemplated_addition, c]
+
+                sum0 = eps
+                sum1 = eps
+
+                prop = u / (4 - 3 * u)
+
+                sum1 += (pl[left1] * pr[length - left1 - 3 - 1] * prop).sum()
+
+                sum0 += (pl[left] * pr[length - left - 3] * (1 - prop)).sum()
+                total_p = sum1 + sum0
+
+                s = pl[left1] * pr[length - left1 - 3 - 1] * prop / total_p * n
+                ql1[left1] += s
+                qr1[length - left1 - 1 - 3] += s
+
+                s = pl[left] * pr[length - left - 3] * (1 - prop) / total_p * n
+                ql0[left] += s
+                qr0[length - left - 3] += s
+
+                qu += sum1 / total_p * n
+
+        old_pl = pl.copy()
+        old_pr = pr.copy()
+        for i in range(obs_max_len + 1):
+            # ql0 and ql1 are both indexed by the footprint left cleavage:
+            # the E-step pairs ql1[left1] with pr[length - left1 - 4].
+            pl[i] = (ql1[i] + ql0[i]) / total
+            pr[i] = (qr1[i] + qr0[i]) / total
+
+        N = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
+        u = qu / N
+
+        model_change = np.absolute(old_pl - pl).sum() + np.absolute(old_pr - pr).sum()
+        if model_change < delta_cutoff:
+            break
+
+    return compute_ll(table, obs_min_len, obs_max_len, pl, pr, u, c), u
+
+
+@njit(parallel=True, cache=True)
+def _em_restarts(
+    obs_max_len: int,
+    obs_min_len: int,
+    table: np.ndarray,
+    maxiter: int,
+    c: int,
+    delta_cutoff: float,
+    total: int,
+    pls: np.ndarray,
+    prs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run every restart in *pls*/*prs*, in parallel, updating them in place.
+
+    Restarts are independent, so scheduling cannot change any single result.
+
+    Returns
+    -------
+    lls, us : np.ndarray
+        Per-restart log-likelihood and untemplated-addition probability.
+    """
+    repeats = pls.shape[0]
+    lls = np.empty(repeats)
+    us = np.empty(repeats)
+    for rep in prange(repeats):
+        lls[rep], us[rep] = _em_restart(
+            obs_max_len,
+            obs_min_len,
+            table,
+            maxiter,
+            c,
+            delta_cutoff,
+            total,
+            pls[rep],
+            prs[rep],
+        )
+    return lls, us
+
+
 def repeat(
     repeats: int,
     obs_max_len: int,
@@ -1131,6 +1301,9 @@ def repeat(
     best one), and this tilt raises that to ~9-50% while cutting the iterations
     to convergence by up to 10x.  It only biases the starting point; the data
     still decide where the peak ends up.
+
+    The restarts are drawn up front and then fitted in parallel; the result does
+    not depend on the number of threads.
 
     Parameters
     ----------
@@ -1158,119 +1331,16 @@ def repeat(
     tuple
         ``(best_ll, best_u, best_pl, best_pr)``.
     """
-    np.random.seed(seed)
-
     total = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
-
-    best_ll = -np.inf
-
     peak = min(max(init_peak, 1), obs_max_len - 1)
 
-    for rep in range(max(repeats, 1)):
+    pls, prs = _init_restarts(max(repeats, 1), obs_max_len, peak, seed)
+    lls, us = _em_restarts(
+        obs_max_len, obs_min_len, table, maxiter, c, delta_cutoff, total, pls, prs
+    )
 
-        pl = np.random.rand(obs_max_len + 1)
-        pr = np.random.rand(obs_max_len + 1)
-
-        pl[peak - 1] *= 4
-        pl[peak] *= 10
-        pl[peak + 1] *= 4
-
-        pl = pl / pl.sum()
-        pr = pr / pr.sum()
-
-        N = table[obs_min_len : obs_max_len + 1, :, 1, c].sum()
-        u = N * 4 / 3
-
-        N += table[obs_min_len : obs_max_len + 1, :, 0, c].sum()
-        u /= N
-
-        better_ll = -np.inf
-
-        for it in range(maxiter):
-            eps = 1e-14
-
-            ql0 = np.zeros(obs_max_len + 1)
-            qr0 = np.zeros(obs_max_len + 1)
-            ql1 = np.zeros(obs_max_len + 1)
-            qr1 = np.zeros(obs_max_len + 1)
-
-            qu = 0
-
-            for length in range(obs_min_len, obs_max_len + 1):
-                for frame in range(3):
-                    untemplated_addition = 1
-
-                    n = table[length, frame, untemplated_addition, c]
-
-                    frame1 = (frame - 1) % 3
-                    # left indexes the footprint left cleavage: it may reach
-                    # length - 3, which pairs with a right cleavage of 0.
-                    left = np.arange(frame, length - 2, 3)
-                    # left1 belongs to the one-shorter hidden-UTA footprint, so
-                    # it stops one codon earlier.
-                    left1 = np.arange(frame1, length - 3, 3)
-
-                    total_p = eps + (pl[left] * pr[length - left - 3]).sum()
-                    s = pl[left] * pr[length - left - 3] / total_p * n
-                    ql0[left] += s
-                    qr0[length - left - 3] += s
-
-                    qu += n
-
-                    untemplated_addition = 0
-
-                    n = table[length, frame, untemplated_addition, c]
-
-                    sum0 = eps
-                    sum1 = eps
-
-                    prop = u / (4 - 3 * u)
-
-                    sum1 += (pl[left1] * pr[length - left1 - 3 - 1] * prop).sum()
-
-                    sum0 += (pl[left] * pr[length - left - 3] * (1 - prop)).sum()
-                    total_p = sum1 + sum0
-
-                    s = pl[left1] * pr[length - left1 - 3 - 1] * prop / total_p * n
-                    ql1[left1] += s
-                    qr1[length - left1 - 1 - 3] += s
-
-                    s = pl[left] * pr[length - left - 3] * (1 - prop) / total_p * n
-                    ql0[left] += s
-                    qr0[length - left - 3] += s
-
-                    qu += sum1 / total_p * n
-
-            old_pl = pl.copy()
-            old_pr = pr.copy()
-            for i in range(obs_max_len + 1):
-                # ql0 and ql1 are both indexed by the footprint left cleavage:
-                # the E-step pairs ql1[left1] with pr[length - left1 - 4].
-                pl[i] = (ql1[i] + ql0[i]) / total
-                pr[i] = (qr1[i] + qr0[i]) / total
-
-            N = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
-            u = qu / N
-
-            model_change = (
-                np.absolute(old_pl - pl).sum() + np.absolute(old_pr - pr).sum()
-            )
-            if model_change < delta_cutoff:
-                better_ll = compute_ll(table, obs_min_len, obs_max_len, pl, pr, u, c)
-                better_u = u
-                break
-
-        else:
-            better_ll = compute_ll(table, obs_min_len, obs_max_len, pl, pr, u, c)
-            better_u = u
-
-        if better_ll > best_ll:
-            best_ll = better_ll
-            best_u = better_u
-            best_pl = pl
-            best_pr = pr
-
-    return best_ll, best_u, best_pl, best_pr
+    best = int(np.argmax(lls))
+    return lls[best], us[best], pls[best].copy(), prs[best].copy()
 
 
 def to_file(file_path: str, models: dict[str, CleavageModel]) -> None:

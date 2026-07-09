@@ -1,6 +1,7 @@
 """Reference annotation loading and interval indexing from GTF files."""
 
 import logging
+from bisect import bisect_left, bisect_right
 
 import HTSeq
 
@@ -8,6 +9,10 @@ from price2.genomic_region import GenomicRegion
 from price2.genomic_features import Transcript
 
 logger = logging.getLogger(__name__)
+
+#: Flattened CDS interval index: per ``(chromosome, strand)``, the start position
+#: of every step and the transcripts covering it (``None`` where there are none).
+CdsIndex = dict[tuple[str, str], tuple[list[int], list[frozenset | None]]]
 
 
 class ReferenceAnnotation:
@@ -33,6 +38,9 @@ class ReferenceAnnotation:
     cds_intervals: HTSeq.GenomicArrayOfSets
     transcripts: dict[str, Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
+
+    #: Flattened ``cds_intervals``; see :meth:`build_cds_index`.
+    _cds_index: CdsIndex | None = None
 
     def __init__(self, gtf_path: str) -> None:
         """Parse a GTF file and build genomic interval indexes.
@@ -82,7 +90,67 @@ class ReferenceAnnotation:
 
         logger.info("Loaded %d transcripts from %s", len(self.transcripts), gtf_path)
 
-    def collect_coding_transcripts(self, region: GenomicRegion) -> set[Transcript]:
+    def build_cds_index(self) -> None:
+        """Flatten ``cds_intervals`` into a per-chromosome binary-search index.
+
+        Walking an :class:`HTSeq.GenomicArrayOfSets` with ``steps()`` costs
+        several microseconds per query, which dominates cleavage- and
+        coverage-model estimation (one query per read).  The step boundaries
+        never change after construction, so they are flattened once into a
+        sorted list of step starts plus the transcript set of each step, which
+        a query resolves with two binary searches.
+
+        Equal transcript sets are interned, and steps covered by no CDS store
+        ``None``, so the index adds little memory on top of the source array.
+        Called automatically on the first query; call it explicitly in a parent
+        process to share the index with forked workers.
+        """
+        if self._cds_index is not None:
+            return
+
+        index: CdsIndex = {}
+        interned: dict[frozenset, frozenset] = {}
+        for chrom, strand_vectors in self.cds_intervals.chrom_vectors.items():
+            for strand, chrom_vector in strand_vectors.items():
+                starts: list[int] = []
+                step_sets: list[frozenset | None] = []
+                for iv, transcripts in chrom_vector.steps():
+                    if transcripts:
+                        frozen = frozenset(transcripts)
+                        frozen = interned.setdefault(frozen, frozen)
+                    else:
+                        frozen = None
+                    starts.append(iv.start)
+                    step_sets.append(frozen)
+                index[(chrom, strand)] = (starts, step_sets)
+        self._cds_index = index
+
+    def _coding_transcripts_at(
+        self, chrom: str, strand: str, start: int, end: int
+    ) -> frozenset | None:
+        """Transcripts whose CDS overlaps ``[start, end)``, or ``None``."""
+        try:
+            starts, step_sets = self._cds_index[(chrom, strand)]
+        except KeyError:
+            return None
+
+        first = bisect_right(starts, start) - 1
+        if first < 0:
+            first = 0
+        last = bisect_left(starts, end)
+
+        if last - first == 1:
+            return step_sets[first]
+
+        found = None
+        for i in range(first, last):
+            step = step_sets[i]
+            if step is None:
+                continue
+            found = step if found is None else found | step
+        return found
+
+    def collect_coding_transcripts(self, region: GenomicRegion) -> frozenset[Transcript]:
         """Return all transcripts with a CDS overlapping *region*.
 
         Parameters
@@ -92,17 +160,21 @@ class ReferenceAnnotation:
 
         Returns
         -------
-        set[Transcript]
+        frozenset[Transcript]
             Transcripts whose CDS intervals overlap any exon of *region*.
         """
-        transcripts = set()
+        if self._cds_index is None:
+            self.build_cds_index()
+
+        found = None
         for interval in region.intervals:
-            try:
-                for iv, value in self.cds_intervals[interval].steps():
-                    transcripts |= value
-            except KeyError:
-                pass
-        return transcripts
+            step = self._coding_transcripts_at(
+                interval.chrom, interval.strand, interval.start, interval.end
+            )
+            if step is None:
+                continue
+            found = step if found is None else found | step
+        return found if found is not None else frozenset()
 
     def collect_transcripts(self, region: GenomicRegion) -> set[Transcript]:
         """Return all transcripts with an exon overlapping *region*.
