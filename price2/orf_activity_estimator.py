@@ -15,6 +15,7 @@ import sqlite3 as sql
 import time
 import traceback
 from concurrent.futures import TimeoutError, as_completed
+from contextlib import contextmanager
 from pickle import loads
 
 import multiprocessing as mp
@@ -88,6 +89,73 @@ class ORFActivityEstimator:
 
         cur.execute("SELECT locus_id FROM loci")
         self.loci_ids = [id for id, in cur.fetchall()]
+
+    def _start_gpu_broker(self):
+        """Start the single-context GPU deconvolution broker pool.
+
+        The pool is shared across the whole worker pool via
+        ``config.mu_broker_req_q`` (a Manager queue proxy that pickles to each
+        ``process_loc`` worker).  One broker process holds one CUDA context and
+        serves every worker over shared memory, so device VRAM does not scale
+        with ``config.processes``.
+
+        Returns
+        -------
+        GpuBroker or None
+            The started pool, or ``None`` when the broker is disabled or cannot
+            start — in which case the workers fall back to the configured
+            per-worker MU path.
+        """
+        self.config.mu_broker_req_q = None
+        if (
+            getattr(self.config, "inner_solver", "lbfgs") != "mu"
+            or not getattr(self.config, "mu_broker", False)
+        ):
+            return None
+
+        try:
+            from price2.gpu_broker import GpuBroker
+
+            broker = GpuBroker(
+                n_procs=getattr(self.config, "mu_broker_procs", 4),
+                n_streams=getattr(self.config, "mu_broker_streams", 2),
+                dtype_str=getattr(self.config, "mu_dtype", "float32"),
+            )
+            broker.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "GPU broker unavailable (%s); workers use the configured "
+                "per-worker MU path",
+                exc,
+            )
+            return None
+
+        self.config.mu_broker_req_q = broker.req_q
+        logger.info(
+            "GPU deconvolution broker pool started (%d procs x %d streams, %s)",
+            getattr(self.config, "mu_broker_procs", 4),
+            getattr(self.config, "mu_broker_streams", 2),
+            getattr(self.config, "mu_dtype", "float32"),
+        )
+        return broker
+
+    @contextmanager
+    def gpu_broker_pool(self):
+        """Hold one GPU broker pool open for the duration of the block.
+
+        Each :meth:`run_orf_deconvolution` would otherwise start and stop a pool
+        of its own.  That costs a CUDA context per broker process every time,
+        which the multimapping EM pays once per M-step; wrapping the whole loop
+        in this context manager pays it once.  Nested calls to
+        :meth:`run_orf_deconvolution` reuse the pool and leave it running.
+        """
+        broker = self._start_gpu_broker()
+        try:
+            yield
+        finally:
+            if broker is not None:
+                broker.stop()
+            self.config.mu_broker_req_q = None
 
     def run_orf_deconvolution(
         self,
@@ -173,42 +241,12 @@ class ORFActivityEstimator:
         log_level_num = logging.getLevelName(self.config.log_level)
         pbar = tqdm(total=len(loci_ids), disable=log_level_num > logging.INFO)
 
-        # Optional single-context GPU deconvolution broker: started once here and
-        # shared across the whole worker pool via ``config.mu_broker_req_q`` (a
-        # Manager queue proxy that pickles to each process_loc worker). One broker
-        # holds one CUDA context and serves every worker over shared memory, so
-        # device VRAM does not scale with ``config.processes``. Falls back to the
-        # configured per-worker MU path if the broker cannot start.
+        # Reuse the caller's broker pool when there is one (the EM outer loop
+        # holds a single pool across all of its M-steps), and tear down only a
+        # pool this call started.
         broker = None
-        self.config.mu_broker_req_q = None
-        if (
-            getattr(self.config, "inner_solver", "lbfgs") == "mu"
-            and getattr(self.config, "mu_broker", False)
-        ):
-            try:
-                from price2.gpu_broker import GpuBroker
-
-                broker = GpuBroker(
-                    n_procs=getattr(self.config, "mu_broker_procs", 4),
-                    n_streams=getattr(self.config, "mu_broker_streams", 2),
-                    dtype_str=getattr(self.config, "mu_dtype", "float32"),
-                )
-                broker.start()
-                self.config.mu_broker_req_q = broker.req_q
-                logger.info(
-                    "GPU deconvolution broker pool started (%d procs x %d streams, %s)",
-                    getattr(self.config, "mu_broker_procs", 4),
-                    getattr(self.config, "mu_broker_streams", 2),
-                    getattr(self.config, "mu_dtype", "float32"),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "GPU broker unavailable (%s); workers use the configured "
-                    "per-worker MU path",
-                    exc,
-                )
-                broker = None
-                self.config.mu_broker_req_q = None
+        if getattr(self.config, "mu_broker_req_q", None) is None:
+            broker = self._start_gpu_broker()
 
         price2_logger = logging.getLogger("price2")
         manager = mp.Manager()
@@ -264,6 +302,7 @@ class ORFActivityEstimator:
             if broker is not None:
                 broker.stop()
                 self.config.mu_broker_req_q = None
+            # A pool owned by the caller stays up for the next M-step.
 
         pbar.close()
 

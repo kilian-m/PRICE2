@@ -313,36 +313,39 @@ def _run_em_deconvolution(
     slot_loci = multimap.slot_locus_ids(db_path)
 
     last_it = 0
-    for it in range(config.em_max_iter):
-        last_it = it
-        _timed(
-            f"EM iteration {it} light M-step... ",
-            estimator.run_orf_deconvolution,
-            em_iteration=it,
-            em_final=False,
-            loci_subset=slot_loci,
-        )
-        delta = multimap.e_step(db_path, iteration=it)
-        logger.info(
-            "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
-            it,
-            delta,
-        )
-        if delta < config.em_tol:
-            logger.info(
-                "EM converged after %d iteration(s) (tol=%.1e).",
-                it + 1,
-                config.em_tol,
+    # One broker pool for the whole EM: every M-step would otherwise rebuild it,
+    # paying a CUDA context per broker process per iteration.
+    with estimator.gpu_broker_pool():
+        for it in range(config.em_max_iter):
+            last_it = it
+            _timed(
+                f"EM iteration {it} light M-step... ",
+                estimator.run_orf_deconvolution,
+                em_iteration=it,
+                em_final=False,
+                loci_subset=slot_loci,
             )
-            break
+            delta = multimap.e_step(db_path, iteration=it)
+            logger.info(
+                "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
+                it,
+                delta,
+            )
+            if delta < config.em_tol:
+                logger.info(
+                    "EM converged after %d iteration(s) (tol=%.1e).",
+                    it + 1,
+                    config.em_tol,
+                )
+                break
 
-    # Final full M-step with the converged fractional weights.
-    _timed(
-        "EM final full M-step... ",
-        estimator.run_orf_deconvolution,
-        em_iteration=last_it + 1,
-        em_final=True,
-    )
+        # Final full M-step with the converged fractional weights.
+        _timed(
+            "EM final full M-step... ",
+            estimator.run_orf_deconvolution,
+            em_iteration=last_it + 1,
+            em_final=True,
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
