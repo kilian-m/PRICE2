@@ -565,6 +565,12 @@ class Locus:
         # the eager build was pure overhead on the critical path.
         self._rgr_intervals = None
 
+        # ``rgr.index`` addresses the design-matrix column blocks and the rows
+        # of ``result``, so every RGR carries one from the moment the set is
+        # built.  ``remove_rgrs`` re-densifies them after a removal.
+        for c, rgr in enumerate(self.rgr_set):
+            rgr.index = c
+
         self.gene_ids_complete = {
             rgr.transcript.gene_id for rgr in self.rgr_set
         }
@@ -2142,7 +2148,11 @@ class Locus:
         # re-indexing below overwrites.  ``rgr_set`` iteration order is not
         # the index order (it changes across a pickle round-trip), so the old
         # indices have to be captured rather than re-derived by enumeration.
-        old_indices = {rgr: rgr.index for rgr in old_rgr_set}
+        old_indices = (
+            {rgr: rgr.index for rgr in old_rgr_set}
+            if hasattr(self, "result")
+            else None
+        )
 
         # rgr indices
         for c, rgr in enumerate(self.rgr_set):
