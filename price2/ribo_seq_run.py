@@ -209,9 +209,11 @@ def ribo_seq_run_from_bam(
     run_id = bam_file.split(".")[0]
     bam_file_path = f"{bam_dir}/{bam_file}"
 
-    # Count total reads and derive the downsampling fraction.
+    # Count total reads and derive the downsampling fraction.  ``mapped``
+    # is read from the BAM index; it equals ``count()``, which would
+    # decompress every record.
     with pysam.AlignmentFile(bam_file_path, "rb") as bam:
-        read_count = bam.count()
+        read_count = bam.mapped
     fraction_of_reads = min(10_000_000 / read_count, 0.99)
 
     # Write downsampled BAM to a temporary file.

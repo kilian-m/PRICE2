@@ -18,7 +18,7 @@ from pickle import dumps, loads
 import zlib
 import pandas as pd
 import numpy as np
-from multiprocessing import Pool
+import multiprocessing as mp
 from collections import defaultdict
 
 from price2 import multimap
@@ -288,8 +288,12 @@ class DataCollector:
         """
         # Fork before opening the database: SQLite connections must not be
         # carried across fork(), and the workers have no use for one.
+        # The context must be requested explicitly: importing
+        # ``orf_activity_estimator`` sets the global start method to
+        # ``forkserver``, under which workers would not inherit
+        # ``_WORKER_LOCI``.
         try:
-            pool = Pool(n_proc)
+            pool = mp.get_context("fork").Pool(n_proc)
         except AssertionError:
             # A daemonic process may not spawn children (Process.start
             # asserts this); fall back to mapping the chunks in-process.
