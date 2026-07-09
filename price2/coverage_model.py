@@ -124,11 +124,18 @@ def _try_assign_p_site(
 
     iv_on_cds = cds_intervals[0]
     transcript = transcripts[0]
-    n_codons = (iv_on_cds[1] - iv_on_cds[0]) // 3
-    if n_codons == 0:
-        return None
 
     frame = iv_on_cds[0] % 3
+
+    # A P-site sits on a CDS codon boundary, i.e. at a CDS position divisible
+    # by 3.  Relative to the *read start* the codon boundaries are therefore at
+    # f0, f0 + 3, f0 + 6, ... with f0 = (-frame) % 3, which is the offset
+    # convention read_in_cds_likelihood() uses internally.  Only codons that fit
+    # entirely inside the read can carry the P-site.
+    f0 = (-frame) % 3
+    n_codons = (len(aln) - f0) // 3
+    if n_codons <= 0:
+        return None
 
     # Compute the likelihood that the P-site lies in each codon spanned by
     # the read.
@@ -141,8 +148,8 @@ def _try_assign_p_site(
                 len(aln),
                 frame,
                 aln.untemplated_addition,
-                frame % 3 + 3 * i,
-                frame % 3 + 3 * i + 3,
+                f0 + 3 * i,
+                f0 + 3 * i + 3,
             )
             for i in range(n_codons)
         ]
@@ -156,7 +163,7 @@ def _try_assign_p_site(
     if likelihoods.max() < _MIN_DOMINANT_FRACTION:
         return None
 
-    p_site_cds_pos = iv_on_cds[0] + int(np.argmax(likelihoods)) * 3
+    p_site_cds_pos = iv_on_cds[0] + f0 + int(np.argmax(likelihoods)) * 3
     return transcript, iv_on_cds, p_site_cds_pos
 
 

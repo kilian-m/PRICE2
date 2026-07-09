@@ -78,9 +78,6 @@ class Config:
         Maximum number of line-search steps in all optimisations.
     lam : float
         Group-LASSO regularisation strength λ.
-    rgrs_to_remove_fraction : float
-        Fraction of RGRs that must have low activity before iterative
-        removal is triggered during main deconvolution.
     rgr_min_activity : float
         Minimum activity (in at least one run) for an RGR to be retained.
     min_activity_fraction : float
@@ -197,7 +194,6 @@ class Config:
     # ------------------------------------------------------------------ #
     # RGR activity thresholds                                              #
     # ------------------------------------------------------------------ #
-    rgrs_to_remove_fraction: float = 0.5
     rgr_min_activity: float = 0.01
     min_activity_fraction: float = 0.1
 

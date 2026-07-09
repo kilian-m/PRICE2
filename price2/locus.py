@@ -1470,13 +1470,7 @@ class Locus:
                         num_rgrs, num_runs, config.pseudo_min, mi, mt,
                         theta=theta)
             else:
-                cb = Callback(
-                    w_current,
-                    num_runs,
-                    config,
-                    remove_rgrs=False,
-                    rgr_lengths=rgr_lengths,
-                )
+                cb = Callback(w_current, config)
                 result = minimize(
                     weighted_poisson_nll_grad_lasso,
                     w_current,
@@ -1789,7 +1783,7 @@ class Locus:
                     fixed_mask=fixed, theta=theta)
                 optimization_result = types.SimpleNamespace(x=w_lr, success=True)
             else:
-                cb = Callback(initial_guess, num_runs, config)
+                cb = Callback(initial_guess, config)
                 optimization_result = minimize(
                     weighted_poisson_nll_grad,
                     initial_guess,
@@ -2006,7 +2000,7 @@ class Locus:
                     getattr(config, "mu_inner_tol", 1e-5), theta=theta)
                 tmp = w_ea.copy()
             else:
-                cb = Callback(initial_guess, num_runs, config)
+                cb = Callback(initial_guess, config)
                 optimization_result = minimize(
                     obj_fn,
                     initial_guess,
@@ -2533,36 +2527,23 @@ class Callback:
     Monitors the relative change in activity estimates between
     iterations and raises ``StopIteration`` when all active parameters
     have converged according to ``config.stop_factor_relative``.
-    Optionally identifies low-activity RGRs for early removal.
 
     Attributes
     ----------
     success : bool
         ``True`` when convergence was reached.
-    rgr_indices_to_remove : set[int]
-        Indices of RGRs flagged for removal (only populated when
-        *remove_rgrs* is ``True``).
     """
 
     success: bool
-    rgr_indices_to_remove: set[int]
 
     def __init__(
         self,
         initial_guess: np.ndarray,
-        number_samples: int,
         config: Config,
-        rgr_lengths: np.ndarray | None = None,
-        remove_rgrs: bool = False,
     ) -> None:
         self.config = config
         self.previous = initial_guess
-        self.initial_guess = initial_guess
         self.success = False
-        self.number_samples = number_samples
-        self.rgr_lengths = rgr_lengths
-        self.rgr_indices_to_remove: set[int] = set()
-        self.remove_rgrs = remove_rgrs
 
     def __call__(self, new: np.ndarray) -> None:
         """Evaluate convergence after an L-BFGS-B iteration.
@@ -2570,8 +2551,7 @@ class Callback:
         Raises
         ------
         StopIteration
-            When convergence is detected or enough RGRs are flagged
-            for removal.
+            When convergence is detected.
         """
         tmp = self.previous / new
         if not np.any(
@@ -2587,23 +2567,3 @@ class Callback:
             raise StopIteration
         else:
             self.previous = new
-
-        if self.remove_rgrs:
-            x = new.reshape((-1, self.number_samples))
-
-            if self.rgr_lengths is None:
-                raise ValueError("rgr_lengths must be provided to remove rgrs.")
-            x_t = x.T
-            canonical_indices = (self.rgr_lengths * x_t).argmax(axis=1)
-            min_activities = np.maximum(
-                x_t[np.arange(x_t.shape[0]), canonical_indices]
-                * self.config.min_activity_fraction,
-                self.config.rgr_min_activity,
-            )
-            self.rgr_indices_to_remove = set(
-                np.where(np.all(x < min_activities, axis=1))[0]
-            )
-            if x.shape[0] * self.config.rgrs_to_remove_fraction < len(
-                self.rgr_indices_to_remove
-            ):
-                raise StopIteration
