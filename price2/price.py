@@ -239,6 +239,7 @@ def run_pipeline(config: Config) -> None:
                 "build multimapping linkage index... ",
                 multimap.build_multimap_index,
                 f"{config.w_dir}/price.db",
+                processes=config.processes,
             )
 
     # --- ORF deconvolution ---

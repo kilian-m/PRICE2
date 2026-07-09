@@ -340,10 +340,74 @@ class Locus:
             self._transcript_breakpoint_index = (bp_starts, bp_ends, bp_sets)
             return self._transcript_breakpoint_index
 
+    @property
+    def transcript_junction_index(self) -> dict[tuple[int, int], tuple]:
+        """Lazily built map from intron to the transcripts that splice it.
+
+        Keyed by ``(donor_exon_end, acceptor_exon_start)`` — the intron of
+        a pair of *consecutive* exons — with the flanking exon bounds
+        attached.  A two-block read maps into a transcript exactly when its
+        gap is one of that transcript's introns and its outer ends stay
+        inside the flanking exons, which is what
+        :meth:`~price2.genomic_region.GenomicRegion.map_to_local` checks
+        one candidate at a time; the index turns that into a dict lookup.
+
+        Excluded from pickle (see :meth:`__getstate__`).
+
+        Returns
+        -------
+        dict
+            ``{(intron_start, intron_end): ((transcript, donor_exon_start,
+            acceptor_exon_end), ...)}``.
+        """
+        try:
+            return self._transcript_junction_index
+        except AttributeError:
+            index: dict[tuple[int, int], list] = {}
+            for transcript in self.transcripts:
+                exons = transcript.exons.intervals
+                for donor, acceptor in zip(exons, exons[1:]):
+                    index.setdefault((donor.end, acceptor.start), []).append(
+                        (transcript, donor.start, acceptor.end)
+                    )
+            self._transcript_junction_index = {
+                k: tuple(v) for k, v in index.items()
+            }
+            return self._transcript_junction_index
+
+    @property
+    def has_abutting_exons(self) -> bool:
+        """Whether any transcript has two exons that touch (``end == start``).
+
+        The single-block read fast path in
+        :func:`~price2.data_collector.collect_mappings` infers "this
+        transcript covers the read within one exon" from the read being
+        covered by a contiguous run of breakpoint steps.  That inference
+        holds only because a transcript's exons are separated by introns,
+        so a contiguous covered stretch cannot straddle two of them.
+        Abutting exons would break it; annotations containing them fall
+        back to :meth:`~price2.genomic_region.GenomicRegion.map_to_local`.
+
+        Excluded from pickle (see :meth:`__getstate__`).
+        """
+        try:
+            return self._has_abutting_exons
+        except AttributeError:
+            self._has_abutting_exons = any(
+                donor.end == acceptor.start
+                for transcript in self.transcripts
+                for donor, acceptor in zip(
+                    transcript.exons.intervals, transcript.exons.intervals[1:]
+                )
+            )
+            return self._has_abutting_exons
+
     def __getstate__(self) -> dict:
         """Return pickle state, excluding lazily-rebuilt caches."""
         state = self.__dict__.copy()
         state.pop("_transcript_breakpoint_index", None)
+        state.pop("_transcript_junction_index", None)
+        state.pop("_has_abutting_exons", None)
         state.pop("_rgr_intervals", None)
         return state
 
