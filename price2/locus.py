@@ -1068,15 +1068,19 @@ class Locus:
                 if not rgr_frame_covpos:
                     continue
 
-                counted = False
-                for rgr, frame, covpos in rgr_frame_covpos:
-                    if rgr.type == "NOISE":
-                        continue
-
-                    well_fitting_rcs[run.id][rgr.id] += rsa.read_count
-                    if not counted:
-                        self.wfr_count += rsa.read_count
-                        counted = True
+                # One RGR can appear under several coverage positions for the
+                # same read (a read spanning a short ORF overlaps both its
+                # start- and stop-codon regions), so deduplicate before
+                # counting: a read contributes its count once per RGR.
+                orf_ids = {
+                    rgr.id
+                    for rgr, _frame, _covpos in rgr_frame_covpos
+                    if rgr.type != "NOISE"
+                }
+                if orf_ids:
+                    self.wfr_count += rsa.read_count
+                for rgr_id in orf_ids:
+                    well_fitting_rcs[run.id][rgr_id] += rsa.read_count
 
         self.wfr_df = (
             pd.DataFrame.from_dict(well_fitting_rcs).replace(np.nan, 0).astype(np.int32)
@@ -1257,9 +1261,19 @@ class Locus:
             for j in range(len(sorted_rgrs) - 1):
                 s.add(sorted_rgrs[j].id)
                 length = len(sorted_rgrs[j]) - len(sorted_rgrs[j + 1])
-                rc = (
+                # Reads compatible with the shorter RGR are almost always also
+                # compatible with the longer one that contains it, making this
+                # difference the count of reads unique to the longer RGR.  The
+                # partial-overlap likelihood test bounds each RGR by its own
+                # coordinates, so compatibility is not strictly monotone and the
+                # difference can turn slightly negative.  A count cannot be
+                # negative, and the negative-binomial denominator
+                # ``X^T(w (y + theta) / (theta + delta))`` would flip sign and
+                # diverge if it were.
+                rc = max(
                     rgr_read_counts[sorted_rgrs[j].id]
-                    - rgr_read_counts[sorted_rgrs[j + 1].id]
+                    - rgr_read_counts[sorted_rgrs[j + 1].id],
+                    0,
                 )
                 egs[frozenset(s)] = (length, rc)
 
