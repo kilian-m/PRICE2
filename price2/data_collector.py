@@ -581,13 +581,16 @@ _WORKER_LOCI: list[Locus] = []
 #: run land on the same worker repeatedly, so the index is parsed once.
 _WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
 
+#: Layout of the collapsed-reads blob.  ``count`` is how many identical
+#: mappings collapse into one key; on deep, non-deduplicated libraries a
+#: single key can exceed 65,535, so it must be wider than ``uint16``.
 _READS_COLUMNS = (
     ("is_first_iv", bool),
     ("start", np.uint32),
     ("end", np.uint32),
     ("untemplated_addition", bool),
     ("unique", bool),
-    ("count", np.uint16),
+    ("count", np.uint32),
 )
 
 

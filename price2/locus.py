@@ -1435,11 +1435,12 @@ class Locus:
                     slot = run_mm.get(gk)
                     if slot is not None:
                         base, weight = slot
-                        # ``read_count`` (the collapsed slot count ``c``) is
-                        # stored as uint16 at collection, so at an extreme
-                        # repeat hotspot it can wrap below ``base`` (an
-                        # uncapped sum); clamp the non-cross-locus remainder
-                        # at zero so the Poisson response never goes negative.
+                        # ``base`` is summed over the spilled alignments at
+                        # indexing time, independently of the collapsed slot
+                        # count ``read_count``; floor the non-cross-locus
+                        # remainder at zero so that any disagreement between
+                        # the two can never drive the Poisson response
+                        # negative.
                         read_count = max(0.0, read_count - base) + weight
                         if build_cache:
                             mi.append(i)
