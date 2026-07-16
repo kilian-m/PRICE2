@@ -90,7 +90,9 @@ class DataCollector:
             bam_ids = set(self.config.bam_ids)
         else:
             bam_ids = {
-                f.split(".")[0] for f in os.listdir(self.bam_dir) if f.endswith(".bam")
+                os.path.splitext(f)[0]
+                for f in os.listdir(self.bam_dir)
+                if f.endswith(".bam")
             }
 
         if os.path.exists(self.db_path):

@@ -310,7 +310,7 @@ def _sample_and_fit_cleavage(
     tuple
         ``(run_id, read_count, sample_bam_path, counted_alns, cleavage_model)``.
     """
-    run_id = bam_file.split(".")[0]
+    run_id = os.path.splitext(bam_file)[0]
     bam_file_path = f"{bam_dir}/{bam_file}"
 
     # Count total reads and derive the downsampling fraction.  ``mapped`` is
