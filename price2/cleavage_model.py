@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 # Minimum number of alignments required for reliable cleavage model estimation.
 _MIN_COUNTED_ALNS: int = 100_000
 
+# Minimum number of start-proximal reads required before `compute_shift` can
+# resolve the P-site phase. The read-start histogram it anchors on is 3-nt
+# periodic, so the true offset (12) competes with an echo one codon away (9);
+# separating them needs enough reads at both. 40k over the +/-100 nt window puts
+# ~1.3k at the P-site even on a library with a weak start peak.
+_MIN_DIST_STARTS: int = 40_000
+
 
 class CleavageModel:
     """Ribosome cleavage model for Ribo-seq reads.
@@ -771,6 +778,7 @@ class CleavageEstimator:
         min_dist_to_start: int = 30,
         min_dist_to_end: int = 30,
         sufficient_counted_alns: int = _MIN_COUNTED_ALNS,
+        sufficient_dist_starts: int = _MIN_DIST_STARTS,
     ) -> None:
         """Collect read-length / frame / UTA counts from a BAM file.
 
@@ -793,7 +801,11 @@ class CleavageEstimator:
         min_dist_to_end : int, optional
             Minimum distance from CDS end to count a read.
         sufficient_counted_alns : int, optional
-            Stop after counting this many alignments.
+            Stop once this many alignments have been tallied into ``table``
+            *and* ``sufficient_dist_starts`` is also met.
+        sufficient_dist_starts : int, optional
+            Stop once this many start-proximal reads have been tallied into
+            ``dist_starts`` *and* ``sufficient_counted_alns`` is also met.
         """
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
         self.dist_starts = np.zeros(shape=(200,), dtype=np.int32)
@@ -802,6 +814,7 @@ class CleavageEstimator:
         self.not_countable = 0
         self.bad_length = 0
         self.counted_alns = 0
+        self.counted_dist_starts = 0
         with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
             for raw_aln in bam.fetch(until_eof=True):
                 if raw_aln.is_unmapped:
@@ -857,8 +870,6 @@ class CleavageEstimator:
                             0,
                         ] += 1
                         self.counted_alns += 1
-                        if self.counted_alns >= sufficient_counted_alns:
-                            break
 
                 # get dist_to_start
                 for tr in transcript_candidates:
@@ -884,6 +895,20 @@ class CleavageEstimator:
                 else:
                     if isinstance(dist_to_start, int) and (-100 < dist_to_start < 100):
                         self.dist_starts[dist_to_start + 100] += 1
+                        self.counted_dist_starts += 1
+
+                # Both tallies must be satisfied before the scan stops. `table`
+                # accepts reads anywhere in the CDS body; `dist_starts` accepts only
+                # the ~4% lying within 100 nt of a start, so it fills ~27x slower.
+                # Stopping on `counted_alns` alone starved it (~3.7k reads, ~120 at
+                # the P-site) and `compute_shift` then anchored the phase on noise --
+                # picking the -9 periodic echo over the true -12 on libraries whose
+                # start-codon peak is not dominant.
+                if (
+                    self.counted_alns >= sufficient_counted_alns
+                    and self.counted_dist_starts >= sufficient_dist_starts
+                ):
+                    break
 
         if self.counted_alns < sufficient_counted_alns:
             logger.warning(
