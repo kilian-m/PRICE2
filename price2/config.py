@@ -260,12 +260,33 @@ class Config:
     #:      solve is sparser (~19% fewer ORFs on Yewdell). ``lam`` was
     #:      recalibrated for it (100 -> 10) via an AIC/BIC scan; see
     #:      playground/lambda_aic.
-    #:  (2) on CPU it is slower than L-BFGS-B (tight convergence costs iterations);
-    #:      enable ``mu_gpu``/``mu_broker`` (needs PyTorch+CUDA) for the speedup.
+    #:  (2) on CPU it is slower than L-BFGS-B (tight convergence costs iterations).
     #: See playground/deconvolution_performance.
     inner_solver: str = "mu"
+    #
+    # GPU offload of the multiplicative updates (``mu_gpu`` / ``mu_broker``)
+    # -------------------------------------------------------------------
+    # BOTH ARE OFF BY DEFAULT: in the tests run so far the GPU did not speed the
+    # pipeline up meaningfully. The individual deconvolution solves are small
+    # (sparse mat-vecs over a few 10k rows), so kernel-launch and host<->device
+    # transfer overhead eats most of the per-solve gain, and the CPU worker pool
+    # already parallelises across loci — the end-to-end wall time barely moves,
+    # while the GPU paths add CUDA contexts, VRAM pressure and (for the broker)
+    # a shared-memory IPC layer. Turn them on only if you have re-measured on
+    # your own data and see a real win.
+    #
+    # Requirements when you DO enable them: an NVIDIA GPU + driver and PyTorch
+    # built against CUDA (developed/tested with torch 2.5.1+cu121). torch is NOT
+    # a declared dependency — it is absent from pyproject.toml and price2.yml,
+    # so install it separately, e.g.
+    #     pip install torch --index-url https://download.pytorch.org/whl/cu121
+    # Both paths degrade gracefully: if torch or CUDA is unavailable the solves
+    # silently fall back to the NumPy CPU multiplicative updates.
+    #
     #: Use the GPU (PyTorch + CUDA) multiplicative-update path when available
     #: and the system is at least ``mu_gpu_min_rows`` rows; else run on CPU.
+    #: Gives each worker process its own CUDA context (VRAM scales with
+    #: ``processes``); see ``mu_broker`` for the shared-context variant.
     mu_gpu: bool = False
     #: Only offload to the GPU above this row count (transfer overhead makes
     #: small systems faster on the CPU).
@@ -282,7 +303,9 @@ class Config:
     #: playground/deconvolution_performance/gpu_broker). Falls back to the
     #: configured per-worker path (CPU MU, or per-worker GPU when ``mu_gpu``)
     #: if the broker cannot start (no PyTorch/CUDA).
-    mu_broker: bool = True
+    #: OFF by default — see the GPU-offload note above ``mu_gpu``: no meaningful
+    #: end-to-end speedup in the small tests, and it needs a CUDA PyTorch.
+    mu_broker: bool = False
     #: Number of broker PROCESSES (independent CUDA contexts / GILs). A single
     #: process is GIL-bound and cannot saturate the GPU or feed a large worker
     #: pool; a few processes fix that while keeping the context count bounded.
