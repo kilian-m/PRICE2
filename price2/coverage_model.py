@@ -725,3 +725,26 @@ class CoverageModel:
         if position == CoveragePosition.stop:
             return self.stop_factor
         return 1.0
+
+    def distance(self, other: "CoverageModel") -> float:
+        """Log-ratio distance between this coverage model and *other*.
+
+        The start- and stop-codon enrichment factors are multiplicative
+        ratios (always ``>= 1``), so they are compared in log space: a
+        factor of 2 vs 4 counts the same as 4 vs 2, and equal factors give
+        ``0``.  The two per-position absolute log-ratios are summed.
+
+        Parameters
+        ----------
+        other : CoverageModel
+            Model to compare against.
+
+        Returns
+        -------
+        float
+            ``|log2(start) - log2(start')| + |log2(stop) - log2(stop')|``,
+            ``0`` exactly when both factors match.
+        """
+        d_start = abs(np.log2(self.start_factor) - np.log2(other.start_factor))
+        d_stop = abs(np.log2(self.stop_factor) - np.log2(other.stop_factor))
+        return float(d_start + d_stop)

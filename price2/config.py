@@ -180,13 +180,13 @@ class Config:
     # Coverage filter                                                      #
     # ------------------------------------------------------------------ #
     coverage_filter: bool = True
-    min_well_fitting_reads_per_length: float = 0.1
+    min_well_fitting_reads_per_length: float = 0.01
 
     # ------------------------------------------------------------------ #
     # Deconvolution filter                                                 #
     # ------------------------------------------------------------------ #
     deconvolution_filter: bool = True
-    deconvolution_filter_min_activity: float = 0.1
+    deconvolution_filter_min_activity: float = 0.01
 
     # ------------------------------------------------------------------ #
     # Main optimisation                                                    #

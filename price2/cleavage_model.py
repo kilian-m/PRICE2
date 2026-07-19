@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 from numba import njit, prange
+from scipy.spatial.distance import jensenshannon
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
@@ -23,13 +24,6 @@ logger = logging.getLogger(__name__)
 
 # Minimum number of alignments required for reliable cleavage model estimation.
 _MIN_COUNTED_ALNS: int = 100_000
-
-# Minimum number of start-proximal reads required before `compute_shift` can
-# resolve the P-site phase. The read-start histogram it anchors on is 3-nt
-# periodic, so the true offset (12) competes with an echo one codon away (9);
-# separating them needs enough reads at both. 40k over the +/-100 nt window puts
-# ~1.3k at the P-site even on a library with a weak start peak.
-_MIN_DIST_STARTS: int = 40_000
 
 
 class CleavageModel:
@@ -186,6 +180,45 @@ class CleavageModel:
         pr = np.random.choice(np.arange(len(self.pr)), size=size, p=self.pr)
         u = np.random.choice([True, False], size=size, p=[self.pu, 1 - self.pu])
         return (pl, pr, u)
+
+    def distance(self, other: "CleavageModel") -> float:
+        """Jensen-Shannon distance between this model and *other*.
+
+        Quantifies how dissimilar two cleavage models are by summing the
+        Jensen-Shannon distances between their left-cleavage (``pl``),
+        right-cleavage (``pr``) and untemplated-addition (``pu``)
+        distributions.  Each component is computed with
+        :func:`scipy.spatial.distance.jensenshannon` (base 2), so it lies
+        in ``[0, 1]``; the returned sum therefore lies in ``[0, 3]`` and is
+        ``0`` exactly when the two models are identical.
+
+        The measure is bin-blind: unlike an optimal-transport distance, a
+        peak shifted by one position and a peak shifted by ten can score
+        identically.  It is symmetric and stays finite even for the sparse,
+        regularised distributions produced by
+        :meth:`CleavageEstimator.regularize` -- the Jensen-Shannon mixture
+        is positive wherever either input is, so no smoothing is needed.
+
+        Parameters
+        ----------
+        other : CleavageModel
+            Model to compare against.
+
+        Returns
+        -------
+        float
+            ``JS(pl, pl') + JS(pr, pr') + JS(pu, pu')``, in ``[0, 3]``.
+        """
+        d_pl = _js_distance(self.pl, other.pl)
+        d_pr = _js_distance(self.pr, other.pr)
+        d_pu = float(
+            jensenshannon(
+                [self.pu, 1.0 - self.pu],
+                [other.pu, 1.0 - other.pu],
+                base=2,
+            )
+        )
+        return d_pl + d_pr + d_pu
 
     def get_high_prob_indices(self, prob_sum: float = 0.3) -> list[tuple[int, ...]]:
         """Return CDS LUT indices covering the highest-probability entries.
@@ -581,6 +614,33 @@ class CleavageModel:
             return (likelihoods + likelihoods_ua).argmax() * 3 + f0
 
 
+def _js_distance(p: np.ndarray, q: np.ndarray) -> float:
+    """Base-2 Jensen-Shannon distance between two positional distributions.
+
+    The arrays are zero-padded to a common length before comparison so
+    that index ``i`` denotes the same position in both -- appending zeros
+    is correct because the index of a cleavage distribution *is* the
+    position.
+
+    Parameters
+    ----------
+    p, q : np.ndarray
+        Non-negative weight vectors (need not be normalised;
+        :func:`scipy.spatial.distance.jensenshannon` normalises them).
+
+    Returns
+    -------
+    float
+        Jensen-Shannon distance in ``[0, 1]``.
+    """
+    n = max(len(p), len(q))
+    pp = np.zeros(n)
+    qq = np.zeros(n)
+    pp[: len(p)] = p
+    qq[: len(q)] = q
+    return float(jensenshannon(pp, qq, base=2))
+
+
 @njit(cache=True)
 def read_in_cds_likelihood(
     pl: np.ndarray,
@@ -777,14 +837,17 @@ class CleavageEstimator:
         max_considered_length: int = 40,
         min_dist_to_start: int = 30,
         min_dist_to_end: int = 30,
-        sufficient_counted_alns: int = _MIN_COUNTED_ALNS,
-        sufficient_dist_starts: int = _MIN_DIST_STARTS,
+        min_counted_alns: int = _MIN_COUNTED_ALNS,
     ) -> None:
         """Collect read-length / frame / UTA counts from a BAM file.
 
-        Iterates over uniquely-mapped reads that fall within CDS
-        regions and tallies their length, reading frame and
-        untemplated-addition status into ``self.table``.
+        Iterates over *every* uniquely-mapped read that falls within a CDS
+        region and tallies its length, reading frame and untemplated-addition
+        status into ``self.table``, plus its read-start-to-CDS-start distance
+        into ``self.dist_starts``.  The whole file is scanned to convergence on
+        the true distributions: sampling only a genomic prefix of a
+        coordinate-sorted BAM would bias the counts towards the reads at the
+        start of the file, so any downsampling must happen before this call.
 
         Parameters
         ----------
@@ -800,12 +863,9 @@ class CleavageEstimator:
             Minimum distance from CDS start to count a read.
         min_dist_to_end : int, optional
             Minimum distance from CDS end to count a read.
-        sufficient_counted_alns : int, optional
-            Stop once this many alignments have been tallied into ``table``
-            *and* ``sufficient_dist_starts`` is also met.
-        sufficient_dist_starts : int, optional
-            Stop once this many start-proximal reads have been tallied into
-            ``dist_starts`` *and* ``sufficient_counted_alns`` is also met.
+        min_counted_alns : int, optional
+            Warn when fewer than this many alignments are tallied into
+            ``table``; below it the dataset is too small for a reliable fit.
         """
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
         self.dist_starts = np.zeros(shape=(200,), dtype=np.int32)
@@ -814,7 +874,6 @@ class CleavageEstimator:
         self.not_countable = 0
         self.bad_length = 0
         self.counted_alns = 0
-        self.counted_dist_starts = 0
         with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
             for raw_aln in bam.fetch(until_eof=True):
                 if raw_aln.is_unmapped:
@@ -895,22 +954,8 @@ class CleavageEstimator:
                 else:
                     if isinstance(dist_to_start, int) and (-100 < dist_to_start < 100):
                         self.dist_starts[dist_to_start + 100] += 1
-                        self.counted_dist_starts += 1
 
-                # Both tallies must be satisfied before the scan stops. `table`
-                # accepts reads anywhere in the CDS body; `dist_starts` accepts only
-                # the ~4% lying within 100 nt of a start, so it fills ~27x slower.
-                # Stopping on `counted_alns` alone starved it (~3.7k reads, ~120 at
-                # the P-site) and `compute_shift` then anchored the phase on noise --
-                # picking the -9 periodic echo over the true -12 on libraries whose
-                # start-codon peak is not dominant.
-                if (
-                    self.counted_alns >= sufficient_counted_alns
-                    and self.counted_dist_starts >= sufficient_dist_starts
-                ):
-                    break
-
-        if self.counted_alns < sufficient_counted_alns:
+        if self.counted_alns < min_counted_alns:
             logger.warning(
                 "Not enough alignments counted: %d < %d for %s\n"
                 "  not_unique: %d\n"
@@ -918,7 +963,7 @@ class CleavageEstimator:
                 "  outside_cds: %d\n"
                 "  bad_length: %d",
                 self.counted_alns,
-                sufficient_counted_alns,
+                min_counted_alns,
                 sample_bam_path,
                 self.not_unique,
                 self.not_countable,
