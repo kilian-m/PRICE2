@@ -169,7 +169,19 @@ class Config:
     #: EM iteration.  Reuse amortises it (measured ``0.70 + 1.97/worker_max_tasks``
     #: CPU-seconds per locus) while still recycling processes often enough to
     #: bound RSS growth from the occasional very large locus.
-    worker_max_tasks: int = 50
+    #:
+    #: Retuned 50 -> 1000: that ``0.70`` per-locus figure predates the
+    #: ``eg_cache`` EM light M-step, which reduced the per-locus work of an EM
+    #: iteration to a few milliseconds (a cached bincount + a small MU solve).
+    #: Against that, recycling every 50 loci means a worker spends far more time
+    #: respawning than computing: at ~13K slot loci per light iteration that is
+    #: ~260 respawns (~2 CPU-s each) ≈ ~13 s of wall per iteration. Measured on
+    #: the Yewdell-scale 3-BAM set (playground/pruning): dropping the recycling
+    #: cut whole-deconvolution wall 964 s -> 454 s (2.1x, identical call set).
+    #: 1000 still recycles ~13x/light-iteration and ~48x in the final full pass
+    #: — enough to bound RSS from heavy loci — while making the respawn cost
+    #: negligible against the tiny light-pass work.
+    worker_max_tasks: int = 1000
 
     # ------------------------------------------------------------------ #
     # Transcript pre-filtering                                             #
@@ -368,6 +380,15 @@ class Config:
     #: intermediate pass loads it alone rather than unpickling the locus.
     #: Costs ~65% more space per prepared locus (~95 KB on top of ~148 KB).
     eg_cache: bool = True
+    #: Prune ORF candidates that the first EM light M-step finds inactive
+    #: (activity below ``rgr_min_activity`` in *every* run) so that all later
+    #: EM iterations and the final full pass work on the smaller design matrix.
+    #: A runtime heuristic: such ORFs seldom revive in later M-steps. When it
+    #: fires the locus's equivalence groups are collapsed and the routing cache
+    #: is rebuilt before the prepared state is persisted. This CHANGES the call
+    #: set slightly versus carrying every candidate through the EM (a pruned
+    #: ORF cannot come back), so it is kept separable for A/B testing.
+    em_prune_after_first_mstep: bool = True
     #: Background rate for a multimapping read's alignments that fall
     #: outside any annotated locus.  ``0.0`` (default) means "loci-only":
     #: weight is normalised across the annotated loci a read hits and

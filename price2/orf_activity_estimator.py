@@ -157,6 +157,41 @@ class ORFActivityEstimator:
                 broker.stop()
             self.config.mu_broker_req_q = None
 
+    @contextmanager
+    def worker_pool(self):
+        """Hold one process pool + log listener open across all EM M-steps.
+
+        Each :meth:`run_orf_deconvolution` would otherwise spawn a fresh worker
+        pool, ``multiprocessing`` manager and log ``QueueListener`` and tear
+        them all down again.  The multimapping EM runs ~20 light M-steps plus
+        the final full pass; creating and joining the pool + manager each time
+        costs ~1 s of wall per iteration.  Wrapping the whole loop in this
+        context pays it once.  Nested :meth:`run_orf_deconvolution` calls detect
+        ``self._pool`` and schedule onto it instead of making their own.
+        """
+        price2_logger = logging.getLogger("price2")
+        manager = mp.Manager()
+        log_queue = manager.Queue()
+        listener = logging.handlers.QueueListener(
+            log_queue, *price2_logger.handlers, respect_handler_level=True
+        )
+        listener.start()
+        pool = ProcessPool(
+            max_workers=self.config.processes,
+            max_tasks=self.config.worker_max_tasks,
+        )
+        self._pool = pool
+        self._log_queue = log_queue
+        try:
+            yield
+        finally:
+            pool.close()
+            pool.join()
+            listener.stop()
+            manager.shutdown()
+            self._pool = None
+            self._log_queue = None
+
     def run_orf_deconvolution(
         self,
         em_iteration: int | None = None,
@@ -249,60 +284,72 @@ class ORFActivityEstimator:
             broker = self._start_gpu_broker()
 
         price2_logger = logging.getLogger("price2")
-        manager = mp.Manager()
-        log_queue = manager.Queue()
-        listener = logging.handlers.QueueListener(
-            log_queue, *price2_logger.handlers, respect_handler_level=True
-        )
-        listener.start()
-        try:
-            with ProcessPool(
+        # Reuse a pool + log listener held open by the caller across all EM
+        # M-steps (see :meth:`worker_pool`); otherwise create a private one for
+        # this single call (the classic single-pass path).
+        shared_pool = getattr(self, "_pool", None)
+        own_pool = shared_pool is None
+        if own_pool:
+            manager = mp.Manager()
+            log_queue = manager.Queue()
+            listener = logging.handlers.QueueListener(
+                log_queue, *price2_logger.handlers, respect_handler_level=True
+            )
+            listener.start()
+            pool = ProcessPool(
                 max_workers=self.config.processes,
                 max_tasks=self.config.worker_max_tasks,
-            ) as pool:
-                futures = {
-                    pool.schedule(
-                        process_loc,
-                        args=[
-                            (
-                                locus_id,
-                                self.config,
-                                log_queue,
-                                em_iteration,
-                                em_final,
-                            )
-                        ],
-                        timeout=self.config.timeout,
-                    ): locus_id
-                    for locus_id in loci_ids
-                }
+            )
+        else:
+            pool = shared_pool
+            log_queue = self._log_queue
+        try:
+            futures = {
+                pool.schedule(
+                    process_loc,
+                    args=[
+                        (
+                            locus_id,
+                            self.config,
+                            log_queue,
+                            em_iteration,
+                            em_final,
+                        )
+                    ],
+                    timeout=self.config.timeout,
+                ): locus_id
+                for locus_id in loci_ids
+            }
 
-                results = {}
-                with logging_redirect_tqdm(loggers=[price2_logger]):
-                    for fut in as_completed(futures):
-                        loc_id = futures[fut]
-                        try:
-                            result = fut.result()
-                            if not self.config.save_memory:
-                                results[loc_id] = result
-                        except (TimeoutError, Exception) as e:
-                            stack = traceback.format_exc()
-                            logger.error("locus %s failed: %s", loc_id, e)
-                            lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
-                            with lock:
-                                with open(f"{ra_dir}/failed_loci.txt", "a") as f:
-                                    f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
-                            if not self.config.save_memory:
-                                results[loc_id] = e
-                        finally:
-                            pbar.update(1)
+            results = {}
+            with logging_redirect_tqdm(loggers=[price2_logger]):
+                for fut in as_completed(futures):
+                    loc_id = futures[fut]
+                    try:
+                        result = fut.result()
+                        if not self.config.save_memory:
+                            results[loc_id] = result
+                    except (TimeoutError, Exception) as e:
+                        stack = traceback.format_exc()
+                        logger.error("locus %s failed: %s", loc_id, e)
+                        lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
+                        with lock:
+                            with open(f"{ra_dir}/failed_loci.txt", "a") as f:
+                                f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
+                        if not self.config.save_memory:
+                            results[loc_id] = e
+                    finally:
+                        pbar.update(1)
         finally:
-            listener.stop()
-            manager.shutdown()
+            if own_pool:
+                pool.close()
+                pool.join()
+                listener.stop()
+                manager.shutdown()
             if broker is not None:
                 broker.stop()
                 self.config.mu_broker_req_q = None
-            # A pool owned by the caller stays up for the next M-step.
+            # A caller-owned shared pool stays up for the next M-step.
 
         pbar.close()
 
@@ -397,9 +444,17 @@ def process_loc(arguments: tuple):
         performance_measurements["start"] = loc.iv.start
         performance_measurements["end"] = loc.iv.end
         performance_measurements["db_time"] = time.time() - t1
-        # Reads are excluded from the cache blob; reload them.
+        # Reads are excluded from the cache blob.  In an intermediate light
+        # M-step (em_iteration > 0) the response y is rebuilt entirely from the
+        # routing cache (``cache.counts0`` + slot weights); the reads themselves
+        # are only touched for a length sanity check, so skip the
+        # reload+unpickle there.  Iteration 0 (still building the cache) and the
+        # final full pass both genuinely need the reads.  (A light-pass cache
+        # miss falls through to the full-prepare branch below, which loads its
+        # own reads, so this only elides the reload when the cache is present.)
         t1 = time.time()
-        loc.get_reads_from_db(db_path)
+        if not (em_light and em_iteration > 0):
+            loc.get_reads_from_db(db_path)
         performance_measurements["load_reads_time"] = time.time() - t1
         # Keep perf columns aligned with the full-prepare path (the skipped
         # stages report zero time).  A light locus carries no rgr_set/egs, so
@@ -576,17 +631,32 @@ def process_loc(arguments: tuple):
         rc for _, rc in loc.counted_reads.items()
     )
 
-    # --- Cache prepared state for subsequent EM iterations ---
-    if needs_prepared_save:
-        multimap.save_prepared_locus(db_path, loc_id, loc)
-        if use_eg_cache:
-            multimap.save_locus_cache(db_path, loc_id, loc)
-
     # --- EM light M-step: one Huber reweight, emit λ + activities, stop ---
     if em_light:
         loc.deconvolve(
             config, runs=runs, max_outer=config.em_huber_steps, prune=False
         )
+        # After the first M-step, drop ORFs that are inactive (activity below
+        # ``rgr_min_activity``) in every run.  These rarely revive in later
+        # M-steps, so pruning them now shrinks the design matrix that every
+        # subsequent EM iteration and the final full pass rebuild.  The routing
+        # cache, equivalence groups and prepared-locus blob are all rebuilt to
+        # match before they are persisted below.  Flag-gated and only ever
+        # active on iteration 0 (``needs_prepared_save`` is set there only).
+        if needs_prepared_save and getattr(
+            config, "em_prune_after_first_mstep", False
+        ):
+            performance_measurements["mstep_pruned_orf_count"] = (
+                loc.prune_inactive_orfs(config, runs, mm_data)
+            )
+
+        # Cache the prepared state (now reflecting any pruning) for the
+        # subsequent EM iterations and the final full pass.
+        if needs_prepared_save:
+            multimap.save_prepared_locus(db_path, loc_id, loc)
+            if use_eg_cache:
+                multimap.save_locus_cache(db_path, loc_id, loc)
+
         lambdas = loc.compute_multimap_lambdas(runs)
         multimap.write_locus_em_output(
             db_path,

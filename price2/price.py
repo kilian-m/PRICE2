@@ -314,8 +314,10 @@ def _run_em_deconvolution(
 
     last_it = 0
     # One broker pool for the whole EM: every M-step would otherwise rebuild it,
-    # paying a CUDA context per broker process per iteration.
-    with estimator.gpu_broker_pool():
+    # paying a CUDA context per broker process per iteration.  Likewise hold one
+    # worker pool + log listener open across every M-step (and the final pass)
+    # instead of spawning and joining a fresh 40-worker pool + manager each time.
+    with estimator.gpu_broker_pool(), estimator.worker_pool():
         for it in range(config.em_max_iter):
             last_it = it
             _timed(

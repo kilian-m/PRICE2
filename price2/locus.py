@@ -1603,13 +1603,22 @@ class Locus:
         self.counted_reads = {}
         self.uncounted_reads = 0.0
 
+        rsas = getattr(self, "rsas_dict", None)
         for run in runs:
             run_id = run.id
-            if len(self.rsas_dict[run_id]) != cache.n_reads[run_id]:
+            # The reads are only needed for this length sanity check here; an
+            # intermediate light M-step skips loading them (the response is
+            # rebuilt from ``cache.counts0``), so the check only runs when the
+            # reads were actually loaded.
+            if (
+                rsas is not None
+                and run_id in rsas
+                and len(rsas[run_id]) != cache.n_reads[run_id]
+            ):
                 raise RuntimeError(
                     f"locus {self.id}: cached routing has "
                     f"{cache.n_reads[run_id]} reads for run {run_id} but "
-                    f"{len(self.rsas_dict[run_id])} were loaded"
+                    f"{len(rsas[run_id])} were loaded"
                 )
             counts = cache.counts0[run_id].copy()
             run_mm = mm_data.get(run_id) if mm_data else None
@@ -2238,6 +2247,99 @@ class Locus:
             new_egs[run] = new_run_egs
 
         self.egs = new_egs
+
+    def prune_inactive_orfs(
+        self,
+        config: Config,
+        runs: list[RiboSeqRun],
+        mm_data: dict | None = None,
+    ) -> int:
+        """Drop ORFs inactive in every run after an EM light M-step.
+
+        A runtime heuristic for the multimapping EM: once the first light
+        M-step has produced activity estimates, ORF-type RGRs whose activity
+        is below ``config.rgr_min_activity`` in *every* run are very unlikely
+        to revive in later M-steps.  Removing them here shrinks the design
+        matrix that all subsequent EM iterations and the final full pass
+        rebuild.
+
+        Unlike the post-solve pruning in :meth:`deconvolve` (which also removes
+        ORFs falling below a fraction of the locus's canonical activity), this
+        uses the plain ``rgr_min_activity`` floor only, so it is deliberately
+        conservative — it removes an ORF only when no run gives it appreciable
+        activity.
+
+        After removing the RGRs (via :meth:`remove_rgrs`, which re-indexes the
+        survivors, re-slices :attr:`result` and collapses the equivalence
+        groups) the read-routing cache is rebuilt over the pruned equivalence
+        groups so that the prepared-locus blob and the
+        :class:`EgRoutingCache` persisted for later passes describe the smaller
+        system.
+
+        Parameters
+        ----------
+        config : Config
+            Provides ``rgr_min_activity``.
+        runs : list[RiboSeqRun]
+            Ribo-seq runs, in the order used to build :attr:`result`.
+        mm_data : dict, optional
+            This locus's multimapping-slot data, forwarded to the cache rebuild
+            so fractional weights and slot routing are recorded.
+
+        Returns
+        -------
+        int
+            Number of ORF RGRs removed.
+        """
+        result = getattr(self, "result", None)
+        if result is None:
+            return 0
+
+        # ``result`` rows are keyed by ``rgr.index`` (identical to the routing
+        # cache's column order), so the inactive mask indexes RGRs directly.
+        inactive = np.all(result < config.rgr_min_activity, axis=1)
+        indices_to_remove = set(np.nonzero(inactive)[0].tolist())
+        if not indices_to_remove:
+            return 0
+        rgrs_to_remove = {
+            rgr
+            for rgr in self.rgr_set
+            if rgr.type == "ORF" and rgr.index in indices_to_remove
+        }
+        if not rgrs_to_remove:
+            return 0
+
+        # Removes the RGRs, re-indexes survivors, re-slices ``result`` and
+        # collapses the equivalence groups (dropping the removed RGRs from every
+        # group key).  Also clears ``eg_cache`` / ``_eg_y``.
+        self.remove_rgrs(rgrs_to_remove, runs=runs)
+
+        # Keep the transcripts' ORF views consistent with the pruned RGR set
+        # (mirrors the pre-``make_equivalence_groups`` step of a full prepare),
+        # so the persisted locus is self-consistent.
+        for tr in self.transcripts:
+            tr.update_with_filtered_orfs(self.rgr_set)
+
+        # Rebuild the routing cache over the collapsed equivalence groups.
+        # ``collapse_egs`` already produced the correct group geometry and
+        # merged read counts, but the per-read routing arrays the cache stores
+        # must be re-derived from the reads.  Re-running ``assign_reads_to_egs``
+        # with ``build_cache=True`` does exactly that; the group read counts are
+        # zeroed first (and the plain-dict conversion restores the KeyError-
+        # based "uncounted" handling that ``collapse_egs``'s ``defaultdict``
+        # would otherwise mask) so the reassignment recomputes them cleanly.
+        for run in runs:
+            run_egs = self.egs[run]
+            for eg in run_egs.values():
+                eg.read_count = 0
+            self.egs[run] = dict(run_egs)
+            run.read_count = 0
+        self.read_counts = {}
+        self.counted_reads = {}
+        self.uncounted_reads = 0
+        self.assign_reads_to_egs(runs, mm_data, build_cache=True)
+
+        return len(rgrs_to_remove)
 
     def likelihood_ratio_filtering(
         self,
