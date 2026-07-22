@@ -451,13 +451,32 @@ class CleavageModel:
 
         ax0, ax1, ax2 = axes[0], axes[1], axes[2]
 
-        # Panel 1: read length / frame distribution
+        # Panel 1: read length / reading-frame distribution.
+        #
+        # ``self.table`` is in the EM's frame convention: after
+        # :meth:`CleavageEstimator.correct_table` column ``c`` holds the reads
+        # whose P-site offset is ``c`` (mod 3).  What this panel should show,
+        # though, is the *genomic* reading frame of the read start relative to
+        # the CDS start (``read_start_offset % 3``) -- the phase the reads
+        # actually fall into: a 12-nt cleavage distance is frame 0, 13 nt is
+        # frame 2, 11 nt is frame 1.  Genomic frame ``g`` lives in column
+        # ``(-g) % 3``, so frames 0/1/2 read off columns 0/2/1.
+        #
+        # We also sum over the untemplated-addition axis.  The frame is taken
+        # from the mapping portion of the read (the extra 5' base is soft-clipped
+        # under Local, or trimmed under EndToEnd, before ``genomic_region`` is
+        # built), so a detected-UA read already sits in its true frame.  Dropping
+        # those reads -- as an ``oua == 0`` slice does -- hides almost all of the
+        # signal in a high-UA library: e.g. SRR7240724 (pu = 0.99) has its
+        # genuine frame-0 peak all but vanish, leaving only the misdetection
+        # shadow behind.
         lo, hi = 20, min(40, self.table.shape[0])
         x = np.arange(lo, hi)
         bar_w = 0.25
-        ax0.bar(x - bar_w, self.table[lo:hi, 0, 0, 0], bar_w, label="frame 0")
-        ax0.bar(x, self.table[lo:hi, 1, 0, 0], bar_w, label="frame 1")
-        ax0.bar(x + bar_w, self.table[lo:hi, 2, 0, 0], bar_w, label="frame 2")
+        counts = self.table[lo:hi, :, :, 0].sum(axis=2)  # (n_lengths, 3) by column
+        ax0.bar(x - bar_w, counts[:, 0], bar_w, label="frame 0")
+        ax0.bar(x, counts[:, 2], bar_w, label="frame 1")
+        ax0.bar(x + bar_w, counts[:, 1], bar_w, label="frame 2")
         ax0.set_xlabel("read length")
         ax0.set_ylabel("read count")
         ax0.set_title("read length / frame distribution")
