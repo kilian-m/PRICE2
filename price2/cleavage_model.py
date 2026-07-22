@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # Minimum number of alignments required for reliable cleavage model estimation.
 _MIN_COUNTED_ALNS: int = 100_000
 
+# Plausible P-site offsets (read-start-to-P-site distance) for a healthy
+# Ribo-seq dataset.  12 is canonical, but 11 and 13 are common and equally
+# valid depending on read-length range and RNase digestion; a peak outside this
+# range signals an unusual or low-quality library.
+_PLAUSIBLE_P_SITE_OFFSETS: frozenset[int] = frozenset({11, 12, 13})
+
 
 class CleavageModel:
     """Ribosome cleavage model for Ribo-seq reads.
@@ -1020,10 +1026,12 @@ class CleavageEstimator:
 
         max_pos = int(np.argmax(self.best_pl))
         max_prob = float(self.best_pl[max_pos])
-        if max_pos != 12:
+        if max_pos not in _PLAUSIBLE_P_SITE_OFFSETS:
             logger.warning(
-                "Unusual cleavage model: Upstream cleavage peak is at position %d, expected 12. ",
+                "Unusual cleavage model: Upstream cleavage peak is at position %d, "
+                "expected one of %s. ",
                 max_pos,
+                sorted(_PLAUSIBLE_P_SITE_OFFSETS),
             )
         if max_prob < 0.3:
             logger.warning(
@@ -1052,57 +1060,144 @@ class CleavageEstimator:
         self.best_pl = select_and_scale(self.best_pl.copy(), keep_prob)
         self.best_pr = select_and_scale(self.best_pr.copy(), keep_prob)
 
-    def init_peak(
-        self, range_start: int = -25, range_end: int = -5, default: int = 12
+    def _height(self, offset: int) -> float:
+        """Read-start count at ``offset`` nt upstream of the CDS start.
+
+        ``dist_starts`` index 100 holds a read start sitting on the CDS start,
+        so an offset of ``o`` upstream sits at index ``100 - o``.
+        """
+        dist_starts = self.dist_starts
+        idx = 100 - offset
+        return float(dist_starts[idx]) if 0 <= idx < len(dist_starts) else 0.0
+
+    def _reading_frame(self, min_offset: int = 6, max_offset: int = 25) -> int:
+        """Reading frame (``offset % 3``) of the P-site relative to the CDS.
+
+        The read-start metagene around the CDS start often carries a second comb
+        of peaks one nt away from the true one -- the untemplated-addition
+        shadow, whose reads map one base off after their extra 5' base is soft
+        clipped (or, under ``EndToEnd``, matched).  That shadow can be as tall as
+        or taller than the real comb (e.g. SRR13202602), so the frame cannot be
+        read off the single tallest bar.  Cross-correlating the *whole* fitted
+        ``pl`` against the start-region histogram instead integrates over the
+        comb, and the frame whose correlation is largest is the true one.
+
+        Parameters
+        ----------
+        min_offset, max_offset : int, optional
+            Inclusive window of read-start-to-CDS-start distances to score.
+
+        Returns
+        -------
+        int
+            The P-site reading frame (0, 1 or 2).
+        """
+        pl = self.best_pl
+        peak = int(np.argmax(pl))
+        k = np.arange(len(pl))
+
+        def correlation(offset: int) -> float:
+            # Place ``pl`` with its peak at ``offset`` and correlate it with the
+            # metagene, counting only positions inside the start-region window.
+            idx = 100 - (offset - peak + k)
+            inside = (100 - max_offset <= idx) & (idx <= 100 - min_offset)
+            return float(np.dot(pl[inside], self.dist_starts[idx[inside]]))
+
+        offsets = range(min_offset, max_offset + 1)
+        frame_score = {
+            f: max((correlation(o) for o in offsets if o % 3 == f), default=0.0)
+            for f in range(3)
+        }
+        return max(frame_score, key=frame_score.get)
+
+    def _onset_offset(
+        self,
+        frame: Optional[int] = None,
+        min_offset: int = 6,
+        max_offset: int = 25,
+        default: int = 12,
     ) -> int:
+        """Read-start-to-CDS-start distance at the translation onset.
+
+        Within a reading frame the metagene is a 3-nt-periodic comb of peaks --
+        the start codon and every downstream in-frame codon -- of similar
+        height, so a plain ``argmax`` often lands on a downstream codon and
+        reports an offset that is 3, 6, ... nt too small (e.g. 10 instead of
+        13).  The start codon is the *onset* of that comb: the in-frame position
+        whose count jumps up the most over its next-upstream (``offset + 3``)
+        neighbour, which still lies in the 5' UTR and is near-empty.  Selecting
+        on that jump rather than on the raw height recovers the true offset even
+        when two in-frame peaks are nearly tied.
+
+        Parameters
+        ----------
+        frame : int or None, optional
+            Reading frame to search.  When ``None`` the frame is taken from the
+            tallest peak (used only to seed the EM, before ``pl`` is fitted);
+            :meth:`compute_shift` passes the frame from :meth:`_reading_frame`.
+        min_offset, max_offset : int, optional
+            Inclusive range of read-start-to-CDS-start distances to search.
+        default : int, optional
+            Returned when no start-distance histogram was collected, or it is
+            empty across the search range (the canonical P-site offset).
+
+        Returns
+        -------
+        int
+            Offset from the read start to the P-site at the translation onset.
+        """
+        dist_starts = getattr(self, "dist_starts", None)
+        if dist_starts is None:
+            return default
+
+        offsets = range(min_offset, max_offset + 1)
+        if sum(self._height(o) for o in offsets) == 0:
+            return default
+
+        if frame is None:
+            frame = max(offsets, key=self._height) % 3
+        comb = [o for o in offsets if o % 3 == frame % 3]
+        return max(comb, key=lambda o: self._height(o) - self._height(o + 3))
+
+    def init_peak(self, default: int = 12) -> int:
         """Expected position of the ``pl`` peak, for initialising the EM.
 
-        The most frequent distance from a read start to the CDS start is, up to
-        sign, the most likely left cleavage.  Falls back to *default* when no
-        start-distance histogram was collected.
+        Delegates to :meth:`_onset_offset`; the most frequent distance from a
+        read start to the CDS start is, up to sign, the most likely left
+        cleavage.  ``pl`` is not fitted yet, so the frame is taken from the
+        tallest peak -- good enough for a starting point, since
+        :meth:`compute_shift` re-anchors the final model.  Falls back to
+        *default* when no start-distance histogram was collected.
 
         Returns
         -------
         int
             Offset from the read start to the P-site at the ``pl`` peak.
         """
-        dist_starts = getattr(self, "dist_starts", None)
-        if dist_starts is None:
-            return default
-        window = dist_starts[100 + range_start : 100 + range_end]
-        if window.sum() == 0:
-            return default
-        return -(range_start + int(np.argmax(window)))
+        return self._onset_offset(default=default)
 
-    def compute_shift(self, range_start: int = -25, range_end: int = -5) -> int:
-        """Compute the shift to align pl with the start-distance histogram.
+    def compute_shift(self) -> int:
+        """Shift that anchors the fitted ``pl`` peak to the P-site offset.
 
-        Uses cross-correlation (via convolution) to find the offset that
-        best aligns the reversed left-cleavage distribution with the
-        observed read-start-to-ORF-start distance histogram.
-
-        Parameters
-        ----------
-        range_start : int, optional
-            Start of the search range relative to the ORF start (default -25).
-        range_end : int, optional
-            End of the search range relative to the ORF start (default -5).
+        :func:`repeat` fixes the *shape* of ``pl``/``pr`` but leaves their
+        absolute position free: shifting ``pl`` one codon right and ``pr`` one
+        codon left leaves every footprint likelihood unchanged.  This resolves
+        that gauge freedom by moving the ``pl`` peak onto the onset offset --
+        the reading frame from :meth:`_reading_frame` (robust to the
+        untemplated-addition shadow) combined with the in-frame onset from
+        :meth:`_onset_offset` (robust to 3-nt periodicity) -- so the model's
+        P-site matches the observed read-start-to-CDS-start distance.
 
         Returns
         -------
         int
-            Shift that aligns the cleavage model to the P-site.
+            Shift to pass to :meth:`correct_max_pos`.
         """
-        # pl_rev = self.best_pl[::-1]
-        dist_starts = self.dist_starts[100 + range_start : 100 + range_end]
-
-        # Index within dist_starts that corresponds to the expected peak position
-        expected_peak = -range_start
-
-        # Best alignment offset from cross-correlation
-        conv_offset = np.convolve(dist_starts, self.best_pl, mode="full").argmax()
-
-        return expected_peak - conv_offset
+        dist_starts = getattr(self, "dist_starts", None)
+        if dist_starts is None:
+            return 0
+        onset = self._onset_offset(frame=self._reading_frame())
+        return onset - int(np.argmax(self.best_pl))
 
     def correct_max_pos(self, shift: int) -> None:
         """Shift pl and pr arrays and re-normalise.

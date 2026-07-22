@@ -20,7 +20,12 @@ import numba
 import numpy as np
 import pysam
 
-from price2.cleavage_model import CleavageEstimator, CleavageModel, _MIN_COUNTED_ALNS
+from price2.cleavage_model import (
+    CleavageEstimator,
+    CleavageModel,
+    _MIN_COUNTED_ALNS,
+    _PLAUSIBLE_P_SITE_OFFSETS,
+)
 from price2.coverage_model import (
     CoverageModel,
     build_histograms,
@@ -241,7 +246,9 @@ def _assemble_run(
     max_pos = int(np.argmax(cleavage_model.pl))
     max_prob = float(cleavage_model.pl[max_pos])
     cleavage_ok = (
-        (max_pos == 12) and (max_prob >= 0.3) and (counted_alns >= _MIN_COUNTED_ALNS)
+        (max_pos in _PLAUSIBLE_P_SITE_OFFSETS)
+        and (max_prob >= 0.3)
+        and (counted_alns >= _MIN_COUNTED_ALNS)
     )
 
     start_hist = coverage_model.start_hist
