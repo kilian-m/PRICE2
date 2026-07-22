@@ -102,6 +102,7 @@ def ribo_seq_runs_from_bams(
     ref_annotation: ReferenceAnnotation,
     processes: int = 32,
     high_quality_only: bool = False,
+    end_to_end: bool = False,
 ) -> list[RiboSeqRun]:
     """Build :class:`RiboSeqRun` objects from a collection of BAM files.
 
@@ -136,13 +137,17 @@ def ribo_seq_runs_from_bams(
         If True, exclude runs whose cleavage model failed quality checks
         (peak not at position 12 or peak probability < 0.3).  Defaults to
         False.
+    end_to_end : bool, optional
+        When True the BAM files were mapped with ``--alignEndsType EndToEnd``;
+        the untemplated addition is recovered from the 5'-terminal mismatch
+        instead of a soft-clip.  Defaults to False.
 
     Returns
     -------
     list[RiboSeqRun]
         One :class:`RiboSeqRun` per BAM file, ordered by BAM filename.
     """
-    global _WORKER_RA, _WORKER_CLEAVAGE
+    global _WORKER_RA, _WORKER_CLEAVAGE, _WORKER_END_TO_END
 
     sample_dir = f"{wdir}/sample_bam"
     os.makedirs(sample_dir, exist_ok=True)
@@ -161,6 +166,7 @@ def ribo_seq_runs_from_bams(
     # under which workers would not inherit the module globals below.
     ctx = mp.get_context("fork")
     _WORKER_RA = ref_annotation
+    _WORKER_END_TO_END = end_to_end
     fitted: list[tuple[str, int, str, int, CleavageModel]] = []
     try:
         # Phase one runs one worker per BAM, so each may use several threads of
@@ -195,6 +201,7 @@ def ribo_seq_runs_from_bams(
     finally:
         _WORKER_RA = None
         _WORKER_CLEAVAGE = {}
+        _WORKER_END_TO_END = False
         # Also clears the samples of a phase that died half-way, which would
         # otherwise mask the original exception with a "directory not empty".
         shutil.rmtree(sample_dir, ignore_errors=True)
@@ -277,6 +284,8 @@ def _coverage_windows(sample_bam: str) -> list[tuple[str, int, int]]:
 #: pickles.
 _WORKER_RA: ReferenceAnnotation | None = None
 _WORKER_CLEAVAGE: dict[str, CleavageModel] = {}
+#: EndToEnd untemplated-addition detection, set in the parent before forking.
+_WORKER_END_TO_END: bool = False
 
 #: Per-worker state, populated after the fork.
 _WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
@@ -340,7 +349,7 @@ def _sample_and_fit_cleavage(
     pysam.index("-@", str(_WORKER_THREADS), sample_bam)
 
     estimator = CleavageEstimator()
-    estimator.collect_data(_WORKER_RA, sample_bam)
+    estimator.collect_data(_WORKER_RA, sample_bam, end_to_end=_WORKER_END_TO_END)
     estimator.correct_table()
     return run_id, read_count, sample_bam, estimator.counted_alns, estimator.run()
 
@@ -351,7 +360,11 @@ def _coverage_window(
     """Accumulate the coverage histograms of one genomic window of one run."""
     run_id, sample_bam, window = task
     start_hist, stop_hist = build_histograms(
-        _WORKER_RA, _worker_bam(sample_bam), _WORKER_CLEAVAGE[run_id], window
+        _WORKER_RA,
+        _worker_bam(sample_bam),
+        _WORKER_CLEAVAGE[run_id],
+        window,
+        end_to_end=_WORKER_END_TO_END,
     )
     return run_id, start_hist, stop_hist
 

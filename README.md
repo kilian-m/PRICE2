@@ -24,11 +24,21 @@ pip install --no-deps .
 ```
 
 ### Data preparation
-PRICE 2 requires a reference annotation in GTF format, a reference genome in FASTA format and one or more mapped ribo-seq datasets in BAM format. Before you apply PRICE 2 you should check the quality of your fastqs, remove rRNA reads and clip adapters. Use the [STAR aligner](https://github.com/alexdobin/STAR) to map the reads and make sure to use 
-```bash
---outSAMtype BAM SortedByCoordinate --alignEndsType Local --outSAMattributes nM MD NH
-```
-`--alignEndsType Local` is important to detect untemplated nucleotide additions / RT nucleotides
+PRICE 2 requires a reference annotation in GTF format, a reference genome in FASTA format and one or more mapped ribo-seq datasets in BAM format. Before you apply PRICE 2 you should check the quality of your fastqs, remove rRNA reads and clip adapters. Use the [STAR aligner](https://github.com/alexdobin/STAR) to map the reads.
+
+PRICE 2 relies on the untemplated nucleotide additions ("RT nucleotides") added by the reverse transcriptase. It supports two STAR read-end alignment modes, selected with the `align_ends_type` config option (default `local`):
+
+- **`local`** (default) — map with `--alignEndsType Local`. The RT nucleotide is soft-clipped and read directly:
+  ```bash
+  --outSAMtype BAM SortedByCoordinate --alignEndsType Local --outSAMattributes nM MD NH
+  ```
+- **`endtoend`** — map with `--alignEndsType EndToEnd` (the mode most other ribo-seq ORF callers use, so you may already have BAMs of this type). Here the RT nucleotide is not soft-clipped but recovered from the 5'-terminal mismatch, so set `"align_ends_type": "endtoend"` in the config:
+  ```bash
+  --outSAMtype BAM SortedByCoordinate --alignEndsType EndToEnd --outSAMattributes nM MD NH
+  ```
+  Results are close to a `local` run but not identical: RT-carrying reads whose extra mismatch exceeds STAR's `--outFilterMismatchNmax` are dropped by the mapper.
+
+The **`MD` tag is required** — always include it in `--outSAMattributes`. In `endtoend` mode PRICE 2 reads the RT nucleotide from it; if it is missing PRICE 2 warns and detects no untemplated additions.
 
 ### Running PRICE 2
 PRICE 2 exposes many parameters but in most use cases the defaults should work well. We advice to set the parameters in a json config file (alternatively they can be set when calling PRICE 2 from the CLI).
@@ -45,6 +55,7 @@ The required parameters are:
 
 other frequently used parameters are:
 - `bam_ids`: a list of identifiers for the BAM files. The BAM files should be named `{bam_id}.bam` and be located in `bam_dir`. If not provided, all BAM files in `bam_dir` will be used.
+- `align_ends_type`: the STAR read-end alignment mode of your BAMs, `"local"` (default) or `"endtoend"` (see [Data preparation](#data-preparation)). Both require the `MD` tag in the BAMs.
 - `processes`: the number of processes to use for parallelization. If not provided, PRICE 2 will use all available cores.
 
 ## How it works

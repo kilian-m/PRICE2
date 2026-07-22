@@ -838,6 +838,7 @@ class CleavageEstimator:
         min_dist_to_start: int = 30,
         min_dist_to_end: int = 30,
         min_counted_alns: int = _MIN_COUNTED_ALNS,
+        end_to_end: bool = False,
     ) -> None:
         """Collect read-length / frame / UTA counts from a BAM file.
 
@@ -866,6 +867,10 @@ class CleavageEstimator:
         min_counted_alns : int, optional
             Warn when fewer than this many alignments are tallied into
             ``table``; below it the dataset is too small for a reliable fit.
+        end_to_end : bool, optional
+            When ``True`` the BAM was mapped with ``--alignEndsType EndToEnd``;
+            the untemplated addition is recovered from the 5'-terminal mismatch
+            instead of a soft-clip (see :meth:`RiboSeqAlignment.from_pysam`).
         """
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
         self.dist_starts = np.zeros(shape=(200,), dtype=np.int32)
@@ -878,7 +883,7 @@ class CleavageEstimator:
             for raw_aln in bam.fetch(until_eof=True):
                 if raw_aln.is_unmapped:
                     continue
-                aln = RiboSeqAlignment.from_pysam(raw_aln)
+                aln = RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end)
 
                 if not aln.unique():
                     self.not_unique += 1

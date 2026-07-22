@@ -24,11 +24,41 @@ from collections import defaultdict
 from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
+from price2.ribo_seq_alignment import five_prime_terminal_mismatch
 from price2.locus import Locus
 from price2.genomic_region import GenomicRegion
 from price2.config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def _first_mapped_read_has_md(bam_path: str) -> bool | None:
+    """Return whether the first mapped read of a BAM carries an ``MD`` tag.
+
+    ``None`` when the file cannot be opened or contains no mapped reads.  STAR
+    writes ``MD`` for every alignment or for none, so the first mapped read is
+    representative of the whole file.
+
+    Parameters
+    ----------
+    bam_path : str
+        Path to the BAM file.
+
+    Returns
+    -------
+    bool or None
+        ``True``/``False`` if the presence of an ``MD`` tag could be
+        determined; ``None`` otherwise.
+    """
+    try:
+        with pysam.AlignmentFile(bam_path, "rb") as bam:
+            for aln in bam.fetch(until_eof=True):
+                if aln.is_unmapped:
+                    continue
+                return aln.has_tag("MD")
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 class DataCollector:
@@ -116,6 +146,20 @@ class DataCollector:
                         )"""
             )
 
+        if self.config.align_ends_type == "endtoend":
+            for bam_id in sorted(bam_ids):
+                if _first_mapped_read_has_md(f"{self.bam_dir}/{bam_id}.bam") is False:
+                    logger.warning(
+                        "align_ends_type='endtoend' but BAM %s has no MD tag. "
+                        "The untemplated addition (RT nucleotide) is recovered "
+                        "from the 5'-terminal mismatch, which requires the MD "
+                        "tag; without it no untemplated additions will be "
+                        "detected. Re-map with STAR "
+                        "'--outSAMattributes NH HI AS nM MD' (or add tags with "
+                        "'samtools calmd -b in.bam ref.fa').",
+                        bam_id,
+                    )
+
         new_runs = ribo_seq_runs_from_bams(
             self.bam_dir,
             bam_ids,
@@ -123,6 +167,7 @@ class DataCollector:
             self.reference_annotation,
             self.config.processes,
             high_quality_only=self.config.high_quality_runs_only,
+            end_to_end=self.config.align_ends_type == "endtoend",
         )
         self.runs += new_runs
 
@@ -244,6 +289,8 @@ class DataCollector:
         global _WORKER_LOCI
         _WORKER_LOCI = loci
 
+        end_to_end = self.config.align_ends_type == "endtoend"
+
         try:
             for run in pending:
                 tasks = [
@@ -254,6 +301,7 @@ class DataCollector:
                         hi,
                         chunk_idx,
                         os.path.join(spill_root, run.id) if record_multimap else "",
+                        end_to_end,
                     )
                     for chunk_idx, (lo, hi) in enumerate(bounds)
                 ]
@@ -653,6 +701,39 @@ def _slow_path_transcripts(blocks: list, locus: Locus) -> list:
     return transcripts
 
 
+def _trim_blocks_5p(blocks: list, is_minus: bool) -> list:
+    """Drop the single 5'-most reference base from a read's reference blocks.
+
+    The EndToEnd counterpart of Local's implicit soft-clip removal: when the
+    force-aligned RT base is recovered as a 5'-terminal mismatch it must be
+    stripped from :meth:`pysam.AlignedSegment.get_blocks` output so the stored
+    footprint matches the Local geometry.  On ``+`` strand the 5' end is the
+    first block's start; on ``-`` strand it is the last block's end.  A block
+    reduced to length zero is dropped.
+
+    Parameters
+    ----------
+    blocks : list of (int, int)
+        Reference blocks in chromosome order.
+    is_minus : bool
+        ``True`` for reverse-strand reads.
+
+    Returns
+    -------
+    list of (int, int)
+        A new block list with one 5'-end base removed.
+    """
+    if is_minus:
+        s, e = blocks[-1]
+        if e - s <= 1:
+            return blocks[:-1]
+        return blocks[:-1] + [(s, e - 1)]
+    s, e = blocks[0]
+    if e - s <= 1:
+        return blocks[1:]
+    return [(s + 1, e)] + blocks[1:]
+
+
 def collect_mappings_chunk(data: tuple) -> tuple:
     """Map one run's reads against a contiguous chunk of loci.
 
@@ -674,9 +755,10 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     Parameters
     ----------
     data : tuple
-        ``(run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir)`` where
-        ``lo``/``hi`` slice :data:`_WORKER_LOCI` and ``run_spill_dir`` is
-        empty when multimapping linkage is not being recorded.
+        ``(run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir, end_to_end)``
+        where ``lo``/``hi`` slice :data:`_WORKER_LOCI`, ``run_spill_dir`` is
+        empty when multimapping linkage is not being recorded, and
+        ``end_to_end`` selects EndToEnd untemplated-addition detection.
 
     Returns
     -------
@@ -685,7 +767,7 @@ def collect_mappings_chunk(data: tuple) -> tuple:
         to insert.  Multimapping alignments are spilled to disk, not
         returned.
     """
-    run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir = data
+    run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir, end_to_end = data
     record_multimap = bool(run_spill_dir)
 
     reads_rows: list = []
@@ -720,10 +802,20 @@ def collect_mappings_chunk(data: tuple) -> tuple:
             cigar = alignment.cigartuples
             if not cigar:
                 continue
-            # 5' untemplated addition: a 1-nt soft clip at the read's 5' end.
-            ua = cigar[-1] == (4, 1) if is_minus else cigar[0] == (4, 1)
-
             blocks = alignment.get_blocks()
+            if end_to_end:
+                # EndToEnd: the RT base is force-aligned as a 5'-terminal
+                # mismatch. Recover it and trim that base so the footprint
+                # matches what Local's soft-clip would have left behind.
+                ua = five_prime_terminal_mismatch(alignment, is_minus)
+                if ua:
+                    blocks = _trim_blocks_5p(blocks, is_minus)
+                    if not blocks:
+                        continue
+            else:
+                # Local: a 1-nt soft clip at the read's 5' end.
+                ua = cigar[-1] == (4, 1) if is_minus else cigar[0] == (4, 1)
+
             n_blocks = len(blocks)
 
             if n_blocks == 1 and single_block_fast:

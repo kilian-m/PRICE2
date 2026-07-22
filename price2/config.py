@@ -42,6 +42,19 @@ class Config:
     bam_ids : list[str] or None
         Optional subset of BAM file identifiers to process.  When
         ``None`` all BAM files found in ``bam_dir`` are used.
+    align_ends_type : str
+        How the input BAMs were mapped at their read ends, one of
+        ``"local"`` (default) or ``"endtoend"``.  With ``"local"`` the
+        reverse-transcription untemplated nucleotide (RT base) appears as a
+        1-nt 5' soft-clip (STAR ``--alignEndsType Local``) and PRICE2 reads
+        it directly.  With ``"endtoend"`` (STAR ``--alignEndsType EndToEnd``)
+        there are no soft-clips, so a mismatching RT base is instead recovered
+        from the 1-nt 5'-terminal mismatch (requires the ``MD`` tag) and that
+        base is trimmed off the footprint, reproducing the Local read
+        geometry.  Results are close but not bit-identical to a Local run: the
+        ~1-2%% of RT-carrying reads whose extra mismatch trips STAR's
+        ``outFilterMismatchNmax`` are dropped by the mapper and never reach
+        PRICE2.
     processes : int
         Number of parallel worker processes.
     worker_max_tasks : int
@@ -154,6 +167,15 @@ class Config:
     fasta_path: str = ""
     bam_dir: str = ""
     bam_ids: list[str] | None = None
+
+    # ------------------------------------------------------------------ #
+    # Read mapping                                                          #
+    # ------------------------------------------------------------------ #
+    #: How the input BAMs were mapped at the read ends: ``"local"`` (STAR
+    #: ``--alignEndsType Local``, soft-clipped RT nucleotide) or ``"endtoend"``
+    #: (``--alignEndsType EndToEnd``, RT nucleotide recovered from the
+    #: 5'-terminal mismatch).  See the class docstring.
+    align_ends_type: str = "local"
 
     # ------------------------------------------------------------------ #
     # Parallelism & runtime                                                #
@@ -457,6 +479,12 @@ class Config:
 
     def __post_init__(self) -> None:
         """Resolve empty path fields to their default locations under ``base_dir``."""
+        allowed_ends = ("local", "endtoend")
+        if self.align_ends_type not in allowed_ends:
+            raise ValueError(
+                f"align_ends_type must be one of {allowed_ends}, "
+                f"got {self.align_ends_type!r}"
+            )
         if self.o_dir == "":
             self.o_dir = f"{self.base_dir}/o_dir"
         if self.w_dir == "":

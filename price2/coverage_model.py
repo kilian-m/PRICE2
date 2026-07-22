@@ -219,6 +219,7 @@ def build_histograms(
     bam: "pysam.AlignmentFile",
     cm: CleavageModel,
     region: Optional[tuple[str, int, int]] = None,
+    end_to_end: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Accumulate P-site counts around the CDS start and stop codons.
 
@@ -244,6 +245,10 @@ def build_histograms(
         indexed.  Only reads whose leftmost mapped base lies in ``[start, end)``
         are counted, so the histograms of a set of regions tiling the genome sum
         to those of the whole file.  When *None* the whole file is scanned.
+    end_to_end : bool, optional
+        When ``True`` the BAM was mapped with ``--alignEndsType EndToEnd``;
+        the untemplated addition is recovered from the 5'-terminal mismatch
+        instead of a soft-clip (see :meth:`RiboSeqAlignment.from_pysam`).
 
     Returns
     -------
@@ -274,7 +279,9 @@ def build_histograms(
         if lo is not None and not (lo <= raw_aln.reference_start < hi):
             continue
 
-        result = _try_assign_p_site(RiboSeqAlignment.from_pysam(raw_aln), ra, cm)
+        result = _try_assign_p_site(
+            RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end), ra, cm
+        )
         if result is None:
             continue
         transcript, iv_on_cds, p_site = result
