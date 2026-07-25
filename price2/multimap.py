@@ -436,41 +436,117 @@ def reset_run_spill(root: str, run_id: str) -> None:
     shutil.rmtree(os.path.join(root, run_id), ignore_errors=True)
 
 
+#: Rows a worker buffers before spilling them to disk.  Only bounds peak
+#: memory (~20 bytes/row, so ~40 MB per worker); the common case is that a
+#: worker never reaches it and spills exactly once, when the run finishes.
+SPILL_FLUSH_ROWS = 2_000_000
+
+#: ``run_spill_dir -> {"q": [...], "l": [...], "g": [...], "n": int, "seq": int}``
+#: Process-local: each collection worker accumulates only its own alignments.
+_SPILL_BUFFERS: dict[str, dict] = {}
+_SPILL_FINALIZER = None
+
+_SPILL_COLUMNS = (("q", np.uint64), ("l", np.uint32), ("g", np.uint64))
+
+
 def write_spill(
     run_spill_dir: str,
-    chunk_idx: int,
     qname_hashes: list[int],
     locus_indices: list[int],
     group_keys: list[int],
 ) -> None:
-    """Append one locus chunk's multimapping alignments to the spill.
+    """Buffer one locus chunk's multimapping alignments for the spill.
 
-    The three parallel arrays are written as separate ``.npy`` files so
-    the index builder can load each column contiguously.  Each file is
-    written to a temporary name and renamed, so a crashed worker leaves no
-    half-written array behind.
+    Nothing reaches disk here in the normal case.  Alignments accumulate in
+    a process-local buffer and are written by :func:`flush_spill`, either
+    when the buffer passes ``SPILL_FLUSH_ROWS`` or when the worker exits.
+
+    Writing per *chunk* instead was the obvious thing and does not scale:
+    a chunk is at most four loci, so a human run is ~12 000 chunks, and at
+    three files each that is ~36 000 files **per run** — 1.6 M for a 45-BAM
+    set, which exhausts a typical filesystem inode quota long before it runs
+    out of space.  Buffering per worker writes three files per worker
+    instead, ~100x fewer, for the same bytes.
 
     Parameters
     ----------
     run_spill_dir : str
-        ``<spill_dir>/<run_id>``; created if absent.
-    chunk_idx : int
-        Index of the locus chunk, used only to name the files.
+        ``<spill_dir>/<run_id>``; created when the buffer is flushed.
     qname_hashes, locus_indices, group_keys : list of int
         One entry per in-locus multimapping alignment.
     """
     if not qname_hashes:
         return
-    os.makedirs(run_spill_dir, exist_ok=True)
-    for suffix, values, dtype in (
-        ("q", qname_hashes, np.uint64),
-        ("l", locus_indices, np.uint32),
-        ("g", group_keys, np.uint64),
+
+    global _SPILL_FINALIZER
+    if _SPILL_FINALIZER is None:
+        # NOT atexit: multiprocessing children end in os._exit(), which skips
+        # atexit handlers entirely.  util.Finalize is what _exit_function runs,
+        # and it is only reached if the pool is closed and joined rather than
+        # terminated (see DataCollector._collect_run).
+        from multiprocessing.util import Finalize
+
+        _SPILL_FINALIZER = Finalize(None, flush_spill, exitpriority=16)
+
+    buf = _SPILL_BUFFERS.get(run_spill_dir)
+    if buf is None:
+        buf = {"q": [], "l": [], "g": [], "n": 0, "seq": 0}
+        _SPILL_BUFFERS[run_spill_dir] = buf
+
+    for (key, dtype), values in zip(
+        _SPILL_COLUMNS, (qname_hashes, locus_indices, group_keys)
     ):
-        final = os.path.join(run_spill_dir, f"{chunk_idx:06d}.{suffix}.npy")
-        tmp = f"{final}.tmp.npy"  # already ends in .npy: np.save won't re-suffix
-        np.save(tmp, np.asarray(values, dtype=dtype))
-        os.replace(tmp, final)
+        buf[key].append(np.asarray(values, dtype=dtype))
+    buf["n"] += len(qname_hashes)
+
+    if buf["n"] >= SPILL_FLUSH_ROWS:
+        flush_spill(run_spill_dir)
+
+
+def flush_spill(run_spill_dir: str | None = None) -> int:
+    """Write buffered alignments out as one ``.npy`` triple per call.
+
+    Called on the size threshold, from the worker's exit finalizer, and
+    directly by the in-process fallback path.  Files are named by process id
+    and flush sequence, which keeps them unique across the pool;
+    :func:`_load_run_spill` only globs and concatenates, so the naming and
+    the number of files carry no meaning.
+
+    Parameters
+    ----------
+    run_spill_dir : str, optional
+        Flush only this run's buffer; ``None`` (the default, and what the
+        exit finalizer uses) flushes every buffer this process holds.
+
+    Returns
+    -------
+    int
+        Number of alignments written.
+    """
+    targets = list(_SPILL_BUFFERS) if run_spill_dir is None else [run_spill_dir]
+    written = 0
+    for target in targets:
+        buf = _SPILL_BUFFERS.get(target)
+        if buf is None or buf["n"] == 0:
+            continue
+        os.makedirs(target, exist_ok=True)
+        stem = f"{os.getpid():07d}-{buf['seq']:04d}"
+        for key, dtype in _SPILL_COLUMNS:
+            parts = buf[key]
+            arr = (
+                np.concatenate(parts) if parts else np.empty(0, dtype=dtype)
+            )
+            final = os.path.join(target, f"{stem}.{key}.npy")
+            # Ends in .npy already, so np.save will not append another suffix;
+            # the rename keeps a crash from leaving a half-written array.
+            tmp = f"{final}.tmp.npy"
+            np.save(tmp, arr)
+            os.replace(tmp, final)
+            parts.clear()
+        written += buf["n"]
+        buf["n"] = 0
+        buf["seq"] += 1
+    return written
 
 
 def discard_spill(db_path: str) -> None:

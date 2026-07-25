@@ -372,12 +372,26 @@ class DataCollector:
             if pool is None:
                 for task in tasks:
                     store(collect_mappings_chunk(task))
+                # This process buffered the spill itself, so flush it here.
+                multimap.flush_spill()
             else:
-                with pool:
+                # close()+join(), NOT terminate(): the workers hold this run's
+                # buffered multimapping alignments and only write them from a
+                # multiprocessing exit finalizer, which a terminated (SIGTERMed)
+                # worker never reaches.  ``with pool:`` calls terminate() and
+                # would silently drop the spill.  join() also guarantees every
+                # worker has finished writing before the index is built.
+                try:
                     for result in pool.imap_unordered(
                         collect_mappings_chunk, tasks, chunksize=1
                     ):
                         store(result)
+                    pool.close()
+                except BaseException:
+                    pool.terminate()
+                    raise
+                finally:
+                    pool.join()
             db.commit()
         finally:
             db.close()
@@ -880,9 +894,7 @@ def collect_mappings_chunk(data: tuple) -> tuple:
         )
 
     if record_multimap:
-        multimap.write_spill(
-            run_spill_dir, chunk_idx, mm_qnames, mm_loci, mm_keys
-        )
+        multimap.write_spill(run_spill_dir, mm_qnames, mm_loci, mm_keys)
 
     return reads_rows, transcript_count_rows
 
