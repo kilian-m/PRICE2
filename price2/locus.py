@@ -669,7 +669,10 @@ class Locus:
                             cl = noise_cl
                             if cl == 0:
                                 continue
-                            if ol / cl > thr:
+                            # cl > 0 here, so test ol > thr*cl instead of
+                            # ol/cl > thr: same result, no scalar-divide overflow
+                            # when cl is a tiny denormal.
+                            if ol > thr * cl:
                                 rgr_frame_covpos.add(
                                     (
                                         rgr,
@@ -704,7 +707,10 @@ class Locus:
                                 region_end=region_end,
                             )
                         ) > 0:
-                            if cl_ok and (ol / cl > thr):
+                            # ol > thr*cl avoids the ol/cl scalar-divide overflow
+                            # when cl is a tiny denormal (cl_ok guarantees cl > 0);
+                            # identical result since thr > 0.
+                            if cl_ok and (ol > thr * cl):
                                 rgr_frame_covpos.add(
                                     (
                                         orf,
@@ -729,8 +735,10 @@ class Locus:
                         ) > 0:
                             if cl_ok and (
                                 # ol * run.coverage_model.start_factor / cl
-                                ol / cl
-                                > thr
+                                # (as ol > thr*cl: avoids scalar-divide overflow
+                                #  for denormal cl; cl_ok guarantees cl > 0)
+                                ol
+                                > thr * cl
                             ):
                                 rgr_frame_covpos.add(
                                     (orf, frame, cov_start)
@@ -753,8 +761,10 @@ class Locus:
                         ) > 0:
                             if cl_ok and (
                                 # ol * run.coverage_model.stop_factor / cl
-                                ol / cl
-                                > thr
+                                # (as ol > thr*cl: avoids scalar-divide overflow
+                                #  for denormal cl; cl_ok guarantees cl > 0)
+                                ol
+                                > thr * cl
                             ):
                                 rgr_frame_covpos.add(
                                     (orf, frame, cov_stop)
