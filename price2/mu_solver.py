@@ -89,6 +89,16 @@ def mu_inner_cpu(X, XT, y, weights, w0, lam, num_rgrs, num_runs, pmin,
     """
     poisson = theta is None
     omega_y = weights * y
+    # Per-row floor on delta so that omega_y/delta cannot exceed ~1e200 and
+    # overflow the X^T mat-vec to +Inf. That Inf used to cascade into NaN one
+    # iteration later — the group-norm penalty computes Inf/Inf (line below) —
+    # which then silently poisons the whole solve (and, downstream, the EM
+    # convergence metric). The floor is omega_y*1e-200 (never below the original
+    # 1e-300 div-by-zero guard); it is far below delta at the optimum, where
+    # delta ~= y, so it never binds for a converged solution and the fixed point
+    # / results are unchanged. It only bounds pathological transients where an
+    # observed group (omega_y > 0) is momentarily predicted ~0.
+    delta_floor = np.maximum(omega_y * 1e-200, 1e-300)
     if poisson:
         # Poisson denominator data term X^T ω is constant across iterations.
         Xt_omega = np.asarray(XT @ weights).ravel()
@@ -96,7 +106,7 @@ def mu_inner_cpu(X, XT, y, weights, w0, lam, num_rgrs, num_runs, pmin,
     if fixed_mask is not None:
         w[fixed_mask] = pmin
     for _ in range(max_iter):
-        delta = np.maximum(np.asarray(X @ w).ravel(), 1e-300)
+        delta = np.maximum(np.asarray(X @ w).ravel(), delta_floor)
         num = np.asarray(XT @ (omega_y / delta)).ravel()
         if poisson:
             data_den = Xt_omega
@@ -156,11 +166,19 @@ class GpuMuSolver:
         omega = t.from_numpy(np.ascontiguousarray(weights)).to(self.dtype).cuda()
         w = t.from_numpy(np.ascontiguousarray(w0)).to(self.dtype).cuda()
         omega_y = omega * self.yt
+        # Per-element delta floor so omega_y/delta cannot overflow the X^T
+        # mat-vec to +Inf (which cascades to NaN through the group-norm penalty
+        # below). See mu_inner_cpu. The cap is dtype-aware: float32 overflows at
+        # ~3.4e38, so it must head Inf off far sooner than float64. The floor is
+        # far below delta at the optimum, so it never binds for a converged
+        # solution and results are unchanged.
+        cap = 1e20 if self.dtype == t.float32 else 1e200
+        delta_floor = (omega_y * (1.0 / cap)).clamp_min(self.tiny)
         if poisson:
             # Poisson denominator data term X^T ω is constant across iterations.
             Xt_omega = t.mv(self.XcT, omega)
         for _ in range(max_iter):
-            delta = t.mv(self.Xc, w).clamp_min(self.tiny)
+            delta = t.maximum(t.mv(self.Xc, w), delta_floor)
             num = t.mv(self.XcT, omega_y / delta)
             if poisson:
                 data_den = Xt_omega
