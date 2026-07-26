@@ -1461,16 +1461,24 @@ def e_step(db_path: str, iteration: int) -> float:
 
     # Responsibility per membership row: λ / Σλ within its group, or a uniform
     # 1/n split when the group's λ sums to zero (its read fits no ORF anywhere,
-    # so it is neither lost nor arbitrarily concentrated).  Folded into an
-    # affine form ``count * (a·λ + b)`` so each row needs two gathers, not a
-    # branch.
+    # so it is neither lost nor arbitrarily concentrated).  Written as
+    # ``count * (λ/Σλ + b)`` — normalise first, scale by the read count second.
+    #
+    # The order matters.  Precomputing ``count / Σλ`` as its own factor is one
+    # gather cheaper, but a group's λ can sum to a *subnormal* positive value,
+    # and that quotient then overflows to ``inf`` even though the weight it
+    # scales is bounded by ``count``.  The rows where λ is 0 pick up ``0 * inf``
+    # = ``NaN`` from it.  Dividing at the row keeps every intermediate inside
+    # the bound the maths already guarantees: λ/Σλ ≤ 1 for non-negative λ.
     lam_cell = lam_slot[member_slot]
     lam_sum = np.bincount(member_mmg, weights=lam_cell, minlength=n_groups)
     n_cells = np.bincount(member_mmg, minlength=n_groups)
     positive = lam_sum > 0.0
-    scale = np.where(positive, mmg_count / np.where(positive, lam_sum, 1.0), 0.0)
-    offset = np.where(positive, 0.0, mmg_count / np.maximum(n_cells, 1))
-    weight_cell = lam_cell * scale[member_mmg] + offset[member_mmg]
+    denom = np.where(positive, lam_sum, 1.0)
+    offset = np.where(positive, 0.0, 1.0 / np.maximum(n_cells, 1))
+    weight_cell = (
+        lam_cell / denom[member_mmg] + offset[member_mmg]
+    ) * mmg_count[member_mmg]
 
     # New weight per slot = Σ contributions across the MMGs sharing it.
     new_slot = np.bincount(member_slot, weights=weight_cell, minlength=n_slots)
@@ -1494,6 +1502,20 @@ def e_step(db_path: str, iteration: int) -> float:
     # reflects the one-off removal of the classic full-weight double count.
     total_mass = float(new_slot.sum())
     moved = float(np.abs(new_slot - old_slot).sum())
+
+    # A non-finite weight must stop the EM, and it takes an explicit check to
+    # make it do so: ``NaN > 0`` is False, so a single NaN anywhere in the
+    # slots would fall through to the ``else`` below and report a convergence
+    # metric of exactly 0.0 — indistinguishable from a perfectly converged
+    # run, and enough to end the loop after one iteration.
+    if not (np.isfinite(total_mass) and np.isfinite(moved)):
+        n_bad = int((~np.isfinite(new_slot)).sum())
+        db.close()
+        raise FloatingPointError(
+            f"the E-step produced {n_bad} non-finite slot weight(s) of "
+            f"{n_slots} at iteration {iteration}; refusing to derive a "
+            f"convergence metric from them. The new weights were not written."
+        )
     rel = moved / total_mass if total_mass > 0 else 0.0
 
     # Write new weights, then prune spent state.  Only weights[it+1] (the next
