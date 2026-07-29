@@ -43,6 +43,26 @@ from price2.genomic_region import GenomicRegion
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 
+# Transcript biotypes that count as long non-coding RNA.  Ensembl (>=98)
+# and GENCODE (>=v29) use a single "lncRNA" biotype; earlier releases split
+# the same class across the sub-biotypes listed below, so both vocabularies
+# are accepted.  "processed_transcript" and "retained_intron" are
+# deliberately excluded: in the legacy vocabulary they are also used for
+# non-coding transcripts of protein-coding genes.
+LNCRNA_BIOTYPES: frozenset[str] = frozenset(
+    {
+        "lncRNA",
+        "lincRNA",
+        "antisense",
+        "antisense_RNA",
+        "sense_intronic",
+        "sense_overlapping",
+        "macro_lncRNA",
+        "bidirectional_promoter_lncRNA",
+        "3prime_overlapping_ncRNA",
+    }
+)
+
 # Priority-ordered levels for ORF type assignment.  Within each level,
 # having more than one matching label across compatible transcripts yields
 # "other ORF"; the first level with exactly one match wins.
@@ -58,7 +78,7 @@ ORF_TYPES_LEVELS: list[set[str]] = [
         "+2 iORF",
     },
     {"uORF", "dORF"},
-    {"pcRNA-ORF", "lincRNA-ORF", "varRNA-ORF"},
+    {"pcRNA-ORF", "lncRNA-ORF", "varRNA-ORF"},
 ]
 
 
@@ -125,8 +145,8 @@ def get_orf_type(
 
         elif tr.biotype == "protein_coding":
             label = "pcRNA-ORF"
-        elif tr.biotype == "lincRNA":
-            label = "lincRNA-ORF"
+        elif tr.biotype in LNCRNA_BIOTYPES:
+            label = "lncRNA-ORF"
         else:
             label = "varRNA-ORF"
 

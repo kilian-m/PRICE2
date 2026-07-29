@@ -47,7 +47,9 @@ class Transcript:
     gene_id : str
         Ensembl gene identifier.
     biotype : str
-        Transcript biotype (e.g. ``"protein_coding"``).
+        Transcript biotype (e.g. ``"protein_coding"``), read from the
+        ``transcript_biotype`` (Ensembl) or ``transcript_type`` (GENCODE)
+        GTF attribute, or ``"unknown"`` if neither is present.
     iv : HTSeq.GenomicInterval
         Genomic interval of the whole transcript locus.
     exons : GenomicRegion
@@ -85,7 +87,10 @@ class Transcript:
         self.exon_length: int = 0
         self.orf_set: set[ReadGeneratingRegion] = set()
         self.rgr_set: set[ReadGeneratingRegion] = set()
-        self.biotype: str = feature.attr.get("transcript_biotype", "unknown")
+        self.biotype: str = feature.attr.get(
+            "transcript_biotype",
+            feature.attr.get("transcript_type", "unknown"),
+        )
         self.annotated_cds_iv: tuple[int, int] | None = None
 
     def __hash__(self) -> int:
@@ -439,7 +444,7 @@ class ReadGeneratingRegion:
     # Colours used in BED itemRgb column, matched in order (first wins).
     _BED_COLOURS: list[tuple[str, str]] = [
         ("pcRNA-ORF", "255,192,203"),
-        ("lincRNA-ORF", "128,128,128"),
+        ("lncRNA-ORF", "128,128,128"),
         ("varRNA-ORF", "160,160,160"),
         ("N terminal", "0,200,200"),
         ("uoORF", "255,140,0"),
