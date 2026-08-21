@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "price2"
-version = "1.0.0"
+version = "1.1.0"
 description = "Detect actively translated ORFs from multiple Ribo-seq datasets using group-LASSO penalized Poisson regression."
 readme = "README.md"
 requires-python = ">=3.10"
