@@ -201,12 +201,15 @@ class ORFActivityEstimator:
         """Run the full per-locus ORF deconvolution pipeline.
 
         Dispatches each locus to a worker process via
-        :class:`pebble.ProcessPool`.  Already-processed loci (detected
-        via ``performance_measurements.tsv``) are skipped so that the
-        run can be resumed after a crash.
+        :class:`pebble.ProcessPool`.  On a full pass already-processed
+        loci are skipped so that the run can be resumed after a crash;
+        their ids are read from ``<w_dir>/processed_loci.txt``, falling
+        back to ``<o_dir>/performance_measurements.tsv`` when that file
+        is absent.
 
-        Results are written incrementally to
-        ``<o_dir>/regions_activities/results.tsv``.  Failed loci are
+        Per-locus results are written incrementally to
+        ``<o_dir>/regions_activities/`` (``orfs.tsv`` and ``orfs.bed``
+        by default; see the ``export_*`` options).  Failed loci are
         logged to ``<o_dir>/regions_activities/failed_loci.txt``.
 
         When ``config.save_memory`` is ``False`` the in-memory
