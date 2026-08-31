@@ -397,6 +397,11 @@ def process_loc(arguments: tuple):
     loc_id, config, log_queue, em_iteration, em_final = arguments
     em_mode = em_iteration is not None
     em_light = em_mode and not em_final
+    # No EM to spread a multimapping read over the loci it aligns to, so the
+    # alternative to dropping it is counting it at full weight in each of
+    # them.  A fresh collection already withheld these reads; this also covers
+    # a price.db collected with multimap_em enabled.
+    drop_multimappers = not config.multimap_em
 
     # Route all price2 log records back to the main process.
     worker_logger = logging.getLogger("price2")
@@ -457,7 +462,7 @@ def process_loc(arguments: tuple):
         # own reads, so this only elides the reload when the cache is present.)
         t1 = time.time()
         if not (em_light and em_iteration > 0):
-            loc.get_reads_from_db(db_path)
+            loc.get_reads_from_db(db_path, drop_multimappers=drop_multimappers)
         performance_measurements["load_reads_time"] = time.time() - t1
         # Keep perf columns aligned with the full-prepare path (the skipped
         # stages report zero time).  A light locus carries no rgr_set/egs, so
@@ -528,7 +533,7 @@ def process_loc(arguments: tuple):
 
         # --- Load reads ---
         t1 = time.time()
-        loc.get_reads_from_db(db_path)
+        loc.get_reads_from_db(db_path, drop_multimappers=drop_multimappers)
         t2 = time.time()
         performance_measurements["load_reads_time"] = t2 - t1
 

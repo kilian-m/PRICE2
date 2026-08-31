@@ -371,10 +371,13 @@ class Config:
     # When ``True`` (default) the deconvolution runs inside an EM outer loop
     # that fractionally re-assigns each multimapping read across the loci it
     # maps to (E-step), with the existing per-locus optimisation as the
-    # M-step.  When ``False`` behaviour is identical to classic PRICE2
-    # (every read counted at full weight at every locus it overlaps).  Note:
-    # enabling this makes read collection record per-alignment multimap
-    # linkage (extra time/disk) and adds the EM outer iterations below.
+    # M-step.  When ``False`` multimapping alignments (``NH`` > 1) are
+    # discarded outright -- at collection, and again when reads are loaded, so
+    # that a price.db collected with the EM enabled behaves the same way.
+    # (Classic PRICE2 instead counted every such read at full weight in every
+    # locus it overlaps, which multi-counts it.)  Note: enabling this makes
+    # read collection record per-alignment multimap linkage (extra time/disk)
+    # and adds the EM outer iterations below.
     multimap_em: bool = True
     #: Safety cap on EM outer iterations (light M-step + global E-step). The
     #: EM converges only *linearly* (the L1 read-mass reassigned per E-step

@@ -985,7 +985,9 @@ class Locus:
     # ORF activity estimation                                              #
     # ------------------------------------------------------------------ #
 
-    def get_reads_from_db(self, db_path: str) -> None:
+    def get_reads_from_db(
+        self, db_path: str, drop_multimappers: bool = False
+    ) -> None:
         """Load reads for this locus from the SQLite database.
 
         Populates :attr:`rsas_dict` (mapping run id to a list of
@@ -995,6 +997,16 @@ class Locus:
         ----------
         db_path : str
             Path to the ``price.db`` SQLite database.
+        drop_multimappers : bool, optional
+            Discard stored reads that align to more than one genomic locus
+            (``NH > 1``) instead of counting them at full weight here.  Set
+            when ``multimap_em`` is disabled, which leaves no mechanism for
+            spreading such a read over the loci it aligns to.  A database
+            collected with ``multimap_em`` disabled holds no multimapping
+            reads to begin with, so this is a no-op there; it matters when a
+            database collected with the EM enabled is deconvolved without it.
+            Note that ``transcript_read_counts`` -- used only for the
+            transcript-support filter -- still includes them in that case.
         """
         db = sql.connect(db_path, timeout=120)
         cur = db.cursor()
@@ -1031,6 +1043,10 @@ class Locus:
 
             boundaries = np.flatnonzero(is_first)
             read_ends = np.append(boundaries[1:], len(is_first))
+            if drop_multimappers:
+                keep = uniques[boundaries].astype(bool)
+                boundaries = boundaries[keep]
+                read_ends = read_ends[keep]
 
             rsas_run = []
             for b, e in zip(boundaries.tolist(), read_ends.tolist()):

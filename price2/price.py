@@ -295,8 +295,9 @@ def _run_em_deconvolution(
         logger.warning(
             "multimap_em is enabled but no populated linkage index was "
             "found in %s. Either no read maps to >=2 in-locus slots, or "
-            "price.db was collected with multimap_em disabled (re-run a "
-            "cold collection with multimap_em=true to build the linkage). "
+            "price.db was collected with multimap_em disabled -- in which "
+            "case its multimapping reads were discarded as well, and only a "
+            "cold re-collection with multimap_em=true can restore them. "
             "Running a single classic pass instead.",
             db_path,
         )

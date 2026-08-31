@@ -231,6 +231,15 @@ class DataCollector:
             return
 
         record_multimap = self.config.multimap_em
+        # Without the EM outer loop there is no way to spread a multimapping
+        # read over the loci it aligns to, and counting it at full weight in
+        # each of them multi-counts it -- so discard those alignments instead.
+        drop_multimap = not self.config.multimap_em
+        if drop_multimap:
+            logger.info(
+                "multimap_em is disabled: multimapping alignments (NH > 1) "
+                "are discarded, not stored."
+            )
 
         # Chunk the loci in BAM coordinate order so each worker's fetches
         # sweep a contiguous slab of the file instead of seeking randomly.
@@ -302,6 +311,7 @@ class DataCollector:
                         chunk_idx,
                         os.path.join(spill_root, run.id) if record_multimap else "",
                         end_to_end,
+                        drop_multimap,
                     )
                     for chunk_idx, (lo, hi) in enumerate(bounds)
                 ]
@@ -769,10 +779,12 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     Parameters
     ----------
     data : tuple
-        ``(run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir, end_to_end)``
-        where ``lo``/``hi`` slice :data:`_WORKER_LOCI`, ``run_spill_dir`` is
-        empty when multimapping linkage is not being recorded, and
-        ``end_to_end`` selects EndToEnd untemplated-addition detection.
+        ``(run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir, end_to_end,
+        drop_multimap)`` where ``lo``/``hi`` slice :data:`_WORKER_LOCI`,
+        ``run_spill_dir`` is empty when multimapping linkage is not being
+        recorded, ``end_to_end`` selects EndToEnd untemplated-addition
+        detection, and ``drop_multimap`` discards alignments with ``NH > 1``
+        instead of counting them in every locus they align to.
 
     Returns
     -------
@@ -781,7 +793,16 @@ def collect_mappings_chunk(data: tuple) -> tuple:
         to insert.  Multimapping alignments are spilled to disk, not
         returned.
     """
-    run_id, bam_dir, lo, hi, chunk_idx, run_spill_dir, end_to_end = data
+    (
+        run_id,
+        bam_dir,
+        lo,
+        hi,
+        chunk_idx,
+        run_spill_dir,
+        end_to_end,
+        drop_multimap,
+    ) = data
     record_multimap = bool(run_spill_dir)
 
     reads_rows: list = []
@@ -812,6 +833,15 @@ def collect_mappings_chunk(data: tuple) -> tuple:
         for alignment in sf.fetch(locus.iv.chrom, locus.iv.start, locus.iv.end):
             if alignment.is_unmapped or alignment.is_reverse != is_minus:
                 continue
+
+            if drop_multimap:
+                # Checked before the transcript mapping: the alignment is
+                # dropped outright, so none of that work is needed.
+                try:
+                    if alignment.get_tag("NH") != 1:
+                        continue
+                except KeyError:
+                    pass  # no NH tag: treat as unique
 
             cigar = alignment.cigartuples
             if not cigar:
@@ -870,10 +900,13 @@ def collect_mappings_chunk(data: tuple) -> tuple:
             if not transcripts_ids:
                 continue
 
-            try:
-                unique = alignment.get_tag("NH") == 1
-            except KeyError:
-                unique = True
+            if drop_multimap:
+                unique = True  # multimapping alignments were skipped above
+            else:
+                try:
+                    unique = alignment.get_tag("NH") == 1
+                except KeyError:
+                    unique = True
 
             ivs_tuple = tuple(blocks)
             mappings_dict[(ua, unique, ivs_tuple)] += 1

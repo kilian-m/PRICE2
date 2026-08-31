@@ -14,7 +14,7 @@ flowchart TD
     START(["price.py --config run.json"]) --> DC["<b>DataCollector</b><br/>cleavage + coverage models per run<br/>reads → loci → ORF candidates<br/>persisted to price.db"]
     DC --> MMQ{"config.multimap_em"}
 
-    MMQ -->|"false"| CLASSIC["<b>classic single pass</b><br/>run_orf_deconvolution()<br/>every read counted at full weight<br/>in every locus it aligns to"]
+    MMQ -->|"false"| CLASSIC["<b>unique-reads single pass</b><br/>run_orf_deconvolution()<br/>multimapping reads (NH &gt; 1) discarded<br/>at collection and again at read load"]
     CLASSIC --> TPM
 
     MMQ -->|"true"| IDX["<b>build_multimap_index</b><br/>keep reads with ≥ 2 in-locus slots<br/>slot = locus_id + group_key<br/>collapse identical slot-sets → MMG"]
