@@ -20,6 +20,7 @@ import HTSeq
 from pyfaidx import Fasta
 
 from price2 import multimap
+from price2 import run_state
 from price2.config import Config
 from price2.data_collector import DataCollector
 from price2.ribo_seq_run import save_dataset_models
@@ -112,17 +113,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def setup_directories(config: Config) -> bool:
-    """Create working and output directories.
+def setup_directories(config: Config) -> run_state.ResumePlan:
+    """Create the working and output directories and decide what to reuse.
 
-    When ``config.warm_start`` is ``True`` and a populated SQLite
-    database already exists in ``w_dir``, only the output directory is
-    cleared and ``processed_loci.txt`` is removed so that deconvolution
-    reruns all loci.  If the database is absent the run falls back to a
-    full cold start (both directories are wiped and recreated).
+    With ``config.warm_start`` enabled (the default) an existing working
+    directory is picked up where the previous invocation stopped: the data
+    collection resumes run by run and locus by locus, the multimapping EM
+    resumes at its last checkpointed iteration, and the final
+    deconvolution resumes at the loci not yet in ``processed_loci.txt``.
+    What may be reused is decided by :func:`price2.run_state.plan_resume`
+    from the configuration fingerprints stored in the database; a stage
+    whose options changed starts over.
 
-    When ``config.warm_start`` is ``False`` both directories are always
-    wiped and recreated.
+    With ``config.warm_start`` disabled both directories are wiped and
+    recreated, as is any run whose ``w_dir`` holds no database yet.
 
     Parameters
     ----------
@@ -131,28 +135,94 @@ def setup_directories(config: Config) -> bool:
 
     Returns
     -------
-    bool
-        ``True`` when data collection will be skipped (warm start
-        effective), ``False`` when a full cold run is required.
+    price2.run_state.ResumePlan
+        What the run may skip.  A cold start returns a plan that skips
+        nothing.
+
+    Raises
+    ------
+    price2.run_state.IncompatibleRunStateError
+        When the existing database was collected under different
+        collection options (see :func:`price2.run_state.plan_resume`).
     """
     db_path = os.path.join(config.w_dir, "price.db")
-    warm = config.warm_start and os.path.exists(db_path)
 
-    if warm:
-        if os.path.exists(config.o_dir):
-            shutil.rmtree(config.o_dir)
-        os.makedirs(config.o_dir, exist_ok=True)
-        processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
-        if os.path.exists(processed_loci_path):
-            os.remove(processed_loci_path)
-    else:
+    if not (config.warm_start and os.path.exists(db_path)):
         for path in (config.w_dir, config.o_dir):
             if os.path.exists(path):
                 shutil.rmtree(path)
         for path in (config.w_dir, config.o_dir):
             os.makedirs(path, exist_ok=True)
+        run_state.record_configuration(config, db_path)
+        return run_state.ResumePlan(
+            skip_collection=False,
+            reuse_deconvolution=False,
+            reason="cold start",
+        )
 
-    return warm
+    plan = run_state.plan_resume(config, db_path)
+    os.makedirs(config.o_dir, exist_ok=True)
+    processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
+
+    if plan.reuse_deconvolution and not _outputs_resumable(
+        config, processed_loci_path
+    ):
+        plan = run_state.ResumePlan(
+            skip_collection=plan.skip_collection,
+            reuse_deconvolution=False,
+            reason="reusing the collected data; the deconvolution starts over",
+        )
+
+    if not plan.reuse_deconvolution:
+        if os.path.exists(config.o_dir):
+            shutil.rmtree(config.o_dir)
+        os.makedirs(config.o_dir, exist_ok=True)
+        if os.path.exists(processed_loci_path):
+            os.remove(processed_loci_path)
+
+    run_state.record_configuration(config, db_path)
+    return plan
+
+
+def _outputs_resumable(config: Config, processed_loci_path: str) -> bool:
+    """Reconcile an existing output directory with the finished-locus list.
+
+    Parameters
+    ----------
+    config : Config
+        Fully populated configuration object.
+    processed_loci_path : str
+        Path to ``processed_loci.txt`` in the working directory.
+
+    Returns
+    -------
+    bool
+        ``True`` when the outputs were made consistent and the finished
+        loci may be skipped; ``False`` when the deconvolution has to start
+        over.
+    """
+    ra_dir = os.path.join(config.o_dir, "regions_activities")
+    if os.path.exists(processed_loci_path) and not os.path.isdir(ra_dir):
+        # The results those loci produced are gone; skipping them now would
+        # silently drop them from the output.
+        logger.warning(
+            "%s lists finished loci but %s no longer exists; the "
+            "deconvolution starts over.",
+            processed_loci_path,
+            ra_dir,
+        )
+        return False
+
+    if not run_state.repair_outputs(config.o_dir, processed_loci_path):
+        logger.warning(
+            "the outputs in %s cannot be reconciled with %s; the "
+            "deconvolution starts over.",
+            config.o_dir,
+            processed_loci_path,
+        )
+        return False
+
+    return True
 
 
 def load_genome(fasta_path: str) -> Fasta:
@@ -188,14 +258,11 @@ def run_pipeline(config: Config) -> None:
     config : Config
         Fully populated configuration object.
     """
-    warm = setup_directories(config)
+    plan = setup_directories(config)
+    db_path = os.path.join(config.w_dir, "price.db")
+    logger.info("%s (%s)", plan.reason, config.w_dir)
 
-    if warm:
-        logger.info(
-            "warm start: reusing existing database in %s",
-            config.w_dir,
-        )
-    else:
+    if not plan.skip_collection:
         ref_annotation = _timed(
             "load reference annotation... ",
             ReferenceAnnotation,
@@ -234,13 +301,25 @@ def run_pipeline(config: Config) -> None:
             data_collector.collect_loci,
         )
 
-        if config.multimap_em:
+        # Unlike the stages above, this one is not repeatable: it consumes
+        # the spilled alignments and deletes them, so re-running it after a
+        # successful build would replace a valid index with an empty one.
+        # A populated index with no spill left beside it is therefore taken
+        # as already built; a spill that is still there means alignments
+        # have been collected since, and the index is rebuilt to include
+        # them (that also covers a build interrupted before its cleanup).
+        if config.multimap_em and (
+            not multimap.has_multimap_index(db_path)
+            or os.path.isdir(multimap.spill_dir(db_path))
+        ):
             _timed(
                 "build multimapping linkage index... ",
                 multimap.build_multimap_index,
                 f"{config.w_dir}/price.db",
                 processes=config.processes,
             )
+
+        run_state.write_state(db_path, collection_complete="1")
 
     # --- ORF deconvolution ---
     orf_activity_estimator = ORFActivityEstimator(config)
@@ -254,7 +333,9 @@ def run_pipeline(config: Config) -> None:
     )
 
     if config.multimap_em:
-        _run_em_deconvolution(config, orf_activity_estimator)
+        _run_em_deconvolution(
+            config, orf_activity_estimator, resume=plan.reuse_deconvolution
+        )
     else:
         _timed("", orf_activity_estimator.run_orf_deconvolution)
 
@@ -270,6 +351,7 @@ def run_pipeline(config: Config) -> None:
 def _run_em_deconvolution(
     config: Config,
     estimator: ORFActivityEstimator,
+    resume: bool = False,
 ) -> None:
     """Drive the multimapping-EM outer loop around the per-locus fan-out.
 
@@ -288,6 +370,10 @@ def _run_em_deconvolution(
         Fully populated configuration object.
     estimator : ORFActivityEstimator
         Estimator bound to the run's database.
+    resume : bool, optional
+        Continue an interrupted EM from its last checkpoint instead of
+        restarting it (see :func:`price2.multimap.em_resume_point`).  The
+        caller sets this from the run's :class:`~price2.run_state.ResumePlan`.
     """
     db_path = f"{config.w_dir}/price.db"
 
@@ -305,48 +391,93 @@ def _run_em_deconvolution(
         return
 
     multimap.enable_wal(db_path)
-    # Clear any per-iteration state from a previous run so a warm re-run
-    # cannot consume stale λ / weights / activities.
-    multimap.reset_em_state(db_path)
+
+    checkpoint = multimap.em_resume_point(db_path) if resume else None
+    if checkpoint is None:
+        # Clear any per-iteration state from a previous run so a warm re-run
+        # cannot consume stale λ / weights / activities.
+        multimap.reset_em_state(db_path)
+        run_state.write_state(db_path, em_final_iteration="")
+        start_iteration, finished = 0, set()
+    else:
+        start_iteration, finished = checkpoint
 
     # Loci with no multimap slots do not change across EM iterations, so
     # the light passes only need to touch the loci that carry slots.
     slot_loci = multimap.slot_locus_ids(db_path)
 
-    last_it = 0
+    # The loop has already ended if its last run recorded the iteration the
+    # final pass consumes and the checkpoint still sits there; go straight to
+    # the final pass rather than paying another M-step and E-step for nothing.
+    final_iteration = start_iteration
+    stored_final = run_state.read_state(db_path).get("em_final_iteration")
+    skip_loop = checkpoint is not None and stored_final == str(start_iteration)
+    if skip_loop:
+        logger.info(
+            "EM already converged; resuming at the final full M-step "
+            "(iteration %d).",
+            start_iteration,
+        )
+    elif checkpoint is not None:
+        logger.info(
+            "resuming the multimapping EM at iteration %d (%d of %d slot "
+            "loci already done).",
+            start_iteration,
+            len(finished & slot_loci),
+            len(slot_loci),
+        )
+
+    last_it = start_iteration
     # One broker pool for the whole EM: every M-step would otherwise rebuild it,
     # paying a CUDA context per broker process per iteration.  Likewise hold one
     # worker pool + log listener open across every M-step (and the final pass)
     # instead of spawning and joining a fresh 40-worker pool + manager each time.
     with estimator.gpu_broker_pool(), estimator.worker_pool():
-        for it in range(config.em_max_iter):
-            last_it = it
-            _timed(
-                f"EM iteration {it} light M-step... ",
-                estimator.run_orf_deconvolution,
-                em_iteration=it,
-                em_final=False,
-                loci_subset=slot_loci,
-            )
-            delta = multimap.e_step(db_path, iteration=it)
-            logger.info(
-                "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
-                it,
-                delta,
-            )
-            if delta < config.em_tol:
+        if not skip_loop:
+            for it in range(start_iteration, config.em_max_iter):
+                last_it = it
+                # Only the resumed iteration has loci already behind it; every
+                # later one starts empty.
+                subset = slot_loci - finished
+                finished = set()
+                if subset:
+                    _timed(
+                        f"EM iteration {it} light M-step... ",
+                        estimator.run_orf_deconvolution,
+                        em_iteration=it,
+                        em_final=False,
+                        loci_subset=subset,
+                    )
+                else:
+                    logger.info(
+                        "EM iteration %d light M-step was already complete.",
+                        it,
+                    )
+                delta = multimap.e_step(db_path, iteration=it)
                 logger.info(
-                    "EM converged after %d iteration(s) (tol=%.1e).",
-                    it + 1,
-                    config.em_tol,
+                    "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
+                    it,
+                    delta,
                 )
-                break
+                if delta < config.em_tol:
+                    logger.info(
+                        "EM converged after %d iteration(s) (tol=%.1e).",
+                        it + 1,
+                        config.em_tol,
+                    )
+                    break
+
+            final_iteration = last_it + 1
+            # From here a resume can skip straight to the final pass.
+            run_state.write_state(
+                db_path, em_final_iteration=str(final_iteration)
+            )
 
         # Final full M-step with the converged fractional weights.
         _timed(
             "EM final full M-step... ",
             estimator.run_orf_deconvolution,
-            em_iteration=last_it + 1,
+            em_iteration=final_iteration,
             em_final=True,
         )
 
@@ -362,7 +493,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config = Config.make_config(config=args.config)
     setup_logging(config)
-    run_pipeline(config)
+    try:
+        run_pipeline(config)
+    except run_state.IncompatibleRunStateError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

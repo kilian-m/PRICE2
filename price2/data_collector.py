@@ -125,26 +125,21 @@ class DataCollector:
                 if f.endswith(".bam")
             }
 
-        if os.path.exists(self.db_path):
-
-            db = sql.connect(self.db_path, timeout=60)
-            cur = db.cursor()
-            cur.execute("SELECT * FROM runs")
-            stored_runs = cur.fetchall()
-            run_ids = {run_id for run_id, _ in stored_runs}
-            self.runs = [loads(run_blob) for _, run_blob in stored_runs]
-            bam_ids = bam_ids - run_ids
-        else:
-            self.runs = []
-            db = sql.connect(self.db_path, timeout=60)
-            cur = db.cursor()
-
-            cur.execute(
-                """CREATE TABLE runs (
-                        run_id text PRIMARY KEY,
-                        run_blob blob
-                        )"""
-            )
+        # The database may already exist without holding any runs: a cold
+        # start records its configuration fingerprints before collecting
+        # anything (see :mod:`price2.run_state`).
+        db = sql.connect(self.db_path, timeout=60)
+        cur = db.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS runs (
+                    run_id text PRIMARY KEY,
+                    run_blob blob
+                    )"""
+        )
+        stored_runs = cur.execute("SELECT * FROM runs").fetchall()
+        run_ids = {run_id for run_id, _ in stored_runs}
+        self.runs = [loads(run_blob) for _, run_blob in stored_runs]
+        bam_ids = bam_ids - run_ids
 
         if self.config.align_ends_type == "endtoend":
             for bam_id in sorted(bam_ids):

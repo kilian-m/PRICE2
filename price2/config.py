@@ -120,10 +120,17 @@ class Config:
         Codons accepted as translation stop sites for ORF candidate
         generation.
     warm_start : bool
-        When ``True``, skip data collection and reuse the existing working
-        directory (``w_dir``) and its SQLite database.  The pipeline
-        resumes directly at ORF deconvolution.  Requires a prior run to
-        have completed the data-collection phase (default ``False``).
+        When ``True`` (default), continue an interrupted run instead of
+        starting over: the existing working directory (``w_dir``) and its
+        SQLite database are reused, and every stage picks up where it
+        stopped — data collection run by run and locus by locus, the
+        multimapping EM at its last checkpointed iteration, and the final
+        deconvolution at the loci not yet listed in ``processed_loci.txt``.
+        A stage whose options changed since the previous invocation starts
+        over; a change to an option that decides the *content* of the
+        database (see :mod:`price2.run_state`) stops the run instead of
+        silently discarding a collection that can take days.  When
+        ``False`` both directories are wiped and the run starts cold.
     export_dataset_models : bool
         Write the ``dataset_models/`` directory with cleavage and coverage
         model summaries and plots (default ``True``).
@@ -425,7 +432,7 @@ class Config:
     # ------------------------------------------------------------------ #
     # Export options                                                        #
     # ------------------------------------------------------------------ #
-    warm_start: bool = False
+    warm_start: bool = True
 
     # ------------------------------------------------------------------ #
     # Export options                                                        #

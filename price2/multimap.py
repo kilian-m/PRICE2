@@ -383,6 +383,53 @@ def slot_locus_ids(db_path: str) -> set:
     return ids
 
 
+def em_resume_point(db_path: str) -> tuple[int, set] | None:
+    """Locate the EM iteration an interrupted run should continue from.
+
+    The EM checkpoints itself: :func:`e_step` writes the next iteration's
+    ``group_weights`` and then deletes everything it has consumed, so the
+    database is left holding exactly the inputs of one M-step — its
+    fractional weights, and the previous iteration's ``locus_activities``
+    as a warm start.  The iteration those weights belong to is therefore
+    the one to run next, and the loci that already wrote their activities
+    for it are the ones that M-step had finished before the interruption.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to ``price.db``.
+
+    Returns
+    -------
+    tuple[int, set] or None
+        ``(iteration, finished_locus_ids)``, or ``None`` when no weights
+        are stored — nothing to resume, the EM starts from scratch.
+    """
+    db = sql.connect(db_path, timeout=120)
+    try:
+        cur = db.cursor()
+        cur.execute("PRAGMA busy_timeout = 120000")
+        try:
+            row = cur.execute(
+                "SELECT MAX(iteration) FROM group_weights"
+            ).fetchone()
+        except sql.OperationalError:  # tables absent (never ran an EM here)
+            return None
+        if row is None or row[0] is None:
+            return None
+        iteration = int(row[0])
+        finished = {
+            locus_id
+            for locus_id, in cur.execute(
+                "SELECT locus_id FROM locus_activities WHERE iteration = ?",
+                (iteration,),
+            )
+        }
+        return iteration, finished
+    finally:
+        db.close()
+
+
 # --------------------------------------------------------------------------- #
 # Alignment spill files (written during collection, consumed by the index)     #
 # --------------------------------------------------------------------------- #
