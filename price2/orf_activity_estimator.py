@@ -71,6 +71,14 @@ class ORFActivityEstimator:
     ----------
     config : Config
         Parsed PRICE configuration object.
+
+    Attributes
+    ----------
+    loci_ids : list of str
+        Every locus id stored in the database.
+    locus_timeout : int
+        Wall-clock budget for one locus, in seconds:
+        ``config.timeout`` per Ribo-seq run.
     """
 
     def __init__(self, config) -> None:
@@ -89,6 +97,20 @@ class ORFActivityEstimator:
 
         cur.execute("SELECT locus_id FROM loci")
         self.loci_ids = [id for id, in cur.fetchall()]
+
+        # A locus is solved for every dataset at once — one activity column
+        # per run — so its cost grows with how many there are.  The budget is
+        # therefore per sample: an absolute one would abandon loci a wide run
+        # could still have finished, while being needlessly generous to a
+        # narrow one.
+        n_runs = cur.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        self.locus_timeout = config.timeout * max(1, n_runs)
+        logger.info(
+            "per-locus timeout: %d s (%d s per sample, %d sample(s))",
+            self.locus_timeout,
+            config.timeout,
+            max(1, n_runs),
+        )
 
     def _start_gpu_broker(self):
         """Start the single-context GPU deconvolution broker pool.
@@ -319,7 +341,7 @@ class ORFActivityEstimator:
                             em_final,
                         )
                     ],
-                    timeout=self.config.timeout,
+                    timeout=self.locus_timeout,
                 ): locus_id
                 for locus_id in loci_ids
             }

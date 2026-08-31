@@ -78,6 +78,7 @@ other frequently used parameters are:
 - `bam_ids`: a list of identifiers for the BAM files. The BAM files should be named `{bam_id}.bam`, be located in `bam_dir` and each have its index (`{bam_id}.bam.bai`) alongside. If not provided, all BAM files in `bam_dir` will be used.
 - `align_ends_type`: the STAR read-end alignment mode of your BAMs, `"local"` (default) or `"endtoend"` (see [Data preparation](#data-preparation)). Both require the `MD` tag in the BAMs.
 - `processes`: the number of worker processes used for parallelization (default `80`). This is a fixed default, not the machine's core count, so set it explicitly to match the host you are running on.
+- `timeout`: the wall-clock budget for one locus, in seconds **per Ribo-seq run** (default `180`). A locus is abandoned after `timeout` × (number of runs) seconds — 900 s for five datasets — and listed in `o_dir/regions_activities/failed_loci.txt`. It scales with the sample count because a locus is solved for all datasets at once.
 - `warm_start`: continue an interrupted run instead of starting over (default `true`, see [Resuming an interrupted run](#resuming-an-interrupted-run)). Set it to `false` to force a clean run, which wipes `w_dir` and `o_dir` first.
 
 ### Resuming an interrupted run

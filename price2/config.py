@@ -61,7 +61,11 @@ class Config:
         Number of loci a worker process handles before being replaced
         (``0`` means never replaced).
     timeout : int
-        Per-locus timeout in seconds.
+        Per-locus timeout in seconds *per Ribo-seq run*: a locus is
+        abandoned after ``timeout`` × (number of runs) seconds (default
+        ``180``, so 900 s for five datasets).  One locus is solved for all
+        datasets at once, so its cost grows with how many there are and an
+        absolute budget would time out the wide runs.
     memory_limit_gb : int
         Per-worker memory limit in gigabytes.
     pseudo_min : float
@@ -188,7 +192,9 @@ class Config:
     # Parallelism & runtime                                                #
     # ------------------------------------------------------------------ #
     processes: int = 80
-    timeout: int = 60 * 30
+    #: Per-locus wall-clock budget in seconds *per Ribo-seq run*; the effective
+    #: limit is ``timeout * len(runs)`` (see ``ORFActivityEstimator``).
+    timeout: int = 180
     memory_limit_gb: int = 5
     pseudo_min: float = 1e-14
     #: Loci a worker handles before it is replaced (``0`` = never replaced).
