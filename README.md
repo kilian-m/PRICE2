@@ -78,6 +78,23 @@ other frequently used parameters are:
 - `bam_ids`: a list of identifiers for the BAM files. The BAM files should be named `{bam_id}.bam`, be located in `bam_dir` and each have its index (`{bam_id}.bam.bai`) alongside. If not provided, all BAM files in `bam_dir` will be used.
 - `align_ends_type`: the STAR read-end alignment mode of your BAMs, `"local"` (default) or `"endtoend"` (see [Data preparation](#data-preparation)). Both require the `MD` tag in the BAMs.
 - `processes`: the number of worker processes used for parallelization (default `80`). This is a fixed default, not the machine's core count, so set it explicitly to match the host you are running on.
+- `warm_start`: continue an interrupted run instead of starting over (default `true`, see [Resuming an interrupted run](#resuming-an-interrupted-run)). Set it to `false` to force a clean run, which wipes `w_dir` and `o_dir` first.
+
+### Resuming an interrupted run
+A run that is cut short — by a wall-clock limit, a node failure or a `Ctrl-C` — is picked up where it stopped when you simply start it again with the same config. That is what `warm_start` does, and it is on by default. Each stage resumes at its own granularity:
+
+- **data collection**: per Ribo-seq run for the models and the read mappings, per locus for the locus skeletons;
+- **multimapping EM**: at the last checkpointed iteration, re-running only the loci of that iteration that had not finished, and skipping straight to the final pass when the EM had already converged;
+- **final deconvolution**: at the loci not yet listed in `w_dir/processed_loci.txt`.
+
+Before anything is written, the output files are reconciled with that list: a half-written trailing line is dropped, and so is every row belonging to a locus that is re-run, so no result is duplicated or lost. A resumed run reproduces the output of an uninterrupted one.
+
+PRICE 2 records a fingerprint of your configuration in `price.db` to decide what may be reused:
+
+- change an option that only affects the deconvolution (a filter, `lam`, an `export_*` selection, …) and the collected data is kept while the deconvolution starts over;
+- change an option that decides the *content* of the database (`gtf_path`, `fasta_path`, `bam_dir`, `bam_ids`, `align_ends_type`, `high_quality_runs_only`, `multimap_em`) and the run stops with an error rather than silently mixing incompatible data or discarding a collection that can take days. Point the new configuration at a different `base_dir`, or set `warm_start` to `false` to collect it again.
+
+Paths are compared by file name, so moving or staging an analysis directory elsewhere does not invalidate it.
 
 ### Output
 All results are written to `o_dir`. The main tables live in `o_dir/regions_activities/`:
@@ -95,7 +112,7 @@ PRICE 2 implements a generative model for ribo-seq read counts. Each ORF is asso
 
 The core of PRICE 2 is a Poisson regression with the read counts of the equivalence groups as the target variables and the activities as the coefficients. For a sparse solution a group LASSO penalty is applied to the coefficients such that the coefficients for one ORF in multiple datasets form a group. The penalised objective is minimised with a multiplicative-update solver.
 
-Reads that map to several loci are not discarded. An Expectation-Maximisation loop wraps the per-locus deconvolution: reads compatible with more than one locus are assigned fractionally according to the current activity estimates (E-step), the per-locus deconvolutions are re-solved on those fractional counts (M-step), and the two alternate until both converge. Loci are still solved independently, so there is no joint optimisation across the genome.
+Reads that map to several loci are not discarded. An Expectation-Maximisation loop wraps the per-locus deconvolution: reads compatible with more than one locus are assigned fractionally according to the current activity estimates (E-step), the per-locus deconvolutions are re-solved on those fractional counts (M-step), and the two alternate until both converge. Loci are still solved independently, so there is no joint optimisation across the genome. Setting `multimap_em` to `false` turns the loop off, and multimapping reads (`NH` > 1) are then discarded rather than counted at full weight in every locus they align to. The per-dataset cleavage and coverage models are always estimated from uniquely mapping reads only.
 
 ## License
 PRICE 2 is released under the GNU General Public License v3.0 or later. See [LICENSE](LICENSE) for the full text.

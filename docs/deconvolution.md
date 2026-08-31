@@ -47,6 +47,15 @@ they are computed exactly once, in the final pass.
 Defaults: `em_max_iter = 30` (backstop), `em_tol = 1e-3` (the normal exit),
 `em_huber_steps = 1`.
 
+The loop is also its own checkpoint. `e_step` writes the next iteration's weights and
+then deletes everything it consumed, so `price.db` is always left holding exactly one
+M-step's inputs: `group_weights[k]` and the `locus_activities[k-1]` that warm-start it.
+A warm start reads that back through `multimap.em_resume_point` — `k` is the iteration
+to run next, and the loci that already wrote `locus_activities[k]` are the ones that
+M-step had finished — so an interrupted run re-enters at `k` with only the missing loci,
+rather than at iteration 0. `run_state`'s `em_final_iteration` records that the loop has
+ended, letting a run interrupted during the final pass skip straight back to it.
+
 ---
 
 ## 2. One locus — the M-step worker
