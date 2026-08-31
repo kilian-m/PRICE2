@@ -232,6 +232,9 @@ def build_histograms(
     :data:`_STOP_WINDOW` of the CDS end and its matching range does not span
     the CDS start.  The two conditions are not exclusive.
 
+    Only uniquely mapping reads (``NH`` tag equal to 1, or absent) are
+    counted, as in :class:`~price2.cleavage_model.CleavageModel`.
+
     Parameters
     ----------
     ra : ReferenceAnnotation
@@ -278,6 +281,15 @@ def build_histograms(
         # read in exactly one region.
         if lo is not None and not (lo <= raw_aln.reference_start < hi):
             continue
+        # Multimapping reads would contribute the same footprint to every
+        # locus they align to, biasing the metagene profile towards whatever
+        # is repeated in the genome.  Skipped here, before the alignment is
+        # built, as the cleavage model does with its own reads.
+        try:
+            if raw_aln.get_tag("NH") != 1:
+                continue
+        except KeyError:
+            pass  # no NH tag: treat as unique
 
         result = _try_assign_p_site(
             RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end), ra, cm
