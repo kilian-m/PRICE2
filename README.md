@@ -40,6 +40,12 @@ PRICE 2 relies on the untemplated nucleotide additions ("RT nucleotides") added 
 
 The **`MD` tag is required** — always include it in `--outSAMattributes`. In `endtoend` mode PRICE 2 reads the RT nucleotide from it; if it is missing PRICE 2 warns and detects no untemplated additions.
 
+The BAMs must also be **coordinate-sorted and indexed**: PRICE 2 fetches reads by genomic region, both when estimating the per-dataset models and when mapping reads to loci. The STAR options above already sort the output, so it only remains to index each file:
+
+```bash
+samtools index sample.bam   # writes sample.bam.bai next to it
+```
+
 ### Running PRICE 2
 PRICE 2 exposes many parameters but in most use cases the defaults should work well. We advice to set the parameters in a json config file (alternatively they can be set when calling PRICE 2 from the CLI).
 
@@ -69,7 +75,7 @@ The required parameters are:
 - `fasta_path`: path to the reference genome in FASTA format
 
 other frequently used parameters are:
-- `bam_ids`: a list of identifiers for the BAM files. The BAM files should be named `{bam_id}.bam` and be located in `bam_dir`. If not provided, all BAM files in `bam_dir` will be used.
+- `bam_ids`: a list of identifiers for the BAM files. The BAM files should be named `{bam_id}.bam`, be located in `bam_dir` and each have its index (`{bam_id}.bam.bai`) alongside. If not provided, all BAM files in `bam_dir` will be used.
 - `align_ends_type`: the STAR read-end alignment mode of your BAMs, `"local"` (default) or `"endtoend"` (see [Data preparation](#data-preparation)). Both require the `MD` tag in the BAMs.
 - `processes`: the number of worker processes used for parallelization (default `80`). This is a fixed default, not the machine's core count, so set it explicitly to match the host you are running on.
 
