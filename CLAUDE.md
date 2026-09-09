@@ -20,19 +20,19 @@ pytest tests/test_cleavage_model.py -v
 
 ## Architecture
 
-PRICE2 is a genomics pipeline that detects actively translated ORFs from multiple Ribo-seq datasets using group-LASSO penalized Poisson regression. The pipeline has two main phases:
+PRICE2 is a genomics pipeline that detects actively translated ORFs from multiple Ribo-seq datasets using group-LASSO penalized Poisson regression. `price.py` drives the run as a list of `pipeline.Stage`s in two phases:
 
-**Data collection** (`data_collector.py`): Processes BAM files to estimate per-dataset cleavage and coverage models (`cleavage_model.py`, `coverage_model.py`), maps reads to genomic loci, and generates ORF candidates. All intermediate results are persisted to a SQLite database (`price.db` in the working directory) to allow resumable runs.
+**Data collection** (`data_collector.py`): estimates per-dataset models from the BAMs (`cleavage_estimator.py` / `coverage_estimator.py` fit the frozen `cleavage_model.py` / `coverage_model.py`; `bam.py` holds the BAM conventions, `plotting.py` the diagnostic plots), builds loci from the annotation, maps reads to them and, with `multimap_em`, spills multimapping alignments for `multimap.py`'s linkage index. Everything is persisted to `price.db` through `database.py` (the only place with SQL DDL, connections and blob codecs); `layout.py` names every file of a run; `run_state.py` fingerprints the configuration so a run can be resumed.
 
-**Parallel deconvolution** (`orf_activity_estimator.py`): Spawns worker processes (via `pebble` with `forkserver` — do not change to `fork`) to process each locus independently. Each worker loads its locus from SQLite, applies coverage and deconvolution filters, builds equivalence groups (reads sharing the same ORF compatibility set), then solves the group-LASSO optimization using IRLS-Huber robust regression with L-BFGS-B.
+**Parallel deconvolution** (`orf_activity_estimator.py`): fans the loci out over a `pebble` pool started with `forkserver` (do not change to `fork`). Each worker runs `process_loc` for a `LocusJob`: `orf_candidates.py` generates and classifies the ORF candidates, `read_routing.py` loads the reads, decides which regions each read is compatible with and builds the equivalence groups and the sparse design matrix, `locus.py` applies the filters and orchestrates the solves, `solver.py` is the single solve entry point (multiplicative updates on CPU/GPU or L-BFGS-B) over the objectives in `likelihood.py`, and `export.py` renders the rows the parent writes. With `multimap_em`, light M-steps and `multimap.e_step` alternate before the final full pass.
 
 **Core data structures:**
-- `Locus` (`locus.py`, ~1800 lines): Aggregates overlapping transcripts, generates ORF candidates, runs all filtering and deconvolution logic.
-- `ReadGeneratingRegion` (RGR): A candidate translated region (ORF or NOISE type).
-- `EquivalenceGroup`: Reads compatible with the same ORF set — the rows of the sparse design matrix fed to the optimizer.
+- `Locus` (`locus.py`): the transcripts of one genomic unit, its RGR candidates, equivalence groups and activity matrix; every attribute a worker fills in is declared in `_init_state`.
+- `ReadGeneratingRegion` (RGR, `genomic_features.py`): A candidate translated region (ORF or NOISE type).
+- `EquivalenceGroup` (`equivalence_groups.py`): Reads compatible with the same ORF set — the rows of the sparse design matrix fed to the optimizer. `read_routing.EgRoutingCache` freezes that routing for the EM.
 - `CleavageModel` / `CoverageModel`: Per-dataset learned distributions used to compute per-read per-ORF likelihoods.
 
-**Output**: Per-locus TSV/GTF files at each filtering stage under `regions_activities/`, then aggregated TPM-normalized output (`orfs_tpm.tsv`, `regions_tpm.tsv`).
+**Output**: Per-locus TSV/GTF/BED rows under `regions_activities/` (per filtering stage with `export_all_steps`), then aggregated TPM-normalized output (`orfs_tpm.tsv`, `regions_tpm.tsv`).
 
 ## Key Conventions
 
