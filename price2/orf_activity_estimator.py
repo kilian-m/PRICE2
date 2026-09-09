@@ -35,10 +35,10 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from price2 import database, export, multimap
 from price2.config import Config
-from price2.data_collector import build_rgrs
 from price2.equivalence_groups import make_equivalence_groups
 from price2.layout import RunLayout
 from price2.locus import Locus
+from price2.orf_candidates import build_rgrs
 from price2.ribo_seq_run import RiboSeqRun
 
 logger = logging.getLogger(__name__)
@@ -481,7 +481,7 @@ def _load_locus(
         # Keep the perf columns aligned with the prepare path; the skipped
         # stages report zero time.  A light locus carries no rgr_set/egs, so
         # the counts come off its routing cache.
-        if hasattr(loc, "rgr_set"):
+        if loc.rgr_set is not None:
             n_rgrs = len(loc.rgr_set)
             n_egs = sum(len(egs) for egs in loc.egs.values())
         else:
@@ -625,7 +625,7 @@ def _full_pass(
     """Group-LASSO deconvolution, likelihood-ratio filter and final estimate."""
     with perf.timed("optimization_time"):
         loc.deconvolve(config, runs=runs)
-    perf["irls_outer_iterations"] = getattr(loc, "irls_outer_iterations", 0)
+    perf["irls_outer_iterations"] = loc.irls_outer_iterations
     perf["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
     if config.export_all_steps:
         export.write_step_outputs(

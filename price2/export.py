@@ -207,7 +207,7 @@ def write_tsv(
     """
     columns = REGION_TABLE_COLUMNS if include_noise else ORF_TABLE_COLUMNS
     path = _output_path(prefix, "regions.tsv" if include_noise else "orfs.tsv")
-    result_df = getattr(loc, "result_df", None)
+    result_df = loc.result_df
     with_activities = runs is not None and result_df is not None
     with FileLock(path + ".lock"):
         if runs is not None and not os.path.exists(path):

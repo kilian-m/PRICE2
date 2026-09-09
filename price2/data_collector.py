@@ -428,7 +428,8 @@ class DataCollector:
 
         Per-locus transcript filtering and ORF candidate generation
         (formerly performed here serially) now run inside the parallel
-        deconvolution workers via :func:`build_rgrs`.  This method only
+        deconvolution workers via :func:`price2.orf_candidates.build_rgrs`.
+        This method only
         records the locus skeletons and the run count needed to compute
         ``min_explained_reads`` downstream.
         """
@@ -451,109 +452,6 @@ class DataCollector:
                 ],
             )
         logger.info("Saved %d locus skeletons.", len(loci_ids_to_process))
-
-
-def build_rgrs(
-    locus: Locus,
-    db_path: str,
-    genome: Fasta,
-    config: Config,
-    min_explained_reads: float,
-) -> bool:
-    """Filter a locus's transcripts by read support and build its RGRs.
-
-    Greedily selects transcripts that jointly explain the most observed
-    reads above ``min_explained_reads``, prunes the locus's transcript
-    set and ``transcript_intervals`` accordingly, and calls
-    :meth:`~price2.locus.Locus.make_rgrs` when transcripts remain.
-
-    Parameters
-    ----------
-    locus : Locus
-        Pre-RGR locus skeleton, mutated in place.
-    db_path : str
-        Path to ``price.db`` (read-only access for
-        ``transcript_read_counts``).
-    genome : pyfaidx.Fasta
-        Worker-local indexed FASTA handle.
-    config : Config
-        Parsed PRICE configuration.
-    min_explained_reads : float
-        Threshold (count, not per-run) used to discard transcripts with
-        insufficient read support.
-
-    Returns
-    -------
-    bool
-        ``True`` when the locus retained at least one transcript and
-        RGRs were built; ``False`` for empty loci that downstream code
-        should skip.
-    """
-    with database.connect(db_path) as db:
-        rows = db.execute(
-            "SELECT transcript_read_counts_blob FROM transcript_read_counts "
-            "WHERE locus_id = ?",
-            (locus.id,),
-        ).fetchall()
-
-    transcript_read_counts: dict = {}
-    for (blob,) in rows:
-        for k, v in database.decompress_blob(blob).items():
-            transcript_read_counts[k] = transcript_read_counts.get(k, 0) + v
-
-    tr_ids = [t.id for t in locus.transcripts]
-    explaining_transcripts_reads_list = []
-
-    if tr_ids and transcript_read_counts:
-        n_tr = len(tr_ids)
-        n_rs = len(transcript_read_counts)
-        tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
-
-        M = np.zeros((n_rs, n_tr), dtype=bool)
-        counts = np.zeros(n_rs, dtype=np.float64)
-
-        for row_i, (read_set, count) in enumerate(transcript_read_counts.items()):
-            counts[row_i] = count
-            for member in read_set:
-                if member in tr_to_col:
-                    M[row_i, tr_to_col[member]] = True
-
-        while counts.sum() > 0:
-            weighted = M.T @ counts
-            best_col = int(np.argmax(weighted))
-            best_score = weighted[best_col]
-            if best_score == 0:
-                break
-            explaining_transcripts_reads_list.append(
-                (tr_ids[best_col], best_score)
-            )
-            counts[M[:, best_col]] = 0.0
-
-    transcripts_dict = {tr.id: tr for tr in locus.transcripts}
-
-    locus.transcripts_number = len(locus.transcripts)
-    locus.transcripts = [
-        transcripts_dict[tr_id]
-        for tr_id, count in explaining_transcripts_reads_list
-        if count > min_explained_reads
-    ]
-
-    new_tr_intervals = HTSeq.GenomicArray(
-        list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
-    )
-    for step_iv, step_set in locus.transcript_intervals.steps():
-        new_step_set = set()
-        for tr in step_set:
-            if tr in locus.transcripts:
-                new_step_set.add(tr)
-        new_tr_intervals[step_iv] = new_step_set
-    locus.transcript_intervals = new_tr_intervals
-
-    if not locus.transcripts:
-        return False
-
-    locus.make_rgrs(genome, config)
-    return True
 
 
 #: Loci to map against, shared with the collection workers by fork.  Set by

@@ -66,7 +66,7 @@ The derived EM state lives in ``price.db`` next to the existing tables:
 ``prepared_loci`` / ``prepared_loci_cache``
     The weight-independent per-locus state an EM iteration reuses: the
     prepared :class:`~price2.locus.Locus`, and — separately, because it
-    holds only arrays — its :class:`~price2.locus.EgRoutingCache`.
+    holds only arrays — its :class:`~price2.read_routing.EgRoutingCache`.
 
 ``group_weights`` and ``group_lambdas`` are bare ``float64`` buffers over a
 locus's slots in canonical order (sorted by run index, then ``group_key``);
@@ -1089,7 +1089,7 @@ def write_locus_em_output(
 
 
 def save_locus_cache(db_path: str, locus_id: str, loc) -> None:
-    """Persist a locus's :class:`~price2.locus.EgRoutingCache` on its own.
+    """Persist a locus's :class:`~price2.read_routing.EgRoutingCache` on its own.
 
     The cache references no RGR, transcript or equivalence-group objects, so
     a light M-step can restore it — plus the locus id and interval, all it
@@ -1156,14 +1156,7 @@ def load_light_locus(db_path: str, locus_id: str):
     payload = load_locus_cache(db_path, locus_id)
     if payload is None:
         return None
-    loc = Locus.__new__(Locus)
-    loc.id = payload["id"]
-    loc.iv = payload["iv"]
-    loc.eg_cache = payload["cache"]
-    loc._eg_y = None
-    loc.read_counts = {}
-    loc.uncounted_reads = 0
-    return loc
+    return Locus.light(payload["id"], payload["iv"], payload["cache"])
 
 
 def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:

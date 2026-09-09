@@ -6,34 +6,29 @@ penalised maximum-likelihood estimation, and applies filtering steps
 (coverage, deconvolution, likelihood-ratio) to identify actively
 translated regions.
 
-The ORF-detection helper :func:`find_orfs` and the design-matrix builder
-:func:`egs_to_sparse` are also provided.
+ORF candidate generation lives in :mod:`price2.orf_candidates`, read loading
+and equivalence-group assignment in :mod:`price2.read_routing`.
 """
 
 from __future__ import annotations
 
-import bisect
 import logging
 import time
 from collections import defaultdict
 
 import HTSeq
 import numpy as np
-from pyfaidx import Fasta
 
 logger = logging.getLogger(__name__)
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-from price2 import database
 from price2 import likelihood
-from price2 import multimap
+from price2 import read_routing
 from price2 import solver
 from price2.config import Config
-from price2.coverage_position import CoveragePosition
 from price2.equivalence_groups import EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
-from price2.genomic_region import GenomicRegion
 from price2.likelihood import (
     distribution_theta,
     huber_weights,
@@ -49,199 +44,6 @@ _distribution_theta = distribution_theta
 poisson_nll_grad = likelihood.poisson_nll_grad
 weighted_poisson_nll_grad = likelihood.weighted_poisson_nll_grad
 weighted_poisson_nll_grad_lasso = likelihood.weighted_poisson_nll_grad_lasso
-
-# Transcript biotypes that count as long non-coding RNA.  Ensembl (>=97)
-# and GENCODE (>=v31) use a single "lncRNA" biotype; earlier releases split
-# the same class across the sub-biotypes listed below, so both vocabularies
-# are accepted.  Note that Ensembl <=91 spells the antisense biotype
-# "antisense_RNA" and 92..96 spell it "antisense".  "processed_transcript"
-# and "retained_intron" are deliberately excluded: in the legacy vocabulary
-# they are also used for non-coding transcripts of protein-coding genes.
-LNCRNA_BIOTYPES: frozenset[str] = frozenset(
-    {
-        "lncRNA",
-        "lincRNA",
-        "antisense",
-        "antisense_RNA",
-        "sense_intronic",
-        "sense_overlapping",
-        "macro_lncRNA",
-        "bidirectional_promoter_lncRNA",
-        "3prime_overlapping_ncRNA",
-    }
-)
-
-# Priority-ordered levels for ORF type assignment.  Within each level,
-# having more than one matching label across compatible transcripts yields
-# "other ORF"; the first level with exactly one match wins.
-ORF_TYPES_LEVELS: list[set[str]] = [
-    {"cORF"},
-    {"N terminal extended cORF", "N terminal truncated cORF"},
-    {
-        "+1 uoORF",
-        "+2 uoORF",
-        "+1 doORF",
-        "+2 doORF",
-        "+1 iORF",
-        "+2 iORF",
-    },
-    {"uORF", "dORF"},
-    {"pcRNA-ORF", "lncRNA-ORF", "varRNA-ORF"},
-]
-
-
-def get_orf_type(
-    orf: ReadGeneratingRegion,
-    transcripts: set[Transcript],
-) -> str:
-    """Classify an ORF relative to the annotated CDSs of compatible transcripts.
-
-    For each transcript in *transcripts* that contains the ORF's genomic
-    footprint, the relationship between the ORF interval and the annotated
-    CDS (in spliced transcript coordinates) is determined.  When an ORF is
-    compatible with multiple transcripts the assignments are reconciled
-    using :data:`ORF_TYPES_LEVELS`: the highest-priority level that has
-    exactly one matching label is used; conflicting labels at the same
-    level yield ``"other ORF"``.
-
-    Parameters
-    ----------
-    orf : ReadGeneratingRegion
-        An ORF-type RGR whose type should be classified.
-    transcripts : set[Transcript]
-        All transcripts belonging to the locus.
-
-    Returns
-    -------
-    str
-        ORF type label, e.g. ``'cORF'``, ``'uORF'``, ``'+0 iORF'``, or
-        ``'other ORF'``.
-    """
-    assignments: dict[Transcript, str] = {}
-
-    for tr in transcripts:
-        try:
-            orf_interval = tr.exons.map_to_local(orf.genomic_region)
-        except ValueError:
-            continue
-
-        if tr.annotated_cds_iv is not None:
-            cds_interval = tr.annotated_cds_iv
-            orf_start, orf_end = orf_interval
-            cds_start, cds_end = cds_interval
-
-            if orf_interval == cds_interval:
-                label = "cORF"
-            elif orf_end == cds_end and orf_start < cds_start:
-                label = "N terminal extended cORF"
-            elif orf_end == cds_end and orf_start > cds_start:
-                label = "N terminal truncated cORF"
-            elif orf_end <= cds_start:
-                label = "uORF"
-            elif orf_start >= cds_end:
-                label = "dORF"
-            else:
-                frame = (orf_start - cds_start) % 3
-                if orf_start < cds_start < orf_end < cds_end:
-                    label = f"+{frame} uoORF"
-                elif cds_start < orf_start < cds_end < orf_end:
-                    label = f"+{frame} doORF"
-                elif cds_start < orf_start and orf_end < cds_end:
-                    label = f"+{frame} iORF"
-                else:
-                    label = "other ORF"
-
-        elif tr.biotype == "protein_coding":
-            label = "pcRNA-ORF"
-        elif tr.biotype in LNCRNA_BIOTYPES:
-            label = "lncRNA-ORF"
-        else:
-            label = "varRNA-ORF"
-
-        assignments[tr] = label
-
-    if not assignments:
-        return "other ORF"
-
-    label_set = set(assignments.values())
-    for level in ORF_TYPES_LEVELS:
-        matches = label_set & level
-        if len(matches) > 1:
-            return "other ORF"
-        if len(matches) == 1:
-            return matches.pop()
-
-    return "other ORF"
-
-
-class EgRoutingCache:
-    """Weight-independent per-locus state reused across EM iterations.
-
-    Between multimapping-EM iterations only the fractional read weights
-    change: the RGR set, the equivalence groups and hence the design matrix
-    ``X`` are fixed (the light M-step runs with ``prune=False``).  This
-    caches everything a light M-step would otherwise re-derive from the
-    reads — the read → design-matrix-row routing and the geometry of ``X`` —
-    so an iteration reduces to a weighted ``bincount`` plus a vectorised
-    rebuild of ``X.data``.
-
-    Invalidated (set to ``None`` on the locus) whenever the RGR set changes,
-    since that re-indexes RGRs and collapses equivalence groups.
-
-    It holds only arrays, ints and strings — no RGR, transcript or
-    equivalence-group objects — so it can be pickled on its own.  A light
-    M-step therefore loads just this blob (a few numpy ``memcpy``s) instead
-    of unpickling the locus's whole object graph, which is ~96% of the cost
-    of restoring a prepared locus.
-
-    Attributes
-    ----------
-    n_rows : int
-        Number of design-matrix rows (non-empty equivalence groups).
-    n_reads : dict[str, int]
-        Reads per run at build time; guards against a changed read order.
-    eg_row : dict[str, numpy.ndarray]
-        Per run, the row each read feeds: ``>=0`` a row index, ``-1`` the
-        read's key is absent from ``egs`` (uncounted), ``-2`` the read is
-        compatible with no RGR.
-    counts0 : dict[str, numpy.ndarray]
-        Per run, each read's raw (unweighted) count.
-    mm_idx, mm_gk, mm_base : dict[str, numpy.ndarray]
-        Per run, the read positions that carry a multimapping slot, their
-        group keys, and their baseline cross-locus mass.
-    slot_gk, slot_rl, slot_oua, slot_nnz : dict[str, numpy.ndarray]
-        Per run, one entry per multimapping slot: group key, read length,
-        untemplated-addition flag, and number of compatible RGR cells.
-    slot_rgr, slot_code : dict[str, numpy.ndarray]
-        Per run, the flattened slot cells: RGR index and packed
-        ``frame * 3 + coverage_position``.  Replaces the object-valued
-        ``mm_slots`` routing that :meth:`compute_multimap_lambdas` used.
-    cell_rgr, cell_code : numpy.ndarray
-        One entry per design-matrix cell: the RGR index, and
-        ``frame * 3 + coverage_position`` packed into a byte.
-    row_nnz, row_len, row_rl, row_oua, row_run : numpy.ndarray
-        Per row: cell count, EG length, read length, untemplated-addition
-        flag, and run index.
-    num_rgrs : int
-        RGR count at build time (design-matrix column blocks).
-    rgr_ids : tuple[str, ...]
-        RGR identifiers, indexed by ``rgr.index``.
-    rgr_lengths : numpy.ndarray
-        RGR lengths, indexed by ``rgr.index``.
-    """
-
-    __slots__ = (
-        "n_rows", "n_reads", "eg_row", "counts0", "mm_idx", "mm_gk",
-        "mm_base", "slot_gk", "slot_rl", "slot_oua", "slot_nnz",
-        "slot_rgr", "slot_code", "cell_rgr", "cell_code", "row_nnz",
-        "row_len", "row_rl", "row_oua", "row_run", "num_rgrs",
-        "rgr_ids", "rgr_lengths",
-    )
-
-    def __init__(self, **fields: object) -> None:
-        for name, value in fields.items():
-            setattr(self, name, value)
-
 
 class Locus:
     """A genomic locus containing overlapping transcripts and ORF candidates.
@@ -306,11 +108,8 @@ class Locus:
             Sequential counter used to build :attr:`id`.
         """
         self.iv = iv
-        self.read_counts: dict[RiboSeqRun, int] = {}
-        self.uncounted_reads = 0
-        self.eg_cache: EgRoutingCache | None = None
-        self._eg_y: np.ndarray | None = None
         self.id = f"loc_{loci_number}"
+        self._init_state()
 
         self.transcript_intervals = HTSeq.GenomicArrayOfSets(
             "auto", stranded=True, storage="step"
@@ -326,6 +125,52 @@ class Locus:
             self.transcripts |= value
             if value:
                 self.exon_length += iv.length
+
+    def _init_state(self) -> None:
+        """Reset everything a worker fills in after the skeleton is built."""
+        # ORF candidates (``make_rgrs`` / ``build_rgrs``).
+        self.rgr_set: set[ReadGeneratingRegion] = set()
+        self.gene_ids_complete: set[str] = set()
+        self.transcripts_number: int = 0
+        # Reads (``get_reads_from_db``) and their counts per RGR
+        # (``make_well_fitting_reads``).
+        self.rsas_dict: dict[str, list[RiboSeqAlignment]] = {}
+        self.run_read_count: dict[str, int] = {}
+        self.wfr_df: pd.DataFrame | None = None
+        # Equivalence groups and the reads assigned to them.
+        self.egs: dict[RiboSeqRun, dict] | None = None
+        self.mm_slots: dict[str, dict] = {}
+        self.read_counts: dict[RiboSeqRun, float] = {}
+        self.counted_reads: dict[str, float] = {}
+        self.uncounted_reads: float = 0
+        self.eg_cache: read_routing.EgRoutingCache | None = None
+        self._eg_y: np.ndarray | None = None
+        # Deconvolution results.
+        self.result: np.ndarray | None = None
+        self.result_df: pd.DataFrame | None = None
+        self.irls_huber_weights: np.ndarray | None = None
+        self.irls_outer_iterations: int = 0
+
+    @classmethod
+    def light(cls, locus_id: str, iv: HTSeq.GenomicInterval, cache) -> Locus:
+        """A locus carrying only its routing cache (an intermediate EM pass).
+
+        It has no transcripts, RGRs or equivalence groups (``rgr_set`` is
+        ``None``); restoring those dominates the cost of loading a prepared
+        locus, and a light M-step needs none of them.
+        """
+        loc = cls.__new__(cls)
+        loc._init_state()
+        loc.id = locus_id
+        loc.iv = iv
+        loc.rgr_set = None
+        loc.eg_cache = cache
+        return loc
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore a pickle, filling in attributes older pickles lack."""
+        self._init_state()
+        self.__dict__.update(state)
 
     def __repr__(self) -> str:
         return f"Locus({self.iv})"
@@ -433,488 +278,58 @@ class Locus:
         state.pop("_transcript_breakpoint_index", None)
         state.pop("_transcript_junction_index", None)
         state.pop("_has_abutting_exons", None)
-        return state
-
-    def make_rgrs(
-        self,
-        genome: Fasta,
-        config: Config,
-        min_length_to_end: int = 30,
-    ) -> None:
-        """Generate ORF and noise ReadGeneratingRegions for this locus.
-
-        For each transcript, noise regions are created upstream and
-        downstream of the annotated CDS (if present) or spanning the
-        full transcript otherwise.  ORF candidates are found by scanning
-        the spliced transcript sequence for start/stop codon pairs.
-        Duplicate RGRs (identical genomic footprint) are deduplicated,
-        keeping the copy with the longest flanking context.
-
-        Parameters
-        ----------
-        genome : pyfaidx.Fasta
-            Indexed FASTA handle keyed by chromosome name.
-        config : Config
-            Configuration providing ``start_codons`` and ``stop_codons``.
-        min_length_to_end : int
-            Minimum combined length of ORF plus flanking transcript
-            distance (in nucleotides) for an ORF to be retained.
-        """
-        self.rgr_set: set[ReadGeneratingRegion] = set()
-        orf_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
-        noise_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
-
-        for transcript in self.transcripts:
-            if (transcript.annotated_cds_iv is not None) and (
-                (cds_start := transcript.annotated_cds_iv[0]) > 5
-            ):
-                # cds_start = transcript.exons.map_to_local(transcript.cds)[0]
-                noise1 = ReadGeneratingRegion(
-                    "NOISE",
-                    transcript,
-                    f"{transcript.id}_a",
-                    (0, cds_start),
-                )
-
-                noise2 = ReadGeneratingRegion(
-                    "NOISE",
-                    transcript,
-                    f"{transcript.id}_b",
-                    (cds_start, len(transcript.exons)),
-                )
-
-                for noise in [noise1, noise2]:
-                    if noise not in noise_dict:
-                        noise_dict[noise] = noise
-                    else:
-                        existing = noise_dict[noise]
-                        existing_span = (
-                            existing.dist_to_transcript_end
-                            + existing.dist_to_transcript_start
-                        )
-                        new_span = (
-                            noise.dist_to_transcript_end
-                            + noise.dist_to_transcript_start
-                        )
-                        if new_span > existing_span:
-                            noise_dict[noise] = noise
-
-            else:
-                noise = ReadGeneratingRegion(
-                    "NOISE",
-                    transcript,
-                    transcript.id,
-                    (0, len(transcript.exons)),
-                )
-                if noise not in noise_dict:
-                    noise_dict[noise] = noise
-                else:
-                    existing = noise_dict[noise]
-                    existing_span = (
-                        existing.dist_to_transcript_end
-                        + existing.dist_to_transcript_start
-                    )
-                    new_span = (
-                        noise.dist_to_transcript_end
-                        + noise.dist_to_transcript_start
-                    )
-                    if new_span > existing_span:
-                        noise_dict[noise] = noise
-
-            seq = transcript.exons.get_sequence(genome)
-            c = 0
-            for orf_iv_on_transcript in find_orfs(
-                seq, config.start_codons, config.stop_codons
-            ):
-                rgr_iv_on_transcript = (
-                    orf_iv_on_transcript[0],
-                    orf_iv_on_transcript[1] - 3,
-                )  # remove stop codon
-                c += 1
-                orf = ReadGeneratingRegion(
-                    "ORF",
-                    transcript,
-                    f"{transcript.id}_{c:04d}",
-                    rgr_iv_on_transcript,
-                )
-                if len(orf) + orf.dist_to_transcript_end < min_length_to_end:
-                    continue
-                if len(orf) + orf.dist_to_transcript_start < min_length_to_end:
-                    continue
-                if orf not in orf_dict:
-                    orf_dict[orf] = orf
-                else:
-                    existing = orf_dict[orf]
-                    existing_span = (
-                        existing.dist_to_transcript_end
-                        + existing.dist_to_transcript_start
-                    )
-                    new_span = orf.dist_to_transcript_end + orf.dist_to_transcript_start
-                    if new_span > existing_span:
-                        orf_dict[orf] = orf
-
-        for noise in noise_dict.values():
-            noise.transcript.rgr_set.add(noise)
-        self.rgr_set |= set(noise_dict.values())
-        for orf in orf_dict.values():
-            orf.orf_type = get_orf_type(orf, self.transcripts)
-            orf.transcript.add_orf(orf)
-        self.rgr_set |= set(orf_dict.values())
-
-        # ``rgr.index`` addresses the design-matrix column blocks and the rows
-        # of ``result``, so every RGR carries one from the moment the set is
-        # built.  ``remove_rgrs`` re-densifies them after a removal.
-        for c, rgr in enumerate(self.rgr_set):
-            rgr.index = c
-
-        self.gene_ids_complete = {
-            rgr.transcript.gene_id for rgr in self.rgr_set
+        # Sets of RGRs can only be unpickled once the RGRs' state is restored
+        # (their hash reads ``genomic_region``).  Emitting the transcripts
+        # first pickles every RGR through ``Transcript.rgr_set`` before any
+        # locus-level set refers to it.
+        first = {
+            name: state.pop(name)
+            for name in ("iv", "id", "transcript_intervals", "transcripts")
+            if name in state
         }
+        return {**first, **state}
 
-    def get_rgr_frame_covpos(
-        self,
-        rsa: RiboSeqAlignment,
-        run: RiboSeqRun,
-        overlap_likelihood_ratio_threshold: float = 0.2,
-    ) -> frozenset[tuple[ReadGeneratingRegion, int | None, CoveragePosition]] | None:
-        """Determine which RGRs a read alignment is compatible with.
+    # ------------------------------------------------------------------ #
+    # Reads and equivalence groups (see :mod:`price2.read_routing`)        #
+    # ------------------------------------------------------------------ #
 
-        For each RGR overlapping the read, compute the reading frame and
-        coverage-profile position (start / middle / stop).  Partial
-        overlaps are kept only when the cleavage-model probability ratio
-        exceeds *overlap_likelihood_ratio_threshold*.
+    def get_reads_from_db(self, db_path: str, drop_multimappers: bool = False) -> None:
+        """Load this locus's reads (see :func:`price2.read_routing.load_reads`)."""
+        read_routing.load_reads(self, db_path, drop_multimappers)
 
-        Parameters
-        ----------
-        rsa : RiboSeqAlignment
-            A single Ribo-seq read alignment.
-        run : RiboSeqRun
-            The Ribo-seq run that produced *rsa*.
-        overlap_likelihood_ratio_threshold : float
-            Minimum ratio of partial-overlap cleavage probability to
-            full-overlap probability for a partial overlap to be accepted.
+    def get_rgr_frame_covpos(self, rsa: RiboSeqAlignment, run: RiboSeqRun):
+        """The RGRs a read is compatible with.
 
-        Returns
-        -------
-        frozenset[tuple[ReadGeneratingRegion, int | None, CoveragePosition]] or None
-            Set of ``(rgr, frame, coverage_position)`` tuples, or
-            ``None`` when no compatible RGR is found.
+        See :func:`price2.read_routing.rgr_compatibility`.
         """
+        return read_routing.rgr_compatibility(self, rsa, run)
 
-        overlap_transcripts = set(self.transcripts)
+    def make_well_fitting_reads(self, runs: list[RiboSeqRun]) -> None:
+        """Count well-fitting reads per RGR.
 
-        rgr_frame_covpos = set()
+        See :func:`price2.read_routing.count_well_fitting_reads`.
+        """
+        read_routing.count_well_fitting_reads(self, runs)
 
-        bp_starts, bp_ends, bp_sets = self.transcript_breakpoint_index
-        for query_iv in rsa.genomic_region.intervals:
-            i = bisect.bisect_right(bp_ends, query_iv.start)
-            while i < len(bp_starts) and bp_starts[i] < query_iv.end:
-                overlap_transcripts &= bp_sets[i]
-                i += 1
+    def assign_reads_to_egs(
+        self,
+        runs: list[RiboSeqRun],
+        mm_data: dict | None = None,
+        build_cache: bool = False,
+    ) -> None:
+        """Assign reads to equivalence groups.
 
-        # Hoist per-read / per-run invariants out of the transcript x rgr
-        # loops.  ``len(rsa) == len(rsa.genomic_region)`` (a cached value) and
-        # the untemplated-addition flag are the same for every candidate RGR,
-        # so compute them once.  The full-overlap cleavage likelihood is an
-        # exact lookup-table entry (verified bit-identical to
-        # ``CleavageModel.pmf`` across the whole domain), so index the LUT
-        # directly instead of paying a pmf() call frame per RGR — only the
-        # partial-overlap (region-bounded) likelihoods still call pmf.
-        pmf = run.cleavage_model.pmf
-        cds_lut = run.cleavage_model.cds_lut
-        noise_lut = run.cleavage_model.noise_lut
-        lut_len = cds_lut.shape[0]
-        read_length = len(rsa)
-        oua = rsa.untemplated_addition
-        oua_i = int(oua)
-        thr = overlap_likelihood_ratio_threshold
-        cov_middle = CoveragePosition.middle
-        cov_start = CoveragePosition.start
-        cov_stop = CoveragePosition.stop
-        in_lut = read_length < lut_len
-        noise_cl = noise_lut[read_length, oua_i] if in_lut else 0.0
+        See :func:`price2.read_routing.assign_reads_to_egs`.
+        """
+        read_routing.assign_reads_to_egs(self, runs, mm_data, build_cache)
 
-        for tr in overlap_transcripts:
-            try:
-                rsa_iv_on_tr = tr.exons.map_to_local(rsa.genomic_region)
-            except ValueError:
-                continue
-            rsa_lo, rsa_hi = rsa_iv_on_tr
-            for rgr in tr.rgr_set:
-                rgr_lo, rgr_hi = rgr.iv_on_transcript
-                # full overlap with orf
-                if rgr.type == "NOISE":
-                    frame = None
-                    if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
-                        if noise_cl > 0:
-                            rgr_frame_covpos.add((rgr, frame, cov_middle))
-                    elif (rsa_lo <= rgr_lo <= rsa_hi) or (
-                        rsa_lo <= rgr_hi <= rsa_hi
-                    ):
-                        region_start = rgr_lo - rsa_lo
-                        region_end = rgr_hi - rsa_lo
-                        if (
-                            ol := pmf(
-                                read_length,
-                                oua,
-                                frame,
-                                region_start=region_start,
-                                region_end=region_end,
-                            )
-                        ) > 0:
-                            cl = noise_cl
-                            if cl == 0:
-                                continue
-                            # cl > 0 here, so test ol > thr*cl instead of
-                            # ol/cl > thr: same result, no scalar-divide overflow
-                            # when cl is a tiny denormal.
-                            if ol > thr * cl:
-                                rgr_frame_covpos.add(
-                                    (
-                                        rgr,
-                                        frame,
-                                        cov_middle,
-                                    )
-                                )
-                elif rgr.type == "ORF":
-                    orf = rgr
-                    if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
-                        frame = (rsa_lo - rgr_lo) % 3
-                        if (cds_lut[read_length, frame, oua_i] if in_lut else 0.0) > 0:
-                            rgr_frame_covpos.add((orf, frame, cov_middle))
-                    # part overlap with orf
-                    elif (rsa_lo <= rgr_lo <= rsa_hi) or (
-                        rsa_lo <= rgr_hi <= rsa_hi
-                    ):
-                        frame = (rsa_lo - rgr_lo) % 3
-                        cl = cds_lut[read_length, frame, oua_i] if in_lut else 0.0
-                        cl_ok = not cl == 0
-                        # consider overlap likelihood
-                        # compute at which position in the read the orf starts
-                        region_start = rgr_lo + 3 - rsa_lo
-                        # compute at which position in the read the orf ends
-                        region_end = rgr_hi - 3 - rsa_lo
-                        if (
-                            ol := pmf(
-                                read_length,
-                                oua,
-                                frame,
-                                region_start=region_start,
-                                region_end=region_end,
-                            )
-                        ) > 0:
-                            # ol > thr*cl avoids the ol/cl scalar-divide overflow
-                            # when cl is a tiny denormal (cl_ok guarantees cl > 0);
-                            # identical result since thr > 0.
-                            if cl_ok and (ol > thr * cl):
-                                rgr_frame_covpos.add(
-                                    (
-                                        orf,
-                                        frame,
-                                        cov_middle,
-                                    )
-                                )
-                        # consider coverage profile - start
-                        # compute where the orf starts relative to the read
-                        start_position = (
-                            rgr_lo - rsa_lo,
-                            rgr_lo + 3 - rsa_lo,
-                        )
-                        if (
-                            ol := pmf(
-                                read_length,
-                                oua,
-                                frame,
-                                region_start=start_position[0],
-                                region_end=start_position[1],
-                            )
-                        ) > 0:
-                            if cl_ok and (
-                                # ol * run.coverage_model.start_factor / cl
-                                # (as ol > thr*cl: avoids scalar-divide overflow
-                                #  for denormal cl; cl_ok guarantees cl > 0)
-                                ol
-                                > thr * cl
-                            ):
-                                rgr_frame_covpos.add(
-                                    (orf, frame, cov_start)
-                                )
-
-                        # consider coverage profile - stop
-                        # compute where the orf ends relative to the read
-                        stop_position = (
-                            rgr_hi - 3 - rsa_lo,
-                            rgr_hi - rsa_lo,
-                        )
-                        if (
-                            ol := pmf(
-                                read_length,
-                                oua,
-                                frame,
-                                region_start=stop_position[0],
-                                region_end=stop_position[1],
-                            )
-                        ) > 0:
-                            if cl_ok and (
-                                # ol * run.coverage_model.stop_factor / cl
-                                # (as ol > thr*cl: avoids scalar-divide overflow
-                                #  for denormal cl; cl_ok guarantees cl > 0)
-                                ol
-                                > thr * cl
-                            ):
-                                rgr_frame_covpos.add(
-                                    (orf, frame, cov_stop)
-                                )
-
-        if not rgr_frame_covpos:
-            return
-
-        rgr_frame_covpos = frozenset(rgr_frame_covpos)
-        return rgr_frame_covpos
+    def compute_multimap_lambdas(self, runs: list[RiboSeqRun]) -> list:
+        """Per-slot origin rates (see :func:`price2.read_routing.multimap_lambdas`)."""
+        return read_routing.multimap_lambdas(self, runs)
 
     # ------------------------------------------------------------------ #
     # ORF activity estimation                                              #
     # ------------------------------------------------------------------ #
-
-    def get_reads_from_db(
-        self, db_path: str, drop_multimappers: bool = False
-    ) -> None:
-        """Load reads for this locus from the SQLite database.
-
-        Populates :attr:`rsas_dict` (mapping run id to a list of
-        :class:`RiboSeqAlignment` objects) and :attr:`run_read_count`.
-
-        Parameters
-        ----------
-        db_path : str
-            Path to the ``price.db`` SQLite database.
-        drop_multimappers : bool, optional
-            Discard stored reads that align to more than one genomic locus
-            (``NH > 1``) instead of counting them at full weight here.  Set
-            when ``multimap_em`` is disabled, which leaves no mechanism for
-            spreading such a read over the loci it aligns to.  A database
-            collected with ``multimap_em`` disabled holds no multimapping
-            reads to begin with, so this is a no-op there; it matters when a
-            database collected with the EM enabled is deconvolved without it.
-            Note that ``transcript_read_counts`` -- used only for the
-            transcript-support filter -- still includes them in that case.
-        """
-        with database.connect(db_path) as db:
-            rows = db.execute(
-                "SELECT run_id, reads_blob FROM reads WHERE locus_id = ?",
-                (self.id,),
-            ).fetchall()
-        self.run_read_count = {}
-        self.rsas_dict = {}
-        chrom = self.iv.chrom
-        strand = self.iv.strand
-        # Memoize GenomicRegion objects by their interval-coordinate signature.
-        # Reads are exact-deduplicated within a run at collection time, but the
-        # same coordinates recur across runs (typically 40-80% of reads); sharing
-        # one immutable GenomicRegion across runs avoids rebuilding its intervals
-        # and hash.  Scoped per locus, so it is freed when the locus is done.
-        region_cache: dict[tuple, GenomicRegion] = {}
-        for run_id, blob in rows:
-            reads_df = database.decompress_blob(blob)
-
-            # Vectorized: pull columns into numpy arrays and locate per-read
-            # boundaries from is_first_iv, avoiding groupby / iterrows / per-row
-            # Series construction (the dominant cost of read loading).
-            is_first = reads_df["is_first_iv"].to_numpy()
-            starts = reads_df["start"].to_numpy()
-            ends = reads_df["end"].to_numpy()
-            uas = reads_df["untemplated_addition"].to_numpy()
-            uniques = reads_df["unique"].to_numpy()
-            counts = reads_df["count"].to_numpy()
-
-            boundaries = np.flatnonzero(is_first)
-            read_ends = np.append(boundaries[1:], len(is_first))
-            if drop_multimappers:
-                keep = uniques[boundaries].astype(bool)
-                boundaries = boundaries[keep]
-                read_ends = read_ends[keep]
-
-            rsas_run = []
-            for b, e in zip(boundaries.tolist(), read_ends.tolist()):
-                if e - b == 1:
-                    sig = (int(starts[b]), int(ends[b]))
-                else:
-                    sig = tuple(
-                        (int(starts[j]), int(ends[j])) for j in range(b, e)
-                    )
-                gr = region_cache.get(sig)
-                if gr is None:
-                    intervals = [
-                        HTSeq.GenomicInterval(
-                            chrom, int(starts[j]), int(ends[j]), strand
-                        )
-                        for j in range(b, e)
-                    ]
-                    gr = GenomicRegion(
-                        intervals=intervals, chrom=chrom, strand=strand
-                    )
-                    region_cache[sig] = gr
-                rsas_run.append(
-                    RiboSeqAlignment.from_region(
-                        gr,
-                        untemplated_addition=bool(uas[b]),
-                        unique=bool(uniques[b]),
-                        read_count=int(counts[b]),
-                    )
-                )
-            self.rsas_dict[run_id] = rsas_run
-
-            self.run_read_count[run_id] = int(
-                counts[boundaries].astype(np.int64).sum()
-            )
-
-    def make_well_fitting_reads(self, runs: list[RiboSeqRun]) -> None:
-        """Count well-fitting reads per RGR and run.
-
-        A read is *well-fitting* when its length and untemplated-addition
-        status match a high-probability entry in the run's cleavage
-        model.  Results are stored in :attr:`wfr_df` (a DataFrame
-        indexed by RGR id with one column per run).
-
-        Parameters
-        ----------
-        runs : list[RiboSeqRun]
-            Ribo-seq runs to process.
-        """
-        well_fitting_rcs = {}
-        for run in runs:
-            well_fitting_rcs[run.id] = {}
-            for rgr in self.rgr_set:
-                if rgr.type == "ORF":
-                    well_fitting_rcs[run.id][rgr.id] = 0
-        for run in runs:
-            well_fitting_indices = run.cleavage_model.get_high_prob_indices()
-            well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}
-            for rsa in self.rsas_dict[run.id]:
-                if (
-                    len(rsa),
-                    int(rsa.untemplated_addition),
-                ) not in well_fitting_length_oua:
-                    continue
-                rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
-                if not rgr_frame_covpos:
-                    continue
-
-                # One RGR can appear under several coverage positions for the
-                # same read (a read spanning a short ORF overlaps both its
-                # start- and stop-codon regions), so deduplicate before
-                # counting: a read contributes its count once per RGR.
-                orf_ids = {
-                    rgr.id
-                    for rgr, _frame, _covpos in rgr_frame_covpos
-                    if rgr.type != "NOISE"
-                }
-                for rgr_id in orf_ids:
-                    well_fitting_rcs[run.id][rgr_id] += rsa.read_count
-
-        self.wfr_df = (
-            pd.DataFrame.from_dict(well_fitting_rcs).replace(np.nan, 0).astype(np.int32)
-        )
 
     def coverage_filter_rgrs(self, config: Config) -> None:
         """Remove ORFs with insufficient well-fitting read coverage.
@@ -1154,364 +569,6 @@ class Locus:
 
         return {k for k, v in rgr_indices.items() if v not in all_kept}
 
-    def assign_reads_to_egs(
-        self,
-        runs: list[RiboSeqRun],
-        mm_data: dict | None = None,
-        build_cache: bool = False,
-    ) -> None:
-        """Assign reads to their equivalence groups.
-
-        Each read is matched to its ``(rgr_frame_covpos, length, oua)``
-        key and added to the corresponding :class:`EquivalenceGroup`.
-        Reads whose key is absent (due to earlier filtering) are counted
-        in :attr:`uncounted_reads`.
-
-        When ``mm_data`` is supplied (multimapping EM mode), each
-        cross-locus multimapping read contributes a *fractional* count at
-        this locus instead of its full count.  For a slot with collapsed
-        count ``c``, baseline cross-locus mass ``base`` and current
-        fractional weight ``weight`` the effective contribution is
-        ``c - base + weight`` (single-slot multimappers keep full weight;
-        cross-locus reads are down-weighted so their total mass across all
-        their loci sums to one).  The routing needed by the E-step is
-        cached in :attr:`mm_slots`.
-
-        Parameters
-        ----------
-        runs : list[RiboSeqRun]
-            Ribo-seq runs to process.
-        mm_data : dict, optional
-            ``{run_id: {group_key: (base, weight)}}`` for this locus's
-            multimapping slots, or ``None`` for classic full-weight
-            counting.
-        build_cache : bool, optional
-            Record the weight-independent read routing and design-matrix
-            geometry in :attr:`eg_cache` while assigning.  Later EM
-            iterations then take :meth:`_assign_reads_from_cache`, which
-            skips the per-read :meth:`get_rgr_frame_covpos` recomputation.
-        """
-        cache = getattr(self, "eg_cache", None)
-        if cache is not None and not build_cache:
-            self._assign_reads_from_cache(runs, mm_data, cache)
-            return
-
-        # Row layout of the design matrix, in the order ``egs_to_sparse``
-        # emits rows.  Built up-front so each read can record the row it
-        # feeds instead of re-deriving its equivalence-group key later.
-        if build_cache:
-            row_of_key: dict = {}
-            n_rows = 0
-            for run in runs:
-                d: dict = {}
-                for key in self.egs[run]:
-                    if not key[0]:
-                        continue
-                    d[key] = n_rows
-                    n_rows += 1
-                row_of_key[run.id] = d
-            eg_row: dict = {}
-            counts0: dict = {}
-            mm_idx: dict = {}
-            mm_gk: dict = {}
-            mm_base: dict = {}
-
-        # {run_id: {group_key: (rgr_frame_covpos, read_length, oua)}} —
-        # the compatibility routing the E-step needs to recompute λ.
-        self.mm_slots = {run.id: {} for run in runs}
-        for run in runs:
-            run_id = run.id
-            run_mm = mm_data.get(run_id) if mm_data else None
-
-            if build_cache:
-                n_reads = len(self.rsas_dict[run_id])
-                rows_arr = np.full(n_reads, -2, dtype=np.int32)
-                counts_arr = np.zeros(n_reads, dtype=np.float64)
-                run_rows = row_of_key[run_id]
-                mi: list = []
-                mg: list = []
-                mb: list = []
-
-            for i, rsa in enumerate(self.rsas_dict[run_id]):
-                rgr_frame_covpos = self.get_rgr_frame_covpos(rsa, run)
-                read_count = rsa.read_count
-
-                if build_cache:
-                    counts_arr[i] = rsa.read_count
-                    if rgr_frame_covpos:
-                        rows_arr[i] = run_rows.get(
-                            (
-                                rgr_frame_covpos,
-                                len(rsa),
-                                rsa.untemplated_addition,
-                            ),
-                            -1,
-                        )
-
-                if run_mm is not None and not rsa.unique():
-                    gk = multimap.alignment_group_key(rsa)
-                    slot = run_mm.get(gk)
-                    if slot is not None:
-                        base, weight = slot
-                        # ``base`` is summed over the spilled alignments at
-                        # indexing time, independently of the collapsed slot
-                        # count ``read_count``; floor the non-cross-locus
-                        # remainder at zero so that any disagreement between
-                        # the two can never drive the Poisson response
-                        # negative.
-                        read_count = max(0.0, read_count - base) + weight
-                        if build_cache:
-                            mi.append(i)
-                            mg.append(gk)
-                            mb.append(base)
-                        if rgr_frame_covpos:
-                            self.mm_slots[run_id][gk] = (
-                                rgr_frame_covpos,
-                                len(rsa),
-                                rsa.untemplated_addition,
-                            )
-
-                if not rgr_frame_covpos:
-                    continue
-
-                try:
-                    self.egs[run][
-                        (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
-                    ].read_count += read_count
-                    run.read_count += read_count
-                except KeyError:
-                    self.uncounted_reads += read_count
-
-                try:
-                    self.read_counts[run] += read_count
-                except KeyError:
-                    self.read_counts[run] = read_count
-
-            if build_cache:
-                eg_row[run_id] = rows_arr
-                counts0[run_id] = counts_arr
-                mm_idx[run_id] = np.array(mi, dtype=np.int32)
-                mm_gk[run_id] = np.array(mg, dtype=np.int64)
-                mm_base[run_id] = np.array(mb, dtype=np.float64)
-
-        self.counted_reads = {}
-        for run in runs:
-            self.counted_reads[run.id] = 0
-            for v in self.egs[run].values():
-                self.counted_reads[run.id] += v.read_count
-
-        if build_cache:
-            self.eg_cache = self._make_eg_cache(
-                runs, n_rows, eg_row, counts0, mm_idx, mm_gk, mm_base
-            )
-
-    def _make_eg_cache(
-        self,
-        runs: list[RiboSeqRun],
-        n_rows: int,
-        eg_row: dict,
-        counts0: dict,
-        mm_idx: dict,
-        mm_gk: dict,
-        mm_base: dict,
-    ) -> EgRoutingCache:
-        """Freeze the design-matrix geometry into a compact cell encoding.
-
-        Storing ``X`` itself would add ~1.1 MB per locus; instead the cells
-        are stored as ``(rgr index, frame*3 + coverage position)`` pairs plus
-        per-row ``(length, read length, oua, run)``, from which ``X.data``
-        is recomputed with a handful of vectorised look-ups.
-
-        The multimapping-slot routing is encoded the same way, so that the
-        cache holds no references to RGR objects and can be loaded without
-        the rest of the locus.
-        """
-        cell_rgr: list = []
-        cell_code: list = []
-        row_nnz: list = []
-        row_len: list = []
-        row_rl: list = []
-        row_oua: list = []
-        row_run: list = []
-        for run_index, run in enumerate(runs):
-            for (rgr_frame_covpos, read_length, oua), eg in self.egs[run].items():
-                if not rgr_frame_covpos:
-                    continue
-                row_nnz.append(len(rgr_frame_covpos))
-                row_len.append(eg.length)
-                row_rl.append(read_length)
-                row_oua.append(int(oua))
-                row_run.append(run_index)
-                for rgr, frame, cov_pos in rgr_frame_covpos:
-                    cell_rgr.append(rgr.index)
-                    cell_code.append(
-                        (3 if frame is None else frame) * 3 + cov_pos.value
-                    )
-
-        slot_gk: dict = {}
-        slot_rl: dict = {}
-        slot_oua: dict = {}
-        slot_nnz: dict = {}
-        slot_rgr: dict = {}
-        slot_code: dict = {}
-        for run in runs:
-            gks, rls, ouas, nnzs, srgr, scode = [], [], [], [], [], []
-            for gk, (rfc, read_length, oua) in self.mm_slots[run.id].items():
-                gks.append(gk)
-                rls.append(read_length)
-                ouas.append(int(oua))
-                nnzs.append(len(rfc))
-                for rgr, frame, cov_pos in rfc:
-                    srgr.append(rgr.index)
-                    scode.append((3 if frame is None else frame) * 3 + cov_pos.value)
-            slot_gk[run.id] = np.array(gks, dtype=np.int64)
-            slot_rl[run.id] = np.array(rls, dtype=np.int32)
-            slot_oua[run.id] = np.array(ouas, dtype=np.uint8)
-            slot_nnz[run.id] = np.array(nnzs, dtype=np.int32)
-            slot_rgr[run.id] = np.array(srgr, dtype=np.int32)
-            slot_code[run.id] = np.array(scode, dtype=np.uint8)
-
-        num_rgrs = len(self.rgr_set)
-        rgr_ids: list = [None] * num_rgrs
-        rgr_lengths = np.empty(num_rgrs, dtype=np.int64)
-        for rgr in self.rgr_set:
-            rgr_ids[rgr.index] = rgr.id
-            rgr_lengths[rgr.index] = len(rgr)
-
-        return EgRoutingCache(
-            n_rows=n_rows,
-            n_reads={r.id: len(self.rsas_dict[r.id]) for r in runs},
-            eg_row=eg_row,
-            counts0=counts0,
-            mm_idx=mm_idx,
-            mm_gk=mm_gk,
-            mm_base=mm_base,
-            slot_gk=slot_gk,
-            slot_rl=slot_rl,
-            slot_oua=slot_oua,
-            slot_nnz=slot_nnz,
-            slot_rgr=slot_rgr,
-            slot_code=slot_code,
-            num_rgrs=num_rgrs,
-            rgr_ids=tuple(rgr_ids),
-            rgr_lengths=rgr_lengths,
-            cell_rgr=np.array(cell_rgr, dtype=np.int32),
-            cell_code=np.array(cell_code, dtype=np.uint8),
-            row_nnz=np.array(row_nnz, dtype=np.int32),
-            row_len=np.array(row_len, dtype=np.int64),
-            row_rl=np.array(row_rl, dtype=np.int32),
-            row_oua=np.array(row_oua, dtype=np.uint8),
-            row_run=np.array(row_run, dtype=np.uint8),
-        )
-
-    def _assign_reads_from_cache(
-        self,
-        runs: list[RiboSeqRun],
-        mm_data: dict | None,
-        cache: EgRoutingCache,
-    ) -> None:
-        """Re-derive the response ``y`` from cached routing (no per-read work).
-
-        Only the fractional weights change between EM iterations, so the
-        per-read equivalence-group routing recorded in *cache* stays valid and
-        the response reduces to a weighted ``bincount`` over rows.
-        """
-        y = np.zeros(cache.n_rows, dtype=np.float64)
-        self.read_counts = {}
-        self.counted_reads = {}
-        self.uncounted_reads = 0.0
-
-        rsas = getattr(self, "rsas_dict", None)
-        for run in runs:
-            run_id = run.id
-            # The reads are only needed for this length sanity check here; an
-            # intermediate light M-step skips loading them (the response is
-            # rebuilt from ``cache.counts0``), so the check only runs when the
-            # reads were actually loaded.
-            if (
-                rsas is not None
-                and run_id in rsas
-                and len(rsas[run_id]) != cache.n_reads[run_id]
-            ):
-                raise RuntimeError(
-                    f"locus {self.id}: cached routing has "
-                    f"{cache.n_reads[run_id]} reads for run {run_id} but "
-                    f"{len(rsas[run_id])} were loaded"
-                )
-            counts = cache.counts0[run_id].copy()
-            run_mm = mm_data.get(run_id) if mm_data else None
-            idx = cache.mm_idx[run_id]
-            if run_mm is not None and idx.size:
-                weights = np.fromiter(
-                    (run_mm[gk][1] for gk in cache.mm_gk[run_id]),
-                    dtype=np.float64,
-                    count=idx.size,
-                )
-                counts[idx] = (
-                    np.maximum(0.0, counts[idx] - cache.mm_base[run_id]) + weights
-                )
-
-            rows = cache.eg_row[run_id]
-            counted = rows >= 0
-            y += np.bincount(
-                rows[counted], weights=counts[counted], minlength=cache.n_rows
-            )
-            counted_sum = float(counts[counted].sum())
-            uncounted = rows == -1
-            self.uncounted_reads += float(counts[uncounted].sum())
-            self.counted_reads[run_id] = counted_sum
-            run.read_count += counted_sum
-            # ``read_counts`` gains an entry only when the run has at least one
-            # read compatible with some RGR, matching the uncached path.
-            compatible = counted | uncounted
-            if compatible.any():
-                self.read_counts[run] = float(counts[compatible].sum())
-
-        # Downstream consumers (the final pass's pruning, the likelihood-ratio
-        # test, ``estimate_activities``) read counts off the EG objects.  A
-        # light M-step loads only the cache, so there are no EG objects and
-        # nothing downstream that reads them.
-        if getattr(self, "egs", None):
-            i = 0
-            for run in runs:
-                for key, eg in self.egs[run].items():
-                    if not key[0]:
-                        continue
-                    eg.read_count = y[i]
-                    i += 1
-        self._eg_y = y
-
-    def _design_matrix_from_cache(
-        self,
-        cache: EgRoutingCache,
-        cm_lut: np.ndarray,
-        coverage_params: np.ndarray,
-        num_runs: int,
-    ) -> csr_matrix:
-        """Rebuild ``X`` from the cached cell encoding, fully vectorised."""
-        nnz_per_row = cache.row_nnz
-        run_c = np.repeat(cache.row_run, nnz_per_row)
-        rl_c = np.repeat(cache.row_rl, nnz_per_row)
-        oua_c = np.repeat(cache.row_oua, nnz_per_row)
-        len_c = np.repeat(cache.row_len, nnz_per_row)
-        code = cache.cell_code.astype(np.int64)
-        frame_c, cov_c = code // 3, code % 3
-
-        data = (
-            len_c
-            * cm_lut[run_c, rl_c, frame_c, oua_c]
-            * coverage_params[run_c, cov_c]
-        )
-        rows_idx = np.repeat(np.arange(cache.n_rows, dtype=np.int64), nnz_per_row)
-        cols_idx = cache.cell_rgr.astype(np.int64) * num_runs + run_c
-        # COO construction (as in ``egs_to_sparse``) so that a row touching the
-        # same RGR at several coverage positions sums those cells.
-        return csr_matrix(
-            (data, (rows_idx, cols_idx)),
-            shape=(cache.n_rows, cache.num_rgrs * num_runs),
-            dtype=np.float64,
-        )
-
     def to_sparse_args(
         self,
         runs: list[RiboSeqRun],
@@ -1550,7 +607,7 @@ class Locus:
         # and the rows of ``result``), not with ``rgr_set`` iteration order:
         # the two are different permutations, and ``deconvolve`` multiplies
         # ``rgr_lengths`` against the index-aligned activity matrix.
-        cache = getattr(self, "eg_cache", None)
+        cache = self.eg_cache
         if cache is not None:
             num_rgrs = cache.num_rgrs
             rgr_lengths = cache.rgr_lengths
@@ -1560,7 +617,7 @@ class Locus:
             for rgr in self.rgr_set:
                 rgr_lengths[rgr.index] = len(rgr)
 
-        if hasattr(self, "result"):
+        if self.result is not None:
             initial_guess = self.result
         else:
             initial_guess = np.ones((num_rgrs, num_runs))
@@ -1570,13 +627,13 @@ class Locus:
         # cleavage/coverage models, all fixed across EM iterations, so a
         # cached locus rebuilds it vectorised instead of walking every cell
         # in Python.  ``y`` came out of the cached read routing.
-        y = getattr(self, "_eg_y", None)
+        y = self._eg_y
         if cache is not None and y is not None:
-            X = self._design_matrix_from_cache(
+            X = read_routing.design_matrix_from_cache(
                 cache, cm_lut, coverage_params, num_runs
             )
         else:
-            X, y = egs_to_sparse(
+            X, y = read_routing.egs_to_sparse(
                 self.egs, runs, cm_lut, coverage_params, num_rgrs, num_runs
             )
 
@@ -1715,7 +772,7 @@ class Locus:
         dict
             ``{rgr_id: numpy.ndarray of shape (num_runs,)}``.
         """
-        cache = getattr(self, "eg_cache", None)
+        cache = self.eg_cache
         if cache is not None:
             return {
                 rgr_id: self.result[index].copy()
@@ -1737,7 +794,7 @@ class Locus:
         num_runs : int
             Number of Ribo-seq runs (columns of the activity matrix).
         """
-        cache = getattr(self, "eg_cache", None)
+        cache = self.eg_cache
         if cache is not None:
             result = np.ones((cache.num_rgrs, num_runs))
             for index, rgr_id in enumerate(cache.rgr_ids):
@@ -1751,95 +808,6 @@ class Locus:
                 if a is not None:
                     result[rgr.index] = a
         self.result = result
-
-    def compute_multimap_lambdas(self, runs: list[RiboSeqRun]) -> list:
-        """Compute the per-slot origin rate ``λ`` for multimapping reads.
-
-        For each recorded multimapping slot, ``λ`` is the read's design-
-        matrix row *without* the geometric ``length`` factor dotted with
-        the current activities — i.e. ``Σ cleavage · coverage · activity``
-        over the read's compatible ORFs, which is the per-read expected
-        rate the E-step normalises across a read's loci
-        (``λ = δ_EG / length_EG``).
-
-        Parameters
-        ----------
-        runs : list[RiboSeqRun]
-            Ribo-seq runs, in the order used to build :attr:`result`.
-
-        Returns
-        -------
-        list of (run_id, group_key, lam)
-            One entry per multimapping slot recorded at this locus.
-        """
-        cache = getattr(self, "eg_cache", None)
-        if cache is None and not any(self.mm_slots.get(run.id) for run in runs):
-            return []
-
-        num_runs = len(runs)
-        cm_lut = np.zeros(
-            (num_runs, runs[0].cleavage_model.cds_lut.shape[0], 4, 2)
-        )
-        for i, run in enumerate(runs):
-            cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut
-            cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
-
-        coverage_params = np.zeros((num_runs, 3))
-        for i, run in enumerate(runs):
-            coverage_params[i, 0] = run.coverage_model.start_factor
-            coverage_params[i, 1] = 1
-            coverage_params[i, 2] = run.coverage_model.stop_factor
-
-        if cache is not None:
-            return self._multimap_lambdas_from_cache(
-                runs, cache, cm_lut, coverage_params
-            )
-
-        out = []
-        for run_index, run in enumerate(runs):
-            for gk, (rfc, read_length, oua) in self.mm_slots[run.id].items():
-                oua_int = int(oua)
-                lam = 0.0
-                for rgr, frame, cov_pos in rfc:
-                    f = 3 if frame is None else frame
-                    lam += (
-                        cm_lut[run_index, read_length, f, oua_int]
-                        * coverage_params[run_index, cov_pos.value]
-                        * self.result[rgr.index, run_index]
-                    )
-                out.append((run.id, gk, float(lam)))
-        return out
-
-    def _multimap_lambdas_from_cache(
-        self,
-        runs: list[RiboSeqRun],
-        cache: EgRoutingCache,
-        cm_lut: np.ndarray,
-        coverage_params: np.ndarray,
-    ) -> list:
-        """Vectorised :meth:`compute_multimap_lambdas` over the cached slots."""
-        out: list = []
-        for run_index, run in enumerate(runs):
-            gks = cache.slot_gk[run.id]
-            if gks.size == 0:
-                continue
-            nnz = cache.slot_nnz[run.id]
-            read_length = np.repeat(cache.slot_rl[run.id], nnz)
-            oua = np.repeat(cache.slot_oua[run.id], nnz)
-            code = cache.slot_code[run.id].astype(np.int64)
-            contribution = (
-                cm_lut[run_index, read_length, code // 3, oua]
-                * coverage_params[run_index, code % 3]
-                * self.result[cache.slot_rgr[run.id], run_index]
-            )
-            slot_of_cell = np.repeat(np.arange(gks.size), nnz)
-            lam = np.bincount(
-                slot_of_cell, weights=contribution, minlength=gks.size
-            )
-            out.extend(
-                (run.id, int(gk), float(value)) for gk, value in zip(gks, lam)
-            )
-        return out
 
     def remove_rgrs(
         self,
@@ -1873,7 +841,7 @@ class Locus:
         # indices have to be captured rather than re-derived by enumeration.
         old_indices = (
             {rgr: rgr.index for rgr in old_rgr_set}
-            if hasattr(self, "result")
+            if self.result is not None
             else None
         )
 
@@ -1882,11 +850,11 @@ class Locus:
             rgr.index = c
 
         # egs
-        if hasattr(self, "egs"):
+        if self.egs is not None:
             self.collapse_egs(runs)
 
         # results
-        if hasattr(self, "result"):
+        if self.result is not None:
             index_array = np.zeros(len(self.rgr_set), dtype=int)
             for rgr in self.rgr_set:
                 index_array[rgr.index] = old_indices[rgr]
@@ -1986,7 +954,7 @@ class Locus:
         int
             Number of ORF RGRs removed.
         """
-        result = getattr(self, "result", None)
+        result = self.result
         if result is None:
             return 0
 
@@ -2236,141 +1204,8 @@ class Locus:
         self.result_df = pd.DataFrame(self.result, index=rgr_ids, columns=run_ids)
 
 
-def egs_to_sparse(
-    locus_egs: dict,
-    runs: list[RiboSeqRun],
-    cm_lut: np.ndarray,
-    coverage_params: np.ndarray,
-    num_rgrs: int,
-    num_runs: int,
-) -> tuple[csr_matrix, np.ndarray]:
-    """Convert locus equivalence groups to a sparse CSR design matrix.
-
-    Builds the design matrix ``X`` and response vector ``y`` for the
-    identity-link Poisson GLM directly from the locus's native EG
-    dictionary, avoiding Numba typed-List construction entirely.
-
-    Each row corresponds to one ``(EG, run)`` pair.  Column
-    ``rgr_index * num_runs + run_index`` receives the value::
-
-        length * cm_lut[run, read_length, frame, oua] * coverage_params[run, cov_pos]
-
-    Parameters
-    ----------
-    locus_egs : dict
-        ``Locus.egs`` — mapping from :class:`RiboSeqRun` to a dict of
-        ``(rgr_frame_covpos, read_length, oua) -> EquivalenceGroup``.
-    runs : list[RiboSeqRun]
-        Ordered list of runs (determines run indices).
-    cm_lut : np.ndarray, shape ``(num_runs, max_read_len, 4, 2)``
-        Cleavage-model look-up table.
-    coverage_params : np.ndarray, shape ``(num_runs, 3)``
-        Coverage-model factors.
-    num_rgrs : int
-        Number of RGRs (= number of column groups).
-    num_runs : int
-        Number of Ribo-seq runs.
-
-    Returns
-    -------
-    X : csr_matrix, shape ``(n_EGs_total, num_rgrs * num_runs)``
-        Sparse design matrix.
-    y : np.ndarray, shape ``(n_EGs_total,)``
-        Observed read counts.
-    """
-    # Pass 1: count rows (non-empty EGs) and total non-zeros so we can
-    # pre-size numpy arrays.  Building Python int/float lists with one
-    # entry per CSR cell costs ~80 B/cell on CPython and dominates peak
-    # RSS at this stage; numpy buffers are 12 B/cell instead.
-    n_rows = 0
-    nnz = 0
-    for run in runs:
-        for (rgr_frame_covpos, _, _), _ in locus_egs[run].items():
-            sz = len(rgr_frame_covpos)
-            if sz == 0:
-                continue
-            n_rows += 1
-            nnz += sz
-
-    rows_idx = np.empty(nnz, dtype=np.int64)
-    cols_idx = np.empty(nnz, dtype=np.int64)
-    data = np.empty(nnz, dtype=np.float64)
-    y = np.empty(n_rows, dtype=np.float64)
-
-    # Pass 2: populate.
-    row = 0
-    cell = 0
-    for run_index, run in enumerate(runs):
-        for (rgr_frame_covpos, read_length, oua), eg in locus_egs[run].items():
-            if not rgr_frame_covpos:
-                continue
-            y[row] = eg.read_count
-            length = eg.length
-            oua_int = int(oua)
-            for rgr, frame, cov_pos in rgr_frame_covpos:
-                f = 3 if frame is None else frame
-                rows_idx[cell] = row
-                cols_idx[cell] = rgr.index * num_runs + run_index
-                data[cell] = (
-                    length
-                    * cm_lut[run_index, read_length, f, oua_int]
-                    * coverage_params[run_index, cov_pos.value]
-                )
-                cell += 1
-            row += 1
-
-    n_cols = num_rgrs * num_runs
-    X = csr_matrix(
-        (data, (rows_idx, cols_idx)), shape=(n_rows, n_cols), dtype=np.float64
-    )
-    return X, y
-
-
 # ------------------------------------------------------------------ #
 # ORF detection                                                        #
 # ------------------------------------------------------------------ #
 
 
-def find_orfs(
-    seq: str,
-    start_codons: list[str] | tuple[str, ...] = ("ATG",),
-    stop_codons: list[str] | tuple[str, ...] = ("TAA", "TAG", "TGA"),
-    min_length: int = 0,
-) -> list[tuple[int, int]]:
-    """Find all ORFs in a transcript sequence.
-
-    Scans all three reading frames for start/stop codon pairs and
-    returns 0-based, half-open intervals **including** the stop codon.
-
-    Parameters
-    ----------
-    seq : str
-        Spliced transcript nucleotide sequence.
-    start_codons : list[str] or tuple[str, ...]
-        Codons accepted as translation initiation sites.
-    stop_codons : list[str] or tuple[str, ...]
-        Codons accepted as translation termination sites.
-    min_length : int
-        Minimum ORF length (nt, excluding stop codon) to report.
-
-    Returns
-    -------
-    list[tuple[int, int]]
-        ``(start, end)`` intervals in transcript coordinates.  *end*
-        includes the 3-nt stop codon.
-    """
-    start_codons_set = set(start_codons)
-    stop_codons_set = set(stop_codons)
-    orf_iv_on_transcript: list[tuple[int, int]] = []
-    for i in range(3):
-        starts: list[int] = []
-        for j in range(i, len(seq), 3):
-            codon = seq[j : j + 3]
-            if codon in start_codons_set:
-                starts.append(j)
-            if codon in stop_codons_set:
-                for start in starts:
-                    if j - start >= min_length:
-                        orf_iv_on_transcript.append((start, j + 3))
-                starts = []
-    return orf_iv_on_transcript
