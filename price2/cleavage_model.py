@@ -6,8 +6,6 @@ learns the model parameters from mapped Ribo-seq reads.
 """
 
 import logging
-import pickle
-from functools import lru_cache
 from typing import Optional
 
 import pysam
@@ -15,7 +13,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 from numba import njit, prange
-from scipy.spatial.distance import jensenshannon
 
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
@@ -150,7 +147,6 @@ class CleavageModel:
             if region_start == 0 and region_end == 10**10:
                 return self.cds_lut[length, frame, int(oua)]
             f0 = (-frame) % 3
-            f1 = (f0 - 1) % 3
 
             if region_start and f0 != region_start % 3:
                 raise ValueError("region_start and frame are not compatible")
@@ -168,63 +164,6 @@ class CleavageModel:
                 region_start,
                 region_end,
             )
-
-    def rvs(self, size: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Draw random cleavage samples from the model.
-
-        Parameters
-        ----------
-        size : int, optional
-            Number of samples to draw (default 1).
-
-        Returns
-        -------
-        tuple of np.ndarray
-            ``(left_positions, right_positions, uta_flags)``.
-        """
-        pl = np.random.choice(np.arange(len(self.pl)), size=size, p=self.pl)
-        pr = np.random.choice(np.arange(len(self.pr)), size=size, p=self.pr)
-        u = np.random.choice([True, False], size=size, p=[self.pu, 1 - self.pu])
-        return (pl, pr, u)
-
-    def distance(self, other: "CleavageModel") -> float:
-        """Jensen-Shannon distance between this model and *other*.
-
-        Quantifies how dissimilar two cleavage models are by summing the
-        Jensen-Shannon distances between their left-cleavage (``pl``),
-        right-cleavage (``pr``) and untemplated-addition (``pu``)
-        distributions.  Each component is computed with
-        :func:`scipy.spatial.distance.jensenshannon` (base 2), so it lies
-        in ``[0, 1]``; the returned sum therefore lies in ``[0, 3]`` and is
-        ``0`` exactly when the two models are identical.
-
-        The measure is bin-blind: unlike an optimal-transport distance, a
-        peak shifted by one position and a peak shifted by ten can score
-        identically.  It is symmetric and stays finite even for the sparse,
-        regularised distributions produced by
-        :meth:`CleavageEstimator.regularize` -- the Jensen-Shannon mixture
-        is positive wherever either input is, so no smoothing is needed.
-
-        Parameters
-        ----------
-        other : CleavageModel
-            Model to compare against.
-
-        Returns
-        -------
-        float
-            ``JS(pl, pl') + JS(pr, pr') + JS(pu, pu')``, in ``[0, 3]``.
-        """
-        d_pl = _js_distance(self.pl, other.pl)
-        d_pr = _js_distance(self.pr, other.pr)
-        d_pu = float(
-            jensenshannon(
-                [self.pu, 1.0 - self.pu],
-                [other.pu, 1.0 - other.pu],
-                base=2,
-            )
-        )
-        return d_pl + d_pr + d_pu
 
     def get_high_prob_indices(self, prob_sum: float = 0.3) -> list[tuple[int, ...]]:
         """Return CDS LUT indices covering the highest-probability entries.
@@ -592,80 +531,6 @@ class CleavageModel:
 
         return models
 
-    @lru_cache(maxsize=None)
-    def shift(self, read_length: int, oua: bool, frame: int) -> int:
-        """Compute the most likely distance from read start to P-site.
-
-        Parameters
-        ----------
-        read_length : int
-            Matching length of the read.
-        oua : bool
-            Whether the read has an untemplated addition.
-        frame : int
-            Reading frame (0, 1, or 2).
-
-        Returns
-        -------
-        int
-            Offset from read start to the P-site.
-        """
-        f0 = (-frame) % 3
-
-        pr = self.pr
-        pl = self.pl
-
-        i = np.arange(f0, read_length - 2, 3)
-
-        likelihoods = pl[i] * pr[read_length - i - 3]
-
-        if oua:
-            if likelihoods.sum() == 0:
-                raise ValueError("Read does not fit cleavage model")
-            return likelihoods.argmax() * 3 + f0
-
-        else:
-            likelihoods *= 1 - self.pu
-
-            read_length -= 1
-            frame = (frame + 1) % 3
-            f1 = (-frame) % 3
-
-            i = np.arange(f1, read_length - 2, 3)
-            likelihoods_ua = pl[i] * pr[read_length - i - 3] * self.pu * 1 / 4
-
-            if len(likelihoods) == len(likelihoods_ua) + 1:
-                likelihoods_ua = np.insert(likelihoods_ua, 0, 0)
-            return (likelihoods + likelihoods_ua).argmax() * 3 + f0
-
-
-def _js_distance(p: np.ndarray, q: np.ndarray) -> float:
-    """Base-2 Jensen-Shannon distance between two positional distributions.
-
-    The arrays are zero-padded to a common length before comparison so
-    that index ``i`` denotes the same position in both -- appending zeros
-    is correct because the index of a cleavage distribution *is* the
-    position.
-
-    Parameters
-    ----------
-    p, q : np.ndarray
-        Non-negative weight vectors (need not be normalised;
-        :func:`scipy.spatial.distance.jensenshannon` normalises them).
-
-    Returns
-    -------
-    float
-        Jensen-Shannon distance in ``[0, 1]``.
-    """
-    n = max(len(p), len(q))
-    pp = np.zeros(n)
-    qq = np.zeros(n)
-    pp[: len(p)] = p
-    qq[: len(q)] = q
-    return float(jensenshannon(pp, qq, base=2))
-
-
 @njit(cache=True)
 def read_in_cds_likelihood(
     pl: np.ndarray,
@@ -675,7 +540,7 @@ def read_in_cds_likelihood(
     frame: int,
     oua: bool,
     region_start: int = 0,
-    region_end: int = 10 * 10,
+    region_end: int = 10**10,
 ) -> float:
     """Compute the likelihood of a read under the CDS model.
 
@@ -754,7 +619,7 @@ def read_in_noise_likelihood(
     length: int,
     oua: bool,
     region_start: int = 0,
-    region_end: int = 10 * 10,
+    region_end: int = 10**10,
 ) -> float:
     """Compute the likelihood of a read under the noise model.
 
@@ -1530,39 +1395,6 @@ def repeat(
 
     best = int(np.argmax(lls))
     return lls[best], us[best], pls[best].copy(), prs[best].copy()
-
-
-def to_file(file_path: str, models: dict[str, CleavageModel]) -> None:
-    """Serialise a dict of cleavage models to a pickle file.
-
-    Parameters
-    ----------
-    file_path : str
-        Output file path.
-    models : dict[str, CleavageModel]
-        Mapping of sample name to cleavage model.
-    """
-    records = [(name, m.pl, m.pr, m.pu) for name, m in models.items()]
-    with open(file_path, "wb") as fh:
-        pickle.dump(records, fh)
-
-
-def from_file(file_path: str) -> dict[str, CleavageModel]:
-    """Deserialise cleavage models from a pickle file.
-
-    Parameters
-    ----------
-    file_path : str
-        Input file path (written by :func:`to_file`).
-
-    Returns
-    -------
-    dict[str, CleavageModel]
-        Mapping of sample name to cleavage model.
-    """
-    with open(file_path, "rb") as fh:
-        records = pickle.load(fh)
-    return {name: CleavageModel(pl, pr, pu) for name, pl, pr, pu in records}
 
 
 def select_and_scale(arr: np.ndarray, keep_prob: float) -> np.ndarray:

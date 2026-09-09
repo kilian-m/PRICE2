@@ -7,7 +7,6 @@ coverage profile when deconvolving overlapping ORFs.
 """
 
 import logging
-import warnings
 from enum import Enum
 from typing import Optional
 
@@ -379,35 +378,6 @@ class CoverageModel:
     # Alternative constructors
     # ------------------------------------------------------------------
 
-    @classmethod
-    def from_bam(
-        cls,
-        ra: ReferenceAnnotation,
-        sample_bam_path: str,
-        cm: CleavageModel,
-    ) -> "CoverageModel":
-        """Estimate a coverage model from a BAM file.
-
-        Parameters
-        ----------
-        ra : ReferenceAnnotation
-            Parsed reference annotation.
-        sample_bam_path : str
-            Path to the BAM file for the Ribo-seq sample.
-        cm : CleavageModel
-            Cleavage model used to assign reads to P-site positions.
-
-        Returns
-        -------
-        CoverageModel
-            Model with all attributes (including optional histograms) set.
-        """
-        with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
-            start_hist, stop_hist = build_histograms(ra, bam, cm)
-        start_factor = cls._compute_start_factor(start_hist, sample_bam_path)
-        stop_factor = cls._compute_stop_factor(stop_hist, sample_bam_path)
-        return cls(start_factor, stop_factor, start_hist, stop_hist)
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -724,46 +694,3 @@ class CoverageModel:
 
         return fig
 
-    def get_coverage_factor(self, position: CoveragePosition) -> float:
-        """Return the coverage scale factor for *position*.
-
-        Parameters
-        ----------
-        position : CoveragePosition
-            Position category (start, middle, or stop).
-
-        Returns
-        -------
-        float
-            ``start_factor`` for ``CoveragePosition.start``,
-            ``stop_factor`` for ``CoveragePosition.stop``, and
-            ``1.0`` for ``CoveragePosition.middle``.
-        """
-        if position == CoveragePosition.start:
-            return self.start_factor
-        if position == CoveragePosition.stop:
-            return self.stop_factor
-        return 1.0
-
-    def distance(self, other: "CoverageModel") -> float:
-        """Log-ratio distance between this coverage model and *other*.
-
-        The start- and stop-codon enrichment factors are multiplicative
-        ratios (always ``>= 1``), so they are compared in log space: a
-        factor of 2 vs 4 counts the same as 4 vs 2, and equal factors give
-        ``0``.  The two per-position absolute log-ratios are summed.
-
-        Parameters
-        ----------
-        other : CoverageModel
-            Model to compare against.
-
-        Returns
-        -------
-        float
-            ``|log2(start) - log2(start')| + |log2(stop) - log2(stop')|``,
-            ``0`` exactly when both factors match.
-        """
-        d_start = abs(np.log2(self.start_factor) - np.log2(other.start_factor))
-        d_stop = abs(np.log2(self.stop_factor) - np.log2(other.stop_factor))
-        return float(d_start + d_stop)

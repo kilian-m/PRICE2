@@ -16,7 +16,6 @@ import shutil
 import sys
 import time
 
-import HTSeq
 from pyfaidx import Fasta
 
 from price2 import multimap

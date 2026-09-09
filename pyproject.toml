@@ -49,3 +49,8 @@ price2 = "price2.price:main"
 
 [tool.setuptools]
 packages = ["price2"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: runs the whole pipeline on the golden fixture (deselect with -m 'not slow')",
+]

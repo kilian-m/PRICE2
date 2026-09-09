@@ -176,21 +176,3 @@ class ReferenceAnnotation:
             found = step if found is None else found | step
         return found if found is not None else frozenset()
 
-    def collect_transcripts(self, region: GenomicRegion) -> set[Transcript]:
-        """Return all transcripts with an exon overlapping *region*.
-
-        Parameters
-        ----------
-        region : GenomicRegion
-            The genomic region to query.
-
-        Returns
-        -------
-        set[Transcript]
-            Transcripts whose exon intervals overlap any exon of *region*.
-        """
-        transcripts = set()
-        for interval in region.intervals:
-            for iv, value in self.transcript_intervals[interval].steps():
-                transcripts |= value
-        return transcripts

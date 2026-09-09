@@ -63,9 +63,8 @@ class ORFActivityEstimator:
     """Orchestrate parallel ORF deconvolution over all genomic loci.
 
     Each locus stored in the PRICE SQLite database is dispatched to an
-    isolated worker process.  Results are accumulated in
-    ``self.loci`` and performance statistics in
-    ``self.performance_df``.
+    isolated worker process; every result is written to disk by the
+    worker itself.
 
     Parameters
     ----------
@@ -225,18 +224,12 @@ class ORFActivityEstimator:
         Dispatches each locus to a worker process via
         :class:`pebble.ProcessPool`.  On a full pass already-processed
         loci are skipped so that the run can be resumed after a crash;
-        their ids are read from ``<w_dir>/processed_loci.txt``, falling
-        back to ``<o_dir>/performance_measurements.tsv`` when that file
-        is absent.
+        their ids are read from ``<w_dir>/processed_loci.txt``.
 
         Per-locus results are written incrementally to
         ``<o_dir>/regions_activities/`` (``orfs.tsv`` and ``orfs.bed``
         by default; see the ``export_*`` options).  Failed loci are
         logged to ``<o_dir>/regions_activities/failed_loci.txt``.
-
-        When ``config.save_memory`` is ``False`` the in-memory
-        attributes ``self.loci`` and ``self.performance_df`` are
-        populated after the pool finishes.
 
         Parameters
         ----------
@@ -258,18 +251,9 @@ class ORFActivityEstimator:
             loci with no multimapping reads never change across EM
             iterations and only need computing once (in the final pass).
         """
-        self.loci = {}
         loci_ids = set(self.loci_ids)
         if loci_subset is not None:
             loci_ids = loci_ids & loci_subset
-
-        performance_measurements = {}
-
-        db = sql.connect(self.db_path)
-        cur = db.cursor()
-        cur.execute("SELECT run_id FROM runs")
-        run_ids = [id for id, in cur.fetchall()]
-        db.close()
 
         ra_dir = os.path.join(self.config.o_dir, "regions_activities")
         os.makedirs(ra_dir, exist_ok=True)
@@ -285,16 +269,6 @@ class ORFActivityEstimator:
                     processed_loc_ids = {
                         line.strip() for line in fh if line.strip()
                     }
-                loci_ids = loci_ids - processed_loc_ids
-            elif os.path.exists(
-                f"{self.config.o_dir}/performance_measurements.tsv"
-            ):
-                processed_loc_ids = set(
-                    pd.read_csv(
-                        f"{self.config.o_dir}/performance_measurements.tsv",
-                        sep="\t",
-                    )["loc_id"]
-                )
                 loci_ids = loci_ids - processed_loc_ids
 
         loci_ids = list(loci_ids)
@@ -346,14 +320,11 @@ class ORFActivityEstimator:
                 for locus_id in loci_ids
             }
 
-            results = {}
             with logging_redirect_tqdm(loggers=[price2_logger]):
                 for fut in as_completed(futures):
                     loc_id = futures[fut]
                     try:
-                        result = fut.result()
-                        if not self.config.save_memory:
-                            results[loc_id] = result
+                        fut.result()
                     except (TimeoutError, Exception) as e:
                         stack = traceback.format_exc()
                         logger.error("locus %s failed: %s", loc_id, e)
@@ -361,8 +332,6 @@ class ORFActivityEstimator:
                         with lock:
                             with open(f"{ra_dir}/failed_loci.txt", "a") as f:
                                 f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
-                        if not self.config.save_memory:
-                            results[loc_id] = e
                     finally:
                         pbar.update(1)
         finally:
@@ -378,18 +347,6 @@ class ORFActivityEstimator:
 
         pbar.close()
 
-        if not self.config.save_memory:
-            self.loci = {}
-            self.failed_loci = {}
-            for loc_id, result in results.items():
-                if isinstance(result, Exception):
-                    self.failed_loci[loc_id] = result
-                else:
-                    self.loci[loc_id] = result[0]
-                    performance_measurements[loc_id] = result[1]
-
-            self.performance_df = pd.DataFrame(performance_measurements).T
-
         lock_files = glob.glob(os.path.join(ra_dir, "*.lock"))
         for lock_file in lock_files:
             os.remove(lock_file)
@@ -404,17 +361,13 @@ def process_loc(arguments: tuple):
     Parameters
     ----------
     arguments : tuple
-        A ``(locus_id, config, log_queue)`` triple where *locus_id* is
-        the string identifier stored in the SQLite database, *config* is
-        the :class:`~price2.config.Config` instance, and *log_queue* is
-        a :class:`multiprocessing.Queue` connected to the main-process
-        :class:`~logging.handlers.QueueListener`.
-
-    Returns
-    -------
-    tuple[Locus, dict] or None
-        ``(locus, performance_measurements)`` when
-        ``config.save_memory`` is ``False``, otherwise ``None``.
+        ``(locus_id, config, log_queue, em_iteration, em_final)`` where
+        *locus_id* is the string identifier stored in the SQLite database,
+        *config* is the :class:`~price2.config.Config` instance, *log_queue*
+        is a :class:`multiprocessing.Queue` connected to the main-process
+        :class:`~logging.handlers.QueueListener`, and *em_iteration* /
+        *em_final* select the multimapping-EM pass (see
+        :meth:`ORFActivityEstimator.run_orf_deconvolution`).
     """
     loc_id, config, log_queue, em_iteration, em_final = arguments
     em_mode = em_iteration is not None
@@ -537,7 +490,7 @@ def process_loc(arguments: tuple):
                 with lock:
                     with open(processed_loci_path, "a") as f:
                         f.write(loc_id + "\n")
-            return None if config.save_memory else (loc, performance_measurements)
+            return None
 
         if config.export_all_steps and not em_light:
             if config.export_gtf:
@@ -551,7 +504,6 @@ def process_loc(arguments: tuple):
                 loc.to_tsv(f"{config.base_o_dir}/all")
             if config.export_bed and config.export_orfs:
                 loc.to_bed(f"{config.base_o_dir}/all")
-        loc.rgr_filter_sets = {}
 
         # --- Load reads ---
         t1 = time.time()
@@ -562,7 +514,6 @@ def process_loc(arguments: tuple):
         # --- Assign reads to ORF candidates ---
         t1 = time.time()
         performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
-        loc.rgr_filter_sets["unfiltered"] = loc.rgr_set
 
         if config.coverage_filter or config.deconvolution_filter:
             loc.make_well_fitting_reads(runs)
@@ -588,7 +539,6 @@ def process_loc(arguments: tuple):
                 loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
             if config.export_bed and config.export_orfs:
                 loc.to_bed(f"{config.base_o_dir}/coverage_filtered")
-        loc.rgr_filter_sets["coverage_filtered"] = loc.rgr_set
 
         performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
         t2 = time.time()
@@ -599,7 +549,6 @@ def process_loc(arguments: tuple):
         if config.deconvolution_filter:
             loc.deconvolution_filter_rgrs(config)
 
-        loc.rgr_filter_sets["deconvolution_filtered"] = loc.rgr_set
         performance_measurements["filtered_deconvolution_rgr_count"] = len(
             loc.rgr_set
         )
@@ -696,7 +645,7 @@ def process_loc(arguments: tuple):
             lambdas,
             mm_data,
         )
-        return None if config.save_memory else (loc, performance_measurements)
+        return None
 
     # --- Group-LASSO optimisation ---
     loc.deconvolve(config, runs=runs)
@@ -704,7 +653,6 @@ def process_loc(arguments: tuple):
         loc, "irls_outer_iterations", 0
     )
 
-    loc.rgr_filter_sets["deconvoluted"] = loc.rgr_set
     performance_measurements["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
     t2 = time.time()
     performance_measurements["optimization_time"] = t2 - t1
@@ -726,7 +674,6 @@ def process_loc(arguments: tuple):
     if config.likelihood_ratio_filter:
         t1 = time.time()
         loc.likelihood_ratio_filtering(config, runs)
-        loc.rgr_filter_sets["likelihood_ratio_filtered"] = loc.rgr_set
         t2 = time.time()
         performance_measurements["likelihood_ratio_time"] = t2 - t1
         performance_measurements["filtered_lrt_rgr_count"] = len(loc.rgr_set)
@@ -788,7 +735,3 @@ def process_loc(arguments: tuple):
         with open(processed_loci_path, "a") as f:
             f.write(loc_id + "\n")
 
-    if config.save_memory:
-        return
-    else:
-        return (loc, performance_measurements)

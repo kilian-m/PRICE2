@@ -15,7 +15,6 @@ from __future__ import annotations
 import enum
 
 import HTSeq
-from HTSeq import GenomicInterval
 
 from price2.genomic_region import GenomicRegion
 
@@ -166,10 +165,7 @@ class Transcript:
         self.rgr_set.add(orf)
 
     def update_with_filtered_orfs(self, rgr_set: set[ReadGeneratingRegion]) -> None:
-        """Restrict RGRs to the given set and rebuild interval indices.
-
-        After filtering, HTSeq ``GenomicArrayOfSets`` interval indices
-        are rebuilt for both ORF-only and all-RGR lookups.
+        """Restrict :attr:`orf_set` and :attr:`rgr_set` to the survivors of a filter.
 
         Parameters
         ----------
@@ -178,40 +174,6 @@ class Transcript:
         """
         self.orf_set = self.orf_set & rgr_set
         self.rgr_set = self.rgr_set & rgr_set
-
-        self.orf_intervals: tuple[
-            HTSeq.GenomicArrayOfSets,
-            HTSeq.GenomicArrayOfSets,
-            HTSeq.GenomicArrayOfSets,
-        ] = (
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-        )
-        for orf in self.orf_set:
-            iv = GenomicInterval(
-                ".", orf.iv_on_transcript[0], orf.iv_on_transcript[1], "."
-            )
-            self.orf_intervals[iv.start % 3][iv] += orf
-
-        self.rgr_intervals: tuple[
-            HTSeq.GenomicArrayOfSets,
-            HTSeq.GenomicArrayOfSets,
-            HTSeq.GenomicArrayOfSets,
-        ] = (
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-            HTSeq.GenomicArrayOfSets("auto", stranded=False),
-        )
-        for rgr in self.rgr_set:
-            iv = GenomicInterval(
-                ".", rgr.iv_on_transcript[0], rgr.iv_on_transcript[1], "."
-            )
-            if rgr.type == "ORF":
-                self.rgr_intervals[iv.start % 3][iv] += rgr
-            else:
-                for i in range(3):
-                    self.rgr_intervals[i][iv] += rgr
 
 
 class ReadGeneratingRegion:
@@ -256,14 +218,12 @@ class ReadGeneratingRegion:
         type: RGRType | str,
         transcript: Transcript,
         id: str,
-        iv_on_transcript: tuple[int, int] | None = None,
-        genomic_region: GenomicRegion | None = None,
+        iv_on_transcript: tuple[int, int],
     ) -> None:
         """Create a ReadGeneratingRegion.
 
-        Exactly one of *iv_on_transcript* or *genomic_region* must be
-        provided.  If *iv_on_transcript* is given, genomic coordinates
-        are derived from the parent transcript's exon structure.
+        Genomic coordinates are derived from the parent transcript's exon
+        structure.
 
         Parameters
         ----------
@@ -274,48 +234,33 @@ class ReadGeneratingRegion:
             The parent transcript.
         id : str
             Unique identifier for this RGR.
-        iv_on_transcript : tuple[int, int] | None
+        iv_on_transcript : tuple[int, int]
             Spliced transcript coordinates ``(start, end)``, 0-based
             half-open.
-        genomic_region : GenomicRegion | None
-            Pre-computed genomic region (overrides coordinate mapping).
-
-        Raises
-        ------
-        ValueError
-            If neither *iv_on_transcript* nor *genomic_region* is given.
         """
-        if iv_on_transcript is None and genomic_region is None:
-            raise ValueError(
-                "Either iv_on_transcript or genomic_region must be provided."
-            )
         self.type: RGRType = RGRType(type)
         self.read_count: int = 0
         self.id: str = id
         self.transcript: Transcript = transcript
         self.orf_type: str | None = None
 
-        if genomic_region is None:
-            self.genomic_region: GenomicRegion = transcript.exons.map_to_global(
-                iv_on_transcript
-            )
-            if self.type == "ORF":
-                self.full_genomic_region: GenomicRegion = (
-                    transcript.exons.map_to_global(
-                        (iv_on_transcript[0], iv_on_transcript[1] + 3)
-                    )
+        self.genomic_region: GenomicRegion = transcript.exons.map_to_global(
+            iv_on_transcript
+        )
+        if self.type == "ORF":
+            self.full_genomic_region: GenomicRegion = (
+                transcript.exons.map_to_global(
+                    (iv_on_transcript[0], iv_on_transcript[1] + 3)
                 )
-            else:
-                self.full_genomic_region = self.genomic_region
-            self.transcript_id: str = transcript.id
-            self.iv_on_transcript: tuple[int, int] = iv_on_transcript
-            self.dist_to_transcript_start: int = iv_on_transcript[0]
-            self.dist_to_transcript_end: int = (
-                transcript.exon_length - iv_on_transcript[1]
             )
         else:
-            self.genomic_region = genomic_region
-            self.transcript_id = transcript  # type: ignore[assignment]
+            self.full_genomic_region = self.genomic_region
+        self.transcript_id: str = transcript.id
+        self.iv_on_transcript: tuple[int, int] = iv_on_transcript
+        self.dist_to_transcript_start: int = iv_on_transcript[0]
+        self.dist_to_transcript_end: int = (
+            transcript.exon_length - iv_on_transcript[1]
+        )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ReadGeneratingRegion):
@@ -332,37 +277,6 @@ class ReadGeneratingRegion:
 
     def __repr__(self) -> str:
         return f"{self.type} {self.id} on region {self.genomic_region}"
-
-    def effective_length(
-        self,
-        upstream_cleavage: int = 12,
-        downstream_cleavage: int = 17,
-    ) -> int:
-        """Compute the number of positions that can yield reads.
-
-        Positions near transcript ends may not be covered by reads
-        because cleavage sites extend beyond the transcript boundary.
-        This method returns the length of the RGR after trimming those
-        inaccessible positions at each end.
-
-        Parameters
-        ----------
-        upstream_cleavage : int, optional
-            Maximum upstream cleavage offset (default 12).
-        downstream_cleavage : int, optional
-            Maximum downstream cleavage offset (default 17).
-
-        Returns
-        -------
-        int
-            Effective observable length (≥ 0).
-        """
-        return max(
-            0,
-            len(self.genomic_region)
-            - max(0, upstream_cleavage - self.dist_to_transcript_start)
-            - max(0, downstream_cleavage - self.dist_to_transcript_end),
-        )
 
     def to_gtf(self, loc_id: str) -> str:
         """Serialise this RGR as GTF-formatted lines.
@@ -395,12 +309,6 @@ class ReadGeneratingRegion:
         )
         if self.orf_type is not None:
             attributes += f' orf_type "{self.orf_type}";'
-        if hasattr(self, "log_p_value"):
-            attributes += f' log_p_value "{self.log_p_value}";'
-        if hasattr(self, "mean_rpkm"):
-            attributes += f' mean_rpkm "{self.mean_rpkm}";'
-        if hasattr(self, "mean_activity"):
-            attributes += f' mean_activity "{self.mean_activity}";'
         s = ""
         if strand == "+":
             intervals = self.full_genomic_region.intervals

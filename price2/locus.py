@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import bisect
 import logging
-import math
 import os
 import sqlite3 as sql
 import time
@@ -30,7 +29,7 @@ logger = logging.getLogger(__name__)
 import pandas as pd
 from filelock import FileLock
 from scipy.optimize import minimize
-from scipy.sparse import csr_matrix, vstack as sp_vstack
+from scipy.sparse import csr_matrix
 from scipy.stats import chi2
 from scipy.special import gammaln
 
@@ -259,8 +258,6 @@ class Locus:
         transcripts.
     rgr_set : set[ReadGeneratingRegion]
         Current set of ORF and noise RGR candidates.
-    rgr_intervals : HTSeq.GenomicArrayOfSets
-        Stranded genomic array mapping positions to overlapping RGRs.
     egs : dict[RiboSeqRun, dict]
         Per-run equivalence groups built during read assignment.
     read_counts : dict[RiboSeqRun, int]
@@ -277,7 +274,6 @@ class Locus:
     transcripts: set[Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
     rgr_set: set[ReadGeneratingRegion]
-    rgr_intervals: HTSeq.GenomicArrayOfSets
     egs: dict[RiboSeqRun, dict]
     read_counts: dict[RiboSeqRun, int]
     exon_length: int
@@ -429,28 +425,7 @@ class Locus:
         state.pop("_transcript_breakpoint_index", None)
         state.pop("_transcript_junction_index", None)
         state.pop("_has_abutting_exons", None)
-        state.pop("_rgr_intervals", None)
         return state
-
-    @property
-    def rgr_intervals(self) -> HTSeq.GenomicArrayOfSets:
-        """Per-position ``GenomicArrayOfSets`` over the current RGR set.
-
-        Built lazily from :attr:`rgr_set` on first access and cached; the cache
-        is invalidated whenever the RGR set changes (see :meth:`remove_rgrs`).
-        Nothing in the core pipeline reads this structure, so it is normally
-        never materialised — building it eagerly in :meth:`make_rgrs` was an
-        O(n_rgr^2) hot-spot on dense loci (hundreds of seconds on the largest
-        Yewdell locus) for no downstream benefit.
-        """
-        ri = getattr(self, "_rgr_intervals", None)
-        if ri is None:
-            ri = HTSeq.GenomicArrayOfSets("auto", stranded=True, storage="step")
-            for rgr in self.rgr_set:
-                for iv in rgr.genomic_region.intervals:
-                    ri[iv] += rgr
-            self._rgr_intervals = ri
-        return ri
 
     def make_rgrs(
         self,
@@ -577,14 +552,6 @@ class Locus:
             orf.orf_type = get_orf_type(orf, self.transcripts)
             orf.transcript.add_orf(orf)
         self.rgr_set |= set(orf_dict.values())
-
-        # ``rgr_intervals`` (a per-position GenomicArrayOfSets over every RGR)
-        # is built lazily on first access (see the ``rgr_intervals`` property)
-        # rather than eagerly here.  Building it eagerly is O(n_rgr^2) for the
-        # heavily-overlapping ORF candidates of large loci (~275 s on the
-        # densest Yewdell locus alone) and nothing in the pipeline reads it, so
-        # the eager build was pure overhead on the critical path.
-        self._rgr_intervals = None
 
         # ``rgr.index`` addresses the design-matrix column blocks and the rows
         # of ``result``, so every RGR carries one from the moment the set is
@@ -944,43 +911,6 @@ class Locus:
                         continue
                     f.write(rgr.to_bed_line())
 
-    def to_fasta(
-        self,
-        prefix: str,
-        genome: Fasta,
-    ) -> None:
-        """Append ORF sequences (with flanking context) to a FASTA file.
-
-        Each ORF is extended by up to 14 nt upstream and 20 nt downstream
-        on its parent transcript before extracting the spliced sequence.
-
-        Parameters
-        ----------
-        prefix : str
-            Directory prefix; the file is ``<prefix>/orfs.fasta``.
-        genome : pyfaidx.Fasta
-            Indexed FASTA handle keyed by chromosome name.
-        """
-
-        path = f"{prefix}/orfs.fasta"
-        for rgr in self.rgr_set:
-            if rgr.type != "ORF":
-                continue
-            iv_on_transcript = rgr.iv_on_transcript
-            iv_on_transcript = (
-                max(0, iv_on_transcript[0] - 14),
-                min(len(rgr.transcript), iv_on_transcript[1] + 20),
-            )
-            gr = rgr.transcript.exons.map_to_global(iv_on_transcript)
-            seq = gr.get_sequence(genome).upper()
-
-            lock = FileLock(path + ".lock")
-            with lock:
-                with open(path, "a") as f:
-                    f.write(f">{rgr.id}|{rgr.transcript.gene_id}|{rgr.transcript.id}\n")
-                    for i in range(0, len(seq), 60):
-                        f.write(seq[i : i + 60] + "\n")
-
     # ------------------------------------------------------------------ #
     # ORF activity estimation                                              #
     # ------------------------------------------------------------------ #
@@ -1088,7 +1018,7 @@ class Locus:
         A read is *well-fitting* when its length and untemplated-addition
         status match a high-probability entry in the run's cleavage
         model.  Results are stored in :attr:`wfr_df` (a DataFrame
-        indexed by RGR id with one column per run) and :attr:`wfr_count`.
+        indexed by RGR id with one column per run).
 
         Parameters
         ----------
@@ -1101,7 +1031,6 @@ class Locus:
             for rgr in self.rgr_set:
                 if rgr.type == "ORF":
                     well_fitting_rcs[run.id][rgr.id] = 0
-        self.wfr_count = 0
         for run in runs:
             well_fitting_indices = run.cleavage_model.get_high_prob_indices()
             well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}
@@ -1124,8 +1053,6 @@ class Locus:
                     for rgr, _frame, _covpos in rgr_frame_covpos
                     if rgr.type != "NOISE"
                 }
-                if orf_ids:
-                    self.wfr_count += rsa.read_count
                 for rgr_id in orf_ids:
                     well_fitting_rcs[run.id][rgr_id] += rsa.read_count
 
@@ -2036,14 +1963,14 @@ class Locus:
                 * config.min_activity_fraction,
                 config.rgr_min_activity,
             )
-            self.rgr_indices_to_remove = set(
+            rgr_indices_to_remove = set(
                 np.where(np.all(x < min_activities, axis=1))[0]
             )
             rgrs_to_remove = set(
                 [
                     rgr
                     for rgr in self.rgr_set
-                    if rgr.index in self.rgr_indices_to_remove
+                    if rgr.index in rgr_indices_to_remove
                     and rgr.type == "ORF"
                 ]
             )
@@ -2196,9 +2123,9 @@ class Locus:
     ) -> None:
         """Remove a set of RGRs and update all dependent data structures.
 
-        Updates :attr:`rgr_set`, re-indexes remaining RGRs, invalidates the
-        lazy :attr:`rgr_intervals` cache, collapses equivalence groups (if
-        present), and re-slices :attr:`result` (if present).
+        Updates :attr:`rgr_set`, re-indexes remaining RGRs, collapses
+        equivalence groups (if present), and re-slices :attr:`result` (if
+        present).
 
         Parameters
         ----------
@@ -2228,10 +2155,6 @@ class Locus:
         # rgr indices
         for c, rgr in enumerate(self.rgr_set):
             rgr.index = c
-
-        # Invalidate the lazily-built rgr_intervals cache; it is rebuilt from
-        # the current rgr_set on next access (nothing in the pipeline reads it).
-        self._rgr_intervals = None
 
         # egs
         if hasattr(self, "egs"):
@@ -2489,8 +2412,6 @@ class Locus:
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
         keep_rgr_indices = noise_rgr_indices | test_rgr_indices
 
-        self.rgr_dict = {rgr.index: rgr for rgr in self.rgr_set}
-
         shape = initial_guess.reshape(num_rgrs, -1).shape
 
         t = np.empty((), dtype=object)
@@ -2502,8 +2423,6 @@ class Locus:
         optimization_result, full_log_likelihood = run_weighted_likelihood_optimization(
             initial_guess, bounds, optim_args
         )
-
-        self.final_result = optimization_result
 
         initial_guess = optimization_result.x
 
@@ -2591,14 +2510,9 @@ class Locus:
         )
         full_activities = optimization_result.x
 
-        self.final_result = optimization_result
-
-        tmp = self.final_result.x.reshape(num_rgrs, num_runs)
-        tmp[tmp <= config.pseudo_min] = 0
-        self.result = tmp
-        with np.errstate(invalid="ignore"):
-            tmp = tmp / tmp.sum(axis=0)
-            tmp[np.isnan(tmp)] = 0
+        result = optimization_result.x.reshape(num_rgrs, num_runs)
+        result[result <= config.pseudo_min] = 0
+        self.result = result
 
         rgrs_to_remove = set()
         for rgr in self.rgr_set:

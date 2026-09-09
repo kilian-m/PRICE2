@@ -23,7 +23,7 @@ from collections import defaultdict
 
 from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
-from price2.ribo_seq_run import RiboSeqRun, ribo_seq_runs_from_bams
+from price2.ribo_seq_run import ribo_seq_runs_from_bams
 from price2.ribo_seq_alignment import five_prime_terminal_mismatch
 from price2.locus import Locus
 from price2.genomic_region import GenomicRegion
@@ -70,15 +70,12 @@ class DataCollector:
 
     Attributes
     ----------
-    loci_intervals : HTSeq.GenomicArray
-        Stranded genomic array mapping intervals to their :class:`Locus`.
     loci_set : set[Locus]
         Full set of loci constructed from the reference annotation.
     chr_order : list[str] or None
         Chromosome names in BAM header order; ``None`` if no BAM found.
     """
 
-    loci_intervals: HTSeq.GenomicArray
     loci_set: set[Locus]
     chr_order: list[str] | None
 
@@ -429,7 +426,7 @@ class DataCollector:
         genomic intervals in a binary step-array, and then merges
         consecutive occupied intervals on the same strand that are at most
         ``distance`` bases apart into a single :class:`~price2.locus.Locus`.
-        Populates ``self.loci_intervals`` and ``self.loci_set``.
+        Populates ``self.loci_set``.
 
         Parameters
         ----------
@@ -444,9 +441,6 @@ class DataCollector:
         )
         for transcript in reference_annotation.transcripts.values():
             loci_intervals_binary[transcript.iv] = True
-        self.loci_intervals = HTSeq.GenomicArray(
-            "auto", stranded=True, storage="step", typecode="O"
-        )
         self.loci_set = set()
 
         connected_loci = {"+": [], "-": []}
@@ -474,7 +468,6 @@ class DataCollector:
                         loci_counter,
                     )
                     loci_counter += 1
-                    self.loci_intervals[connected_iv] = locus
                     self.loci_set.add(locus)
                     connected_loci[iv.strand] = [iv]
         for strand in ["+", "-"]:
@@ -491,7 +484,6 @@ class DataCollector:
                     loci_counter,
                 )
                 loci_counter += 1
-                self.loci_intervals[connected_iv] = locus
                 self.loci_set.add(locus)
             except IndexError:
                 pass
@@ -615,14 +607,12 @@ def build_rgrs(
 
     transcripts_dict = {tr.id: tr for tr in locus.transcripts}
 
-    locus.keep_transcripts = [
+    locus.transcripts_number = len(locus.transcripts)
+    locus.transcripts = [
         transcripts_dict[tr_id]
         for tr_id, count in explaining_transcripts_reads_list
         if count > min_explained_reads
     ]
-
-    locus.transcripts_number = len(locus.transcripts)
-    locus.transcripts = locus.keep_transcripts
 
     new_tr_intervals = HTSeq.GenomicArray(
         list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"

@@ -30,8 +30,6 @@ class Config:
     w_dir : str
         Working directory (holds ``price.db`` SQLite database).
         Defaults to ``<base_dir>/w_dir``.
-    l_file : str
-        Log file path.  Defaults to ``<base_dir>/logs/process.log``.
     gtf_path : str
         Path to the reference annotation GTF file.
     fasta_path : str
@@ -66,8 +64,6 @@ class Config:
         ``180``, so 900 s for five datasets).  One locus is solved for all
         datasets at once, so its cost grows with how many there are and an
         absolute budget would time out the wide runs.
-    memory_limit_gb : int
-        Per-worker memory limit in gigabytes.
     pseudo_min : float
         Lower bound applied to activity estimates during optimisation to
         avoid ``log(0)`` numerical instability.
@@ -110,9 +106,6 @@ class Config:
     high_quality_runs_only : bool
         When ``True``, exclude Ribo-seq runs whose cleavage model failed
         quality checks (peak not at position 12 or peak probability < 0.3).
-    save_memory : bool
-        When ``True``, locus objects are not stored in the master process
-        to reduce peak memory usage.
     log_level : str
         Logging verbosity level for the ``price2`` logger.  Accepts
         standard Python level names (``"DEBUG"``, ``"INFO"``,
@@ -173,7 +166,6 @@ class Config:
     # ------------------------------------------------------------------ #
     o_dir: str = ""
     w_dir: str = ""
-    l_file: str = ""
     gtf_path: str = ""
     fasta_path: str = ""
     bam_dir: str = ""
@@ -195,7 +187,6 @@ class Config:
     #: Per-locus wall-clock budget in seconds *per Ribo-seq run*; the effective
     #: limit is ``timeout * len(runs)`` (see ``ORFActivityEstimator``).
     timeout: int = 180
-    memory_limit_gb: int = 5
     pseudo_min: float = 1e-14
     #: Loci a worker handles before it is replaced (``0`` = never replaced).
     #: A fresh process costs ~2 CPU-seconds before it does any useful work:
@@ -367,9 +358,6 @@ class Config:
     likelihood_ratio_filter: bool = True
     likelihood_ratio_alpha: float = 1e-10
     high_quality_runs_only: bool = False
-    save_memory: bool = (
-        True  # Do not disable this in normal mode, it can clog the pipe shifting results from workers to the master process and cause deadlocks. only use with few workers
-    )
     log_level: str = "INFO"
 
     # ------------------------------------------------------------------ #
@@ -427,13 +415,6 @@ class Config:
     #: set slightly versus carrying every candidate through the EM (a pruned
     #: ORF cannot come back), so it is kept separable for A/B testing.
     em_prune_after_first_mstep: bool = True
-    #: Background rate for a multimapping read's alignments that fall
-    #: outside any annotated locus.  ``0.0`` (default) means "loci-only":
-    #: weight is normalised across the annotated loci a read hits and
-    #: intergenic alignments are ignored.  A positive value discounts
-    #: repeat-heavy reads (currently reserved; intergenic alignments are
-    #: not recorded, so only loci-only normalisation is active).
-    multimap_background: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Export options                                                        #
@@ -507,5 +488,3 @@ class Config:
             self.w_dir = f"{self.base_dir}/w_dir"
         if self.bam_dir == "":
             self.bam_dir = f"{self.base_dir}/bam_dir"
-        if self.l_file == "":
-            self.l_file = f"{self.base_dir}/logs/process.log"
