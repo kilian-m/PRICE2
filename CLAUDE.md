@@ -44,16 +44,3 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 
 **Performance-sensitive code:** `locus.py` deconvolution uses `scipy.sparse` CSR matrices and BLAS-backed operations. Keep numerical code vectorized (numpy/scipy); avoid Python loops over reads or positions.
 
-**Testing:** Tests live in `tests/`. Currently minimal coverage — do not apply TDD (this needs human supervision). Do not modify tests to make code pass — only fix tests if there is a genuine error in the test itself.
-
-If anything in the code is unclear, ask the user what it is supposed to do rather than guessing.
-
-## Code Style
-
-- PEP 8, 88-character line limit
-- Type hints on all public functions and methods
-- NumPy-style docstrings on all public APIs
-- Use classes for core domain objects, functions for utilities
-- Use pytest functions (not test classes); use fixtures to share resources between tests
-- No code in `__init__.py` files
-- Prefer widely used packages (numpy, scipy, pandas, scikit-learn); avoid obscure dependencies
