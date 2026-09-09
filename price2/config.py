@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import json
 import logging
 
+from price2.layout import RunLayout
+
 logger = logging.getLogger(__name__)
 
 #: Options that earlier releases accepted and that no longer do anything.  They
@@ -445,6 +447,15 @@ class Config:
     export_transcripts: bool = False
 
     # ------------------------------------------------------------------ #
+    # Derived                                                              #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def layout(self) -> RunLayout:
+        """The run's files and directories, derived from ``w_dir``/``o_dir``."""
+        return RunLayout(self.w_dir, self.o_dir)
+
+    # ------------------------------------------------------------------ #
     # Factory                                                              #
     # ------------------------------------------------------------------ #
 
@@ -483,8 +494,9 @@ class Config:
         >>> cfg = Config.make_config(base_dir="/data/run1", lam=200)
         """
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        if "config" in kwargs:
-            with open(kwargs["config"], "r") as f:  # type: ignore[arg-type]
+        config_path = kwargs.pop("config", None)
+        if config_path is not None:
+            with open(config_path, "r") as f:  # type: ignore[arg-type]
                 json_dict = json.load(f)
             kwargs = {**json_dict, **kwargs}
 
