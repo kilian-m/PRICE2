@@ -32,7 +32,7 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 - `EquivalenceGroup`: Reads compatible with the same ORF set — the rows of the sparse design matrix fed to the optimizer.
 - `CleavageModel` / `CoverageModel`: Per-dataset learned distributions used to compute per-read per-ORF likelihoods.
 
-**Output**: Per-locus TSV/GTF files at each filtering stage under `regions_activities/`, then aggregated TPM-normalized output (`final_orfs_tpm.tsv`, `final_regions_tpm.tsv`).
+**Output**: Per-locus TSV/GTF files at each filtering stage under `regions_activities/`, then aggregated TPM-normalized output (`orfs_tpm.tsv`, `regions_tpm.tsv`).
 
 ## Key Conventions
 

@@ -257,6 +257,15 @@ def create_em_tables(cur: sql.Cursor) -> None:
     )
 
 
+def _table_exists(cur: sql.Cursor, name: str) -> bool:
+    """Return whether table *name* exists in the connected database."""
+    row = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
 def enable_wal(db_path: str) -> None:
     """Switch ``price.db`` to WAL mode for concurrent worker writes.
 
@@ -409,12 +418,9 @@ def em_resume_point(db_path: str) -> tuple[int, set] | None:
     try:
         cur = db.cursor()
         cur.execute("PRAGMA busy_timeout = 120000")
-        try:
-            row = cur.execute(
-                "SELECT MAX(iteration) FROM group_weights"
-            ).fetchone()
-        except sql.OperationalError:  # tables absent (never ran an EM here)
-            return None
+        if not _table_exists(cur, "group_weights"):
+            return None  # never ran an EM here
+        row = cur.execute("SELECT MAX(iteration) FROM group_weights").fetchone()
         if row is None or row[0] is None:
             return None
         iteration = int(row[0])
@@ -1282,13 +1288,13 @@ def load_locus_cache(db_path: str, locus_id: str):
     cur = db.cursor()
     cur.execute("PRAGMA busy_timeout = 120000")
     try:
-        cur.execute(
-            "SELECT cache_blob FROM prepared_loci_cache WHERE locus_id = ?",
-            (locus_id,),
-        )
-        row = cur.fetchone()
-    except sql.OperationalError:  # table absent (pre-cache database)
         row = None
+        if _table_exists(cur, "prepared_loci_cache"):
+            cur.execute(
+                "SELECT cache_blob FROM prepared_loci_cache WHERE locus_id = ?",
+                (locus_id,),
+            )
+            row = cur.fetchone()
     finally:
         db.close()
     if row is None:
@@ -1424,14 +1430,13 @@ def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
     cur = db.cursor()
     cur.execute("PRAGMA busy_timeout = 120000")
     try:
-        cur.execute(
-            "SELECT prep_blob FROM prepared_loci WHERE locus_id = ?",
-            (locus_id,),
-        )
-        row = cur.fetchone()
-    except sql.OperationalError:
-        # Table absent (e.g. no EM run in progress).
         row = None
+        if _table_exists(cur, "prepared_loci"):
+            cur.execute(
+                "SELECT prep_blob FROM prepared_loci WHERE locus_id = ?",
+                (locus_id,),
+            )
+            row = cur.fetchone()
     finally:
         db.close()
     if row is None:

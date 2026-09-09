@@ -1278,15 +1278,15 @@ class Locus:
                 dtype=np.float64,
             )
 
-            if getattr(config, "inner_solver", "lbfgs") == "mu":
+            if config.inner_solver == "mu":
                 from price2 import mu_solver
 
                 result_x = mu_solver.mu_inner_cpu(
                     X_filter, X_filter.T.tocsr(), eg_read_counts,
                     np.ones(X_filter.shape[0]), initial_guess, 0.0,
                     len(initial_guess), 1, config.pseudo_min,
-                    getattr(config, "mu_inner_max_iter", 3000),
-                    getattr(config, "mu_inner_tol", 1e-5), theta=theta)
+                    config.mu_inner_max_iter,
+                    config.mu_inner_tol, theta=theta)
             else:
                 result_x = minimize(
                     poisson_nll_grad,
@@ -1821,19 +1821,19 @@ class Locus:
 
         # Inner-solver setup. "mu" swaps the scipy L-BFGS-B inner solve for
         # multiplicative (weighted Richardson-Lucy) updates, optionally on GPU.
-        use_mu = getattr(config, "inner_solver", "lbfgs") == "mu"
+        use_mu = config.inner_solver == "mu"
         if use_mu:
             from price2 import mu_solver
 
             XT = X.T.tocsr()
             gpu = None
             if (
-                getattr(config, "mu_gpu", False)
-                and X.shape[0] >= getattr(config, "mu_gpu_min_rows", 50_000)
+                config.mu_gpu
+                and X.shape[0] >= config.mu_gpu_min_rows
             ):
                 try:
                     gpu = mu_solver.GpuMuSolver(
-                        X, y, getattr(config, "mu_dtype", "float32")
+                        X, y, config.mu_dtype
                     )
                 except Exception as exc:  # torch/CUDA missing -> CPU fallback
                     logger.warning("GPU MU unavailable (%s); using CPU", exc)
@@ -1845,7 +1845,7 @@ class Locus:
         broker_req_q = getattr(config, "mu_broker_req_q", None)
         use_broker = (
             use_mu and broker_req_q is not None
-            and X.shape[0] >= getattr(config, "mu_gpu_min_rows", 50_000)
+            and X.shape[0] >= config.mu_gpu_min_rows
         )
 
         s1 = time.time()
@@ -1861,8 +1861,8 @@ class Locus:
                 pseudo_min=config.pseudo_min, huber_c=c,
                 max_outer=n_outer,
                 huber_tol=config.irls_huber_tol,
-                mu_inner_max_iter=getattr(config, "mu_inner_max_iter", 3000),
-                mu_inner_tol=getattr(config, "mu_inner_tol", 1e-5),
+                mu_inner_max_iter=config.mu_inner_max_iter,
+                mu_inner_tol=config.mu_inner_tol,
                 theta=theta)
             w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp, w0=w_current)
             broker_outer = n_outer
@@ -1871,9 +1871,9 @@ class Locus:
         # rel-change metric keeps shrinking geometrically long after the set of
         # ORFs above the activity filter has stabilised; stop once that set is
         # unchanged for `irls_active_patience` consecutive outer iterations.
-        _use_active_stop = getattr(config, "irls_stop_on_active_set", False)
-        _active_patience = getattr(config, "irls_active_patience", 2)
-        _thr_hi = getattr(config, "deconvolution_filter_min_activity", 0.1)
+        _use_active_stop = config.irls_stop_on_active_set
+        _active_patience = config.irls_active_patience
+        _thr_hi = config.deconvolution_filter_min_activity
         _prev_active = None
         _stable_count = 0
         outer = -1
@@ -1884,8 +1884,8 @@ class Locus:
 
             # Solve weighted group-LASSO count-model NLL
             if use_mu:
-                mi = getattr(config, "mu_inner_max_iter", 3000)
-                mt = getattr(config, "mu_inner_tol", 1e-5)
+                mi = config.mu_inner_max_iter
+                mt = config.mu_inner_tol
                 if gpu is not None:
                     w_new = gpu.solve(weights, w_current, config.lam,
                                       num_rgrs, num_runs, config.pseudo_min, mi, mt,
@@ -2344,7 +2344,7 @@ class Locus:
 
         def run_weighted_likelihood_optimization(initial_guess, bounds, optim_args):
             X_lr, y_lr, ftol, gtol = optim_args
-            if getattr(config, "inner_solver", "lbfgs") == "mu":
+            if config.inner_solver == "mu":
                 # Weighted Poisson MLE via MU. A (pmin, pmin) box pins a coord to
                 # ~0 (the reduced hypothesis); map those to a fixed_mask.
                 import types
@@ -2358,8 +2358,8 @@ class Locus:
                     X_lr, XT_lr, y_lr, weights,
                     np.asarray(initial_guess, dtype=np.float64), 0.0,
                     len(initial_guess), 1, pmin,
-                    getattr(config, "mu_inner_max_iter", 3000),
-                    getattr(config, "mu_inner_tol", 1e-5),
+                    config.mu_inner_max_iter,
+                    config.mu_inner_tol,
                     fixed_mask=fixed, theta=theta)
                 optimization_result = types.SimpleNamespace(x=w_lr, success=True)
             else:
@@ -2396,7 +2396,7 @@ class Locus:
         # Transpose once for the MU LRT solver (referenced by the closure above);
         # only needed when inner_solver="mu".
         XT_lr = (X_lr.T.tocsr()
-                 if getattr(config, "inner_solver", "lbfgs") == "mu" else None)
+                 if config.inner_solver == "mu" else None)
         y_lr = sparse_args["y"]
         num_rgrs = sparse_args["num_rgrs"]
         initial_guess = sparse_args["initial_guess"]
@@ -2558,7 +2558,7 @@ class Locus:
 
             bounds = [(config.pseudo_min, None)] * len(initial_guess)
 
-            if getattr(config, "inner_solver", "lbfgs") == "mu":
+            if config.inner_solver == "mu":
                 # Unregularised Poisson MLE via Richardson-Lucy (weights=1, lam=0),
                 # consistent with the MU group-LASSO deconvolution.
                 from price2 import mu_solver
@@ -2567,8 +2567,8 @@ class Locus:
                 w_ea = mu_solver.mu_inner_cpu(
                     X_ea, XT_ea, y_ea, np.ones(X_ea.shape[0]),
                     initial_guess, 0.0, len(initial_guess), 1, config.pseudo_min,
-                    getattr(config, "mu_inner_max_iter", 3000),
-                    getattr(config, "mu_inner_tol", 1e-5), theta=theta)
+                    config.mu_inner_max_iter,
+                    config.mu_inner_tol, theta=theta)
                 tmp = w_ea.copy()
             else:
                 cb = Callback(initial_guess, config)
@@ -2794,8 +2794,8 @@ def _distribution_theta(config: Config) -> float | None:
         The dispersion θ for the negative-binomial model, or ``None`` when
         the Poisson model is selected.
     """
-    if getattr(config, "distribution", "poisson") == "nb":
-        return float(getattr(config, "nb_dispersion", 10.0))
+    if config.distribution == "nb":
+        return float(config.nb_dispersion)
     return None
 
 

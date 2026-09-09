@@ -129,8 +129,8 @@ class ORFActivityEstimator:
         """
         self.config.mu_broker_req_q = None
         if (
-            getattr(self.config, "inner_solver", "lbfgs") != "mu"
-            or not getattr(self.config, "mu_broker", False)
+            self.config.inner_solver != "mu"
+            or not self.config.mu_broker
         ):
             return None
 
@@ -138,9 +138,9 @@ class ORFActivityEstimator:
             from price2.gpu_broker import GpuBroker
 
             broker = GpuBroker(
-                n_procs=getattr(self.config, "mu_broker_procs", 4),
-                n_streams=getattr(self.config, "mu_broker_streams", 2),
-                dtype_str=getattr(self.config, "mu_dtype", "float32"),
+                n_procs=self.config.mu_broker_procs,
+                n_streams=self.config.mu_broker_streams,
+                dtype_str=self.config.mu_dtype,
             )
             broker.start()
         except Exception as exc:  # noqa: BLE001
@@ -154,9 +154,9 @@ class ORFActivityEstimator:
         self.config.mu_broker_req_q = broker.req_q
         logger.info(
             "GPU deconvolution broker pool started (%d procs x %d streams, %s)",
-            getattr(self.config, "mu_broker_procs", 4),
-            getattr(self.config, "mu_broker_streams", 2),
-            getattr(self.config, "mu_dtype", "float32"),
+            self.config.mu_broker_procs,
+            self.config.mu_broker_streams,
+            self.config.mu_dtype,
         )
         return broker
 
@@ -412,7 +412,7 @@ def process_loc(arguments: tuple):
     # miss: classic mode, the first light iteration, or a non-multimapping
     # locus in the final pass.
     needs_prepared_save = False
-    use_eg_cache = getattr(config, "eg_cache", False)
+    use_eg_cache = config.eg_cache
     loc = None
     if em_light and em_iteration > 0 and use_eg_cache:
         loc = multimap.load_light_locus(db_path, loc_id)

@@ -2,6 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+#: Options that earlier releases accepted and that no longer do anything.  They
+#: are dropped with a warning so that an old configuration file still loads.
+_OBSOLETE_FIELDS: frozenset[str] = frozenset(
+    {"l_file", "memory_limit_gb", "save_memory", "multimap_background"}
+)
 
 
 @dataclass
@@ -446,7 +455,9 @@ class Config:
         When ``config`` is present in *kwargs* its value is treated as a
         path to a JSON configuration file.  Values supplied directly as
         keyword arguments take precedence over those in the file.
-        Unknown keys are silently ignored.
+        Options that earlier releases accepted (see ``_OBSOLETE_FIELDS``)
+        are dropped with a warning; any other unknown key is an error, so
+        that a misspelled option cannot silently run on its default.
 
         Parameters
         ----------
@@ -460,6 +471,12 @@ class Config:
         Config
             A fully initialised :class:`Config` instance.
 
+        Raises
+        ------
+        ValueError
+            When a key is neither a :class:`Config` field nor an obsolete
+            option.
+
         Examples
         --------
         >>> cfg = Config.make_config(config="run.json", lam=50)
@@ -471,8 +488,18 @@ class Config:
                 json_dict = json.load(f)
             kwargs = {**json_dict, **kwargs}
 
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_fields}
-        return cls(**filtered_kwargs)
+        unknown = sorted(set(kwargs) - known_fields - _OBSOLETE_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"unknown configuration option(s): {', '.join(unknown)}"
+            )
+        obsolete = sorted(set(kwargs) & _OBSOLETE_FIELDS)
+        if obsolete:
+            logger.warning(
+                "ignoring obsolete configuration option(s): %s",
+                ", ".join(obsolete),
+            )
+        return cls(**{k: v for k, v in kwargs.items() if k in known_fields})
 
     def __post_init__(self) -> None:
         """Resolve empty path fields to their default locations under ``base_dir``."""

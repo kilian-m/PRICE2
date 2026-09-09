@@ -173,8 +173,7 @@ class EquivalenceGroupIntervals:
         read_length : int
             Read length associated with these equivalence groups.
         oua : bool
-            Whether this is for the upstream-annotated (True) or downstream
-            (False) cleavage model variant.
+            Whether the reads carry a 5' untemplated addition.
         key_cache : dict or None
             Optional shared cache used to intern the
             ``(frozenset_of_rgr_frame_covpos, read_length, oua)`` key tuples
@@ -254,18 +253,10 @@ def make_splice_graph(transcripts: HTSeq.GenomicArrayOfSets) -> Node:
     prev_nodes = dict()
 
     steps = list(transcripts.steps())
-    c_p, c_m = 0, 0
-    for step in steps:
-        if step[0].strand == "+":
-            c_p += 1
-        else:
-            c_m += 1
-        if c_p == 2:
-            strand = "+"
-            break
-        if c_m == 2:
-            strand = "-"
-            break
+    try:
+        strand = next(iv.strand for iv, transcript_set in steps if transcript_set)
+    except StopIteration:
+        raise ValueError("the locus has no transcript to build a splice graph from")
 
     if strand == "-":
         steps = steps[::-1]
@@ -654,7 +645,7 @@ def get_equivalence_groups_dict(
     read_length : int
         Read length for which these groups are computed.
     oua : bool
-        Whether this is for the upstream-annotated cleavage model variant.
+        Whether the reads carry a 5' untemplated addition.
     key_cache : dict or None
         Optional shared cache used to intern equivalence-group keys across
         runs and read lengths.
@@ -713,7 +704,7 @@ def cleavage_dist_signature(cleavage_model, read_length: int, oua: bool) -> tupl
     read_length : int
         Read length to model.
     oua : bool
-        Whether to use the upstream-annotated cleavage model variant.
+        Whether the reads carry a 5' untemplated addition.
 
     Returns
     -------
@@ -903,7 +894,7 @@ def make_equivalence_intervals(
     read_length : int
         Read length to model.
     oua : bool
-        Whether to use the upstream-annotated cleavage model variant.
+        Whether the reads carry a 5' untemplated addition.
 
     Returns
     -------

@@ -103,24 +103,29 @@ class GenomicRegion:
         return self.length
 
     def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
-        """Append an exon interval and recompute the hash.
+        """Add an exon interval and recompute the hash.
+
+        Intervals are kept in chromosome order: on the ``+`` strand exons
+        arrive in that order and are appended, on the ``-`` strand they
+        arrive in translation order and are prepended.
 
         Parameters
         ----------
         interval : HTSeq.GenomicInterval
-            Interval to append.
+            Interval to add.
 
         Notes
         -----
-        Calling this method invalidates any previously stored hash.
+        The region must not be used as a dictionary key or set member
+        before every interval has been added: the hash changes with each
+        call.
         """
-        # self.intervals.append(interval)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
         self.length += interval.end - interval.start
         if self.strand == "+":
             self.intervals.append(interval)
         else:
             self.intervals.insert(0, interval)
+        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
     def map_to_local(self, other: GenomicRegion) -> tuple[int, int]:
         """Map *other* into the local spliced coordinate system of *self*.

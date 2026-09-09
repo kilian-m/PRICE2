@@ -1,6 +1,6 @@
 """A single-context GPU deconvolution broker for PRICE2.
 
-Motivation (see ../mps_experiment/MPS_REPORT.md): each CPU worker that touches
+Motivation: each CPU worker that touches
 the GPU pays a ~272 MiB CUDA/torch context that MPS does not share, so N workers
 cost N contexts. The broker inverts that: **one** long-lived GPU process holds
 **one** context and does all the group-LASSO MU deconvolution; the many
@@ -26,8 +26,10 @@ The address lives in Linux's abstract namespace, so it needs no filesystem
 entry, no cleanup, and — unlike a semaphore or an fd — it is just a string and
 travels through the ordinary job dict.
 
-Numerics match price2.mu_solver / solvers.py (weighted Richardson-Lucy +
-group-LASSO), so broker results equal the in-worker GPU/CPU MU results.
+The update rule is the weighted Richardson-Lucy + group-LASSO step of
+``price2.mu_solver``; note that this copy checks convergence only every
+``check_every`` inner iterations, so results are close to but not identical
+with the in-worker CPU/GPU path.
 """
 from __future__ import annotations
 

@@ -29,7 +29,7 @@ flowchart TD
 
     RESET --> M
     CONV -->|"yes — converged"| FINAL["<b>final full M-step</b><br/>all loci, converged weights<br/>full deconvolution + LRT<br/>+ activity estimation + export"]
-    FINAL --> TPM["generate_tpm_output<br/>final_orfs_tpm.tsv"]
+    FINAL --> TPM["generate_tpm_output<br/>orfs_tpm.tsv"]
     TPM --> DONE(["done"])
 
     classDef em fill:#eef6ff,stroke:#4a7fb5
