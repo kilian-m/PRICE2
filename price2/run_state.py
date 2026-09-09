@@ -36,8 +36,8 @@ import hashlib
 import logging
 import os
 import re
-import sqlite3 as sql
 
+from price2 import database
 from price2.config import Config
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ _COLLECTION_FIELDS: tuple[str, ...] = (
 #: Options fingerprinted by basename rather than by full path.
 _PATH_FIELDS: frozenset[str] = frozenset({"gtf_path", "fasta_path", "bam_dir"})
 
-_TABLE = "run_state"
+_TABLE = database.STATE_TABLE
 
 
 @dataclass
@@ -213,17 +213,12 @@ def read_state(db_path: str) -> dict[str, str]:
     """
     if not os.path.exists(db_path):
         return {}
-    db = sql.connect(db_path, timeout=120)
-    try:
+    with database.connect(db_path) as db:
         cur = db.cursor()
-        cur.execute("PRAGMA busy_timeout = 120000")
-        try:
-            rows = cur.execute(f"SELECT key, value FROM {_TABLE}").fetchall()
-        except sql.OperationalError:  # table absent
+        if not database.table_exists(cur, _TABLE):
             return {}
-        return {key: value for key, value in rows}
-    finally:
-        db.close()
+        rows = cur.execute(f"SELECT key, value FROM {_TABLE}").fetchall()
+    return {key: value for key, value in rows}
 
 
 def write_state(db_path: str, **entries: str) -> None:
@@ -236,21 +231,13 @@ def write_state(db_path: str, **entries: str) -> None:
     **entries : str
         Key/value pairs to store.
     """
-    db = sql.connect(db_path, timeout=120)
-    try:
+    with database.connect(db_path, commit=True) as db:
         cur = db.cursor()
-        cur.execute("PRAGMA busy_timeout = 120000")
-        cur.execute(
-            f"CREATE TABLE IF NOT EXISTS {_TABLE} "
-            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
+        database.create_state_table(cur)
         cur.executemany(
             f"INSERT OR REPLACE INTO {_TABLE} VALUES (?, ?)",
             [(key, str(value)) for key, value in entries.items()],
         )
-        db.commit()
-    finally:
-        db.close()
 
 
 # --------------------------------------------------------------------------- #

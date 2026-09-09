@@ -18,6 +18,7 @@ import time
 
 from pyfaidx import Fasta
 
+from price2 import database
 from price2 import multimap
 from price2 import run_state
 from price2.config import Config
@@ -144,7 +145,7 @@ def setup_directories(config: Config) -> run_state.ResumePlan:
         When the existing database was collected under different
         collection options (see :func:`price2.run_state.plan_resume`).
     """
-    db_path = os.path.join(config.w_dir, "price.db")
+    db_path = config.layout.db_path
 
     if not (config.warm_start and os.path.exists(db_path)):
         for path in (config.w_dir, config.o_dir):
@@ -161,7 +162,7 @@ def setup_directories(config: Config) -> run_state.ResumePlan:
 
     plan = run_state.plan_resume(config, db_path)
     os.makedirs(config.o_dir, exist_ok=True)
-    processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
+    processed_loci_path = config.layout.processed_loci_path
 
     if plan.reuse_deconvolution and not _outputs_resumable(
         config, processed_loci_path
@@ -200,7 +201,7 @@ def _outputs_resumable(config: Config, processed_loci_path: str) -> bool:
         loci may be skipped; ``False`` when the deconvolution has to start
         over.
     """
-    ra_dir = os.path.join(config.o_dir, "regions_activities")
+    ra_dir = config.layout.regions_activities_dir
     if os.path.exists(processed_loci_path) and not os.path.isdir(ra_dir):
         # The results those loci produced are gone; skipping them now would
         # silently drop them from the output.
@@ -258,7 +259,7 @@ def run_pipeline(config: Config) -> None:
         Fully populated configuration object.
     """
     plan = setup_directories(config)
-    db_path = os.path.join(config.w_dir, "price.db")
+    db_path = config.layout.db_path
     logger.info("%s (%s)", plan.reason, config.w_dir)
 
     if not plan.skip_collection:
@@ -314,7 +315,7 @@ def run_pipeline(config: Config) -> None:
             _timed(
                 "build multimapping linkage index... ",
                 multimap.build_multimap_index,
-                f"{config.w_dir}/price.db",
+                db_path,
                 processes=config.processes,
             )
 
@@ -374,7 +375,7 @@ def _run_em_deconvolution(
         restarting it (see :func:`price2.multimap.em_resume_point`).  The
         caller sets this from the run's :class:`~price2.run_state.ResumePlan`.
     """
-    db_path = f"{config.w_dir}/price.db"
+    db_path = config.layout.db_path
 
     if not multimap.has_multimap_index(db_path):
         logger.warning(
@@ -389,7 +390,7 @@ def _run_em_deconvolution(
         _timed("", estimator.run_orf_deconvolution)
         return
 
-    multimap.enable_wal(db_path)
+    database.enable_wal(db_path)
 
     checkpoint = multimap.em_resume_point(db_path) if resume else None
     if checkpoint is None:

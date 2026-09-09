@@ -13,14 +13,12 @@ import os
 import HTSeq
 import pysam
 from pyfaidx import Fasta
-import sqlite3 as sql
-from pickle import dumps, loads
-import zlib
 import pandas as pd
 import numpy as np
 import multiprocessing as mp
 from collections import defaultdict
 
+from price2 import database
 from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import ribo_seq_runs_from_bams
@@ -100,7 +98,7 @@ class DataCollector:
         self.genome = genome
         self.reference_annotation = reference_annotation
         self.bam_dir = config.bam_dir
-        self.db_path = f"{config.w_dir}/price.db"
+        self.db_path = config.layout.db_path
         self.get_chromosome_order()
         self.make_loci(self.reference_annotation)
 
@@ -125,17 +123,14 @@ class DataCollector:
         # The database may already exist without holding any runs: a cold
         # start records its configuration fingerprints before collecting
         # anything (see :mod:`price2.run_state`).
-        db = sql.connect(self.db_path, timeout=60)
-        cur = db.cursor()
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS runs (
-                    run_id text PRIMARY KEY,
-                    run_blob blob
-                    )"""
-        )
-        stored_runs = cur.execute("SELECT * FROM runs").fetchall()
+        with database.connect(self.db_path, commit=True) as db:
+            cur = db.cursor()
+            database.create_collection_tables(cur)
+            stored_runs = cur.execute("SELECT * FROM runs").fetchall()
         run_ids = {run_id for run_id, _ in stored_runs}
-        self.runs = [loads(run_blob) for _, run_blob in stored_runs]
+        self.runs = [
+            database.unpickle_blob(run_blob) for _, run_blob in stored_runs
+        ]
         bam_ids = bam_ids - run_ids
 
         if self.config.align_ends_type == "endtoend":
@@ -163,11 +158,11 @@ class DataCollector:
         )
         self.runs += new_runs
 
-        for run in new_runs:
-            cur.execute("INSERT INTO runs VALUES (?, ?)", (run.id, dumps(run)))
-
-        db.commit()
-        db.close()
+        with database.connect(self.db_path, commit=True) as db:
+            db.executemany(
+                "INSERT INTO runs VALUES (?, ?)",
+                [(run.id, database.pickle_blob(run)) for run in new_runs],
+            )
         logger.info("Collected %d Ribo-seq run(s).", len(self.runs))
 
     def collect_mappings(self) -> None:
@@ -190,29 +185,13 @@ class DataCollector:
         :mod:`price2.multimap`).
         """
         logger.info("Collecting read mappings...")
-        db = sql.connect(self.db_path)
-        cur = db.cursor()
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS reads (
-                    locus_id text NOT NULL,
-                    run_id text NOT NULL,
-                    reads_blob blob NOT NULL
-                    )"""
-        )
-
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS transcript_read_counts (
-                         locus_id text NOT NULL,
-                         run_id text NOT NULL,
-                         transcript_read_counts_blob blob NOT NULL
-                         )"""
-        )
-        db.commit()
-
-        processed_run_ids = {
-            run_id for run_id, in cur.execute("SELECT DISTINCT run_id FROM reads")
-        }
-        db.close()
+        with database.connect(self.db_path, commit=True) as db:
+            cur = db.cursor()
+            database.create_collection_tables(cur)
+            processed_run_ids = {
+                run_id
+                for run_id, in cur.execute("SELECT DISTINCT run_id FROM reads")
+            }
 
         pending = [run for run in self.runs if run.id not in processed_run_ids]
         if not pending:
@@ -311,17 +290,8 @@ class DataCollector:
         finally:
             _WORKER_LOCI = []
 
-        db = sql.connect(self.db_path)
-        cur = db.cursor()
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_reads_locus_id ON reads(locus_id)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_trc_locus_id "
-            "ON transcript_read_counts(locus_id)"
-        )
-        db.commit()
-        db.close()
+        with database.connect(self.db_path, commit=True) as db:
+            database.create_read_indexes(db.cursor())
 
         logger.info("Read mappings collected.")
 
@@ -352,25 +322,23 @@ class DataCollector:
             # consuming results would otherwise re-run chunks already stored.
             pool = None
 
-        db = sql.connect(self.db_path, timeout=600)
-        cur = db.cursor()
-        cur.execute("PRAGMA busy_timeout = 600000")
+        with database.connect(self.db_path, timeout=600, commit=True) as db:
+            cur = db.cursor()
 
-        def store(result: tuple) -> None:
-            reads_rows, trc_rows = result
-            cur.executemany(
-                "INSERT INTO reads (locus_id, run_id, reads_blob) "
-                "VALUES (?, ?, ?)",
-                reads_rows,
-            )
-            cur.executemany(
-                "INSERT INTO transcript_read_counts ("
-                "locus_id, run_id, transcript_read_counts_blob) "
-                "VALUES (?, ?, ?)",
-                trc_rows,
-            )
+            def store(result: tuple) -> None:
+                reads_rows, trc_rows = result
+                cur.executemany(
+                    "INSERT INTO reads (locus_id, run_id, reads_blob) "
+                    "VALUES (?, ?, ?)",
+                    reads_rows,
+                )
+                cur.executemany(
+                    "INSERT INTO transcript_read_counts ("
+                    "locus_id, run_id, transcript_read_counts_blob) "
+                    "VALUES (?, ?, ?)",
+                    trc_rows,
+                )
 
-        try:
             if pool is None:
                 for task in tasks:
                     store(collect_mappings_chunk(task))
@@ -394,9 +362,6 @@ class DataCollector:
                     raise
                 finally:
                     pool.join()
-            db.commit()
-        finally:
-            db.close()
         logger.info("Mapped run %s (%d locus chunks).", run_id, len(tasks))
 
     def get_chromosome_order(self) -> None:
@@ -498,29 +463,23 @@ class DataCollector:
         ``min_explained_reads`` downstream.
         """
         logger.info("Saving locus skeletons...")
-        db = sql.connect(self.db_path)
-        cur = db.cursor()
-
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS loci (
-                    locus_id text PRIMARY KEY,
-                    loc_blob blob
-                    )"""
-        )
-        processed_loci_ids = {
-            loc_id for loc_id, in cur.execute("SELECT locus_id FROM loci").fetchall()
-        }
-        loci_ids_to_process = {loc.id for loc in self.loci_set} - processed_loci_ids
-        loc_dict = {loc.id: loc for loc in self.loci_set}
-
-        for loc_id in loci_ids_to_process:
-            locus = loc_dict[loc_id]
-            cur.execute(
-                "INSERT INTO loci VALUES (?, ?)", (locus.id, dumps(locus))
+        with database.connect(self.db_path, commit=True) as db:
+            cur = db.cursor()
+            database.create_collection_tables(cur)
+            processed_loci_ids = {
+                loc_id for loc_id, in cur.execute("SELECT locus_id FROM loci")
+            }
+            loci_ids_to_process = {
+                loc.id for loc in self.loci_set
+            } - processed_loci_ids
+            loc_dict = {loc.id: loc for loc in self.loci_set}
+            cur.executemany(
+                "INSERT INTO loci VALUES (?, ?)",
+                [
+                    (loc_id, database.pickle_blob(loc_dict[loc_id]))
+                    for loc_id in loci_ids_to_process
+                ],
             )
-
-        db.commit()
-        db.close()
         logger.info("Saved %d locus skeletons.", len(loci_ids_to_process))
 
 
@@ -560,22 +519,17 @@ def build_rgrs(
         RGRs were built; ``False`` for empty loci that downstream code
         should skip.
     """
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    cur.execute(
-        "SELECT * FROM transcript_read_counts WHERE locus_id = ?",
-        (locus.id,),
-    )
+    with database.connect(db_path) as db:
+        rows = db.execute(
+            "SELECT transcript_read_counts_blob FROM transcript_read_counts "
+            "WHERE locus_id = ?",
+            (locus.id,),
+        ).fetchall()
 
     transcript_read_counts: dict = {}
-    for entry in cur.fetchall():
-        for k, v in loads(zlib.decompress(entry[2])).items():
-            try:
-                transcript_read_counts[k] += v
-            except KeyError:
-                transcript_read_counts[k] = v
-    db.close()
+    for (blob,) in rows:
+        for k, v in database.decompress_blob(blob).items():
+            transcript_read_counts[k] = transcript_read_counts.get(k, 0) + v
 
     tr_ids = [t.id for t in locus.transcripts]
     explaining_transcripts_reads_list = []
@@ -905,10 +859,10 @@ def collect_mappings_chunk(data: tuple) -> tuple:
                 mm_keys.append(group_key(ivs_tuple, ua))
 
         reads_rows.append(
-            (locus.id, run_id, zlib.compress(dumps(_reads_frame(mappings_dict))))
+            (locus.id, run_id, database.compress_blob(_reads_frame(mappings_dict)))
         )
         transcript_count_rows.append(
-            (locus.id, run_id, zlib.compress(dumps(transcripts_counts)))
+            (locus.id, run_id, database.compress_blob(transcripts_counts))
         )
 
     if record_multimap:

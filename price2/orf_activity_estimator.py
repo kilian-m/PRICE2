@@ -11,12 +11,10 @@ import glob
 import logging
 import logging.handlers
 import os
-import sqlite3 as sql
 import time
 import traceback
 from concurrent.futures import TimeoutError, as_completed
 from contextlib import contextmanager
-from pickle import loads
 
 import multiprocessing as mp
 import pandas as pd
@@ -26,6 +24,7 @@ from pyfaidx import Fasta
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+from price2 import database
 from price2 import multimap
 from price2.data_collector import build_rgrs
 from price2.equivalence_groups import make_equivalence_groups
@@ -89,20 +88,20 @@ class ORFActivityEstimator:
             Parsed PRICE configuration object.
         """
         self.config = config
-        self.db_path = f"{config.w_dir}/price.db"
+        self.db_path = config.layout.db_path
 
-        db = sql.connect(self.db_path)
-        cur = db.cursor()
-
-        cur.execute("SELECT locus_id FROM loci")
-        self.loci_ids = [id for id, in cur.fetchall()]
+        with database.connect(self.db_path) as db:
+            self.loci_ids = [
+                locus_id
+                for locus_id, in db.execute("SELECT locus_id FROM loci")
+            ]
+            n_runs = db.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
         # A locus is solved for every dataset at once — one activity column
         # per run — so its cost grows with how many there are.  The budget is
         # therefore per sample: an absolute one would abandon loci a wide run
         # could still have finished, while being needlessly generous to a
         # narrow one.
-        n_runs = cur.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
         self.locus_timeout = config.timeout * max(1, n_runs)
         logger.info(
             "per-locus timeout: %d s (%d s per sample, %d sample(s))",
@@ -255,15 +254,14 @@ class ORFActivityEstimator:
         if loci_subset is not None:
             loci_ids = loci_ids & loci_subset
 
-        ra_dir = os.path.join(self.config.o_dir, "regions_activities")
+        layout = self.config.layout
+        ra_dir = layout.regions_activities_dir
         os.makedirs(ra_dir, exist_ok=True)
 
         # Resume-skip bookkeeping only applies to full passes; light EM
         # passes intentionally re-run every locus each iteration.
         if em_final:
-            processed_loci_path = os.path.join(
-                self.config.w_dir, "processed_loci.txt"
-            )
+            processed_loci_path = layout.processed_loci_path
             if os.path.exists(processed_loci_path):
                 with open(processed_loci_path) as fh:
                     processed_loc_ids = {
@@ -328,9 +326,9 @@ class ORFActivityEstimator:
                     except (TimeoutError, Exception) as e:
                         stack = traceback.format_exc()
                         logger.error("locus %s failed: %s", loc_id, e)
-                        lock = FileLock(f"{ra_dir}/failed_loci.txt.lock")
+                        lock = FileLock(layout.failed_loci_path + ".lock")
                         with lock:
-                            with open(f"{ra_dir}/failed_loci.txt", "a") as f:
+                            with open(layout.failed_loci_path, "a") as f:
                                 f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
                     finally:
                         pbar.update(1)
@@ -390,17 +388,16 @@ def process_loc(arguments: tuple):
     t_start = time.time()
     t1 = time.time()
 
-    if not hasattr(config, "base_o_dir"):
-        config.base_o_dir = os.path.join(config.o_dir, "regions_activities")
+    layout = config.layout
+    ra_dir = layout.regions_activities_dir
+    db_path = layout.db_path
 
     # --- Load runs (always needed) ---
-    db_path = f"{config.w_dir}/price.db"
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    cur.execute("SELECT * FROM runs")
-    runs = [loads(blob) for id, blob in cur.fetchall()]
-    db.close()
+    with database.connect(db_path) as db:
+        runs = [
+            database.unpickle_blob(blob)
+            for _, blob in db.execute("SELECT * FROM runs")
+        ]
 
     # In EM mode, reuse the weight-independent prepared state (RGRs, filters,
     # equivalence-group geometry) cached by the first light pass; only the
@@ -459,16 +456,15 @@ def process_loc(arguments: tuple):
         performance_measurements["eg_count"] = n_egs
     else:
         # --- Load locus skeleton from database ---
-        db = sql.connect(db_path, timeout=120)
-        cur = db.cursor()
-        cur.execute("PRAGMA busy_timeout = 120000")
-        cur.execute("SELECT * FROM loci WHERE locus_id = ?", (loc_id,))
-        loc = loads(cur.fetchone()[1])
+        with database.connect(db_path) as db:
+            row = db.execute(
+                "SELECT loc_blob FROM loci WHERE locus_id = ?", (loc_id,)
+            ).fetchone()
+        loc = database.unpickle_blob(row[0])
         performance_measurements["chrom"] = loc.iv.chrom
         performance_measurements["strand"] = loc.iv.strand
         performance_measurements["start"] = loc.iv.start
         performance_measurements["end"] = loc.iv.end
-        db.close()
 
         t2 = time.time()
         performance_measurements["db_time"] = t2 - t1
@@ -483,9 +479,7 @@ def process_loc(arguments: tuple):
         performance_measurements["build_rgrs_time"] = time.time() - t1
         if not has_transcripts:
             if not em_light:
-                processed_loci_path = os.path.join(
-                    config.w_dir, "processed_loci.txt"
-                )
+                processed_loci_path = layout.processed_loci_path
                 lock = FileLock(processed_loci_path + ".lock")
                 with lock:
                     with open(processed_loci_path, "a") as f:
@@ -495,15 +489,15 @@ def process_loc(arguments: tuple):
         if config.export_all_steps and not em_light:
             if config.export_gtf:
                 loc.to_gtf(
-                    f"{config.base_o_dir}/all",
+                    f"{ra_dir}/all",
                     write_orfs=config.export_orfs,
                     write_loci=config.export_loci,
                     write_transcripts=config.export_transcripts,
                 )
             if config.export_tsv and config.export_orfs:
-                loc.to_tsv(f"{config.base_o_dir}/all")
+                loc.to_tsv(f"{ra_dir}/all")
             if config.export_bed and config.export_orfs:
-                loc.to_bed(f"{config.base_o_dir}/all")
+                loc.to_bed(f"{ra_dir}/all")
 
         # --- Load reads ---
         t1 = time.time()
@@ -530,15 +524,15 @@ def process_loc(arguments: tuple):
         if config.export_all_steps and not em_light:
             if config.export_gtf:
                 loc.to_gtf(
-                    f"{config.base_o_dir}/coverage_filtered",
+                    f"{ra_dir}/coverage_filtered",
                     write_orfs=config.export_orfs,
                     write_loci=config.export_loci,
                     write_transcripts=config.export_transcripts,
                 )
             if config.export_tsv and config.export_orfs:
-                loc.to_tsv(f"{config.base_o_dir}/coverage_filtered")
+                loc.to_tsv(f"{ra_dir}/coverage_filtered")
             if config.export_bed and config.export_orfs:
-                loc.to_bed(f"{config.base_o_dir}/coverage_filtered")
+                loc.to_bed(f"{ra_dir}/coverage_filtered")
 
         performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
         t2 = time.time()
@@ -558,15 +552,15 @@ def process_loc(arguments: tuple):
         if config.export_all_steps and not em_light:
             if config.export_gtf:
                 loc.to_gtf(
-                    f"{config.base_o_dir}/deconvolution_filtered",
+                    f"{ra_dir}/deconvolution_filtered",
                     write_orfs=config.export_orfs,
                     write_loci=config.export_loci,
                     write_transcripts=config.export_transcripts,
                 )
             if config.export_tsv and config.export_orfs:
-                loc.to_tsv(f"{config.base_o_dir}/deconvolution_filtered")
+                loc.to_tsv(f"{ra_dir}/deconvolution_filtered")
             if config.export_bed and config.export_orfs:
-                loc.to_bed(f"{config.base_o_dir}/deconvolution_filtered")
+                loc.to_bed(f"{ra_dir}/deconvolution_filtered")
 
         # --- Equivalence groups ---
         for tr in loc.transcripts:
@@ -660,15 +654,15 @@ def process_loc(arguments: tuple):
     if config.export_all_steps and not em_light:
         if config.export_gtf:
             loc.to_gtf(
-                f"{config.base_o_dir}/deconvoluted",
+                f"{ra_dir}/deconvoluted",
                 write_orfs=config.export_orfs,
                 write_loci=config.export_loci,
                 write_transcripts=config.export_transcripts,
             )
         if config.export_tsv and config.export_orfs:
-            loc.to_tsv(f"{config.base_o_dir}/deconvoluted")
+            loc.to_tsv(f"{ra_dir}/deconvoluted")
         if config.export_bed and config.export_orfs:
-            loc.to_bed(f"{config.base_o_dir}/deconvoluted")
+            loc.to_bed(f"{ra_dir}/deconvoluted")
 
     # --- Likelihood-ratio filter ---
     if config.likelihood_ratio_filter:
@@ -696,13 +690,13 @@ def process_loc(arguments: tuple):
 
     if config.export_tsv:
         if config.export_orfs:
-            loc.to_tsv(f"{config.base_o_dir}/", runs=runs)
+            loc.to_tsv(f"{ra_dir}/", runs=runs)
         if config.export_regions and not loc.result_df.empty:
-            loc.to_tsv(f"{config.base_o_dir}/", runs=runs, include_noise=True)
+            loc.to_tsv(f"{ra_dir}/", runs=runs, include_noise=True)
 
     if config.export_gtf:
         loc.to_gtf(
-            f"{config.base_o_dir}/",
+            f"{ra_dir}/",
             write_orfs=config.export_orfs,
             write_loci=config.export_loci,
             write_transcripts=config.export_transcripts,
@@ -710,12 +704,12 @@ def process_loc(arguments: tuple):
 
     if config.export_bed:
         if config.export_orfs:
-            loc.to_bed(f"{config.base_o_dir}/")
+            loc.to_bed(f"{ra_dir}/")
         if config.export_regions and not loc.result_df.empty:
-            loc.to_bed(f"{config.base_o_dir}/", include_noise=True)
+            loc.to_bed(f"{ra_dir}/", include_noise=True)
 
     if config.export_performance_measurements:
-        perf_path = f"{config.o_dir}/performance_measurements.tsv"
+        perf_path = layout.performance_path
         header = not os.path.exists(perf_path)
         lock = FileLock(perf_path + ".lock")
         with lock:
@@ -729,7 +723,7 @@ def process_loc(arguments: tuple):
                     )
                 )
 
-    processed_loci_path = os.path.join(config.w_dir, "processed_loci.txt")
+    processed_loci_path = layout.processed_loci_path
     lock = FileLock(processed_loci_path + ".lock")
     with lock:
         with open(processed_loci_path, "a") as f:

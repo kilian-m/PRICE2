@@ -83,12 +83,12 @@ import os
 import shutil
 import sqlite3 as sql
 import struct
-import zlib
 from collections import defaultdict
 from multiprocessing import Pool
-from pickle import dumps, loads
 
 import numpy as np
+
+from price2 import database
 
 logger = logging.getLogger(__name__)
 
@@ -170,139 +170,6 @@ def alignment_group_key(rsa) -> int:
 # Schema                                                                       #
 # --------------------------------------------------------------------------- #
 
-def create_em_tables(cur: sql.Cursor) -> None:
-    """Create the derived EM state tables (dropping any stale copies)."""
-    for table in (
-        "multimap_alignments",  # legacy: superseded by the mm_spill files
-        "multimap_group_slots",
-        "multimap_groups",
-        "multimap_slot_base",
-        "group_weights",
-        "group_lambdas",
-        "locus_activities",
-        "prepared_loci",
-        "prepared_loci_cache",
-    ):
-        cur.execute(f"DROP TABLE IF EXISTS {table}")
-
-    cur.execute(
-        """CREATE TABLE multimap_groups (
-               mmg_id  INTEGER PRIMARY KEY,
-               run_id  TEXT    NOT NULL,
-               count   INTEGER NOT NULL
-           )"""
-    )
-    cur.execute(
-        """CREATE TABLE multimap_group_slots (
-               mmg_id    INTEGER NOT NULL,
-               locus_id  TEXT    NOT NULL,
-               group_key INTEGER NOT NULL
-           )"""
-    )
-    # No index on mmg_id: the sole reader, ``_build_linkage``, full-scans the
-    # table once, and building a 4.5e7-row index cost more than the scan it
-    # never accelerated.
-    # Per-slot state is stored as ONE blob per slot-locus rather than one row
-    # per slot: at genome scale that is ~40K rows instead of ~42M, so every
-    # E-step read/write/prune touches ~1000x fewer rows.  The baseline keeps
-    # its keys (a pickled ``{(run_id, group_key): value}`` dict) because the
-    # workers need them; the weights and λ are bare ``float64`` buffers over
-    # the locus's slots in canonical order (see ``_slot_keys``).  The
-    # multimap_* linkage tables remain per-slot, and are cached as integer
-    # arrays in ``multimap_linkage.npz`` (see ``_linkage``).
-    cur.execute(
-        """CREATE TABLE multimap_slot_base (
-               locus_id  TEXT PRIMARY KEY,
-               base_blob BLOB NOT NULL
-           )"""
-    )
-    cur.execute(
-        """CREATE TABLE group_weights (
-               iteration   INTEGER NOT NULL,
-               locus_id    TEXT    NOT NULL,
-               weight_blob BLOB    NOT NULL,
-               PRIMARY KEY (iteration, locus_id)
-           )"""
-    )
-    cur.execute(
-        """CREATE TABLE group_lambdas (
-               iteration INTEGER NOT NULL,
-               locus_id  TEXT    NOT NULL,
-               lam_blob  BLOB    NOT NULL,
-               PRIMARY KEY (iteration, locus_id)
-           )"""
-    )
-    cur.execute(
-        """CREATE TABLE locus_activities (
-               iteration      INTEGER NOT NULL,
-               locus_id       TEXT    NOT NULL,
-               activities_blob BLOB   NOT NULL,
-               PRIMARY KEY (iteration, locus_id)
-           )"""
-    )
-    cur.execute(
-        """CREATE TABLE prepared_loci (
-               locus_id  TEXT PRIMARY KEY,
-               prep_blob BLOB NOT NULL
-           )"""
-    )
-    # The per-locus ``EgRoutingCache`` (see ``Config.eg_cache``), stored apart
-    # from the locus because it holds only arrays: a light M-step loads this
-    # blob alone and never unpickles the locus's object graph.
-    cur.execute(
-        """CREATE TABLE prepared_loci_cache (
-               locus_id   TEXT PRIMARY KEY,
-               cache_blob BLOB NOT NULL
-           )"""
-    )
-
-
-def _table_exists(cur: sql.Cursor, name: str) -> bool:
-    """Return whether table *name* exists in the connected database."""
-    row = cur.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (name,),
-    ).fetchone()
-    return row is not None
-
-
-def enable_wal(db_path: str) -> None:
-    """Switch ``price.db`` to WAL mode for concurrent worker writes.
-
-    The EM M-step makes every worker a writer (activities + λ) from up to
-    ``config.processes`` processes at once.  WAL lets many readers and one
-    writer proceed without blocking, and combined with ``busy_timeout``
-    serialises the brief commit windows safely.
-
-    ``journal_mode`` is a persistent database property; ``synchronous`` is
-    per-connection, so the writer connections set it themselves via
-    :func:`_prepare_writer`.
-
-    Parameters
-    ----------
-    db_path : str
-        Path to the SQLite database.
-    """
-    db = sql.connect(db_path, timeout=120)
-    try:
-        db.execute("PRAGMA journal_mode = WAL")
-    finally:
-        db.close()
-
-
-def _prepare_writer(db_path: str) -> sql.Connection:
-    """Open a writer connection tuned for WAL concurrency.
-
-    Sets ``busy_timeout`` (wait rather than fail under contention) and
-    ``synchronous = NORMAL`` (safe under WAL, avoids an fsync per commit).
-    Both pragmas are per-connection, so every writer must set them.
-    """
-    db = sql.connect(db_path, timeout=120)
-    db.execute("PRAGMA busy_timeout = 120000")
-    db.execute("PRAGMA synchronous = NORMAL")
-    return db
-
-
 def reset_em_state(db_path: str) -> None:
     """Clear per-iteration EM state and re-seed iteration-0 weights.
 
@@ -321,25 +188,19 @@ def reset_em_state(db_path: str) -> None:
     db_path : str
         Path to ``price.db`` (must already contain the linkage tables).
     """
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    cur.execute("DELETE FROM group_lambdas")
-    cur.execute("DELETE FROM locus_activities")
-    cur.execute("DELETE FROM group_weights")
-    cur.execute("DELETE FROM prepared_loci")
-    # Databases collected before ``prepared_loci_cache`` existed lack the table.
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS prepared_loci_cache ("
-        "locus_id TEXT PRIMARY KEY, cache_blob BLOB NOT NULL)"
-    )
-    cur.execute("DELETE FROM prepared_loci_cache")
-    cur.executemany(
-        "INSERT INTO group_weights VALUES (0, ?, ?)",
-        _baseline_weight_rows(cur),
-    )
-    db.commit()
-    db.close()
+    with database.connect(db_path, commit=True) as db:
+        cur = db.cursor()
+        cur.execute("DELETE FROM group_lambdas")
+        cur.execute("DELETE FROM locus_activities")
+        cur.execute("DELETE FROM group_weights")
+        cur.execute("DELETE FROM prepared_loci")
+        # Databases collected before ``prepared_loci_cache`` existed lack it.
+        database.create_prepared_cache_table(cur)
+        cur.execute("DELETE FROM prepared_loci_cache")
+        cur.executemany(
+            "INSERT INTO group_weights VALUES (0, ?, ?)",
+            _baseline_weight_rows(cur),
+        )
 
 
 def _baseline_weight_rows(cur: sql.Cursor) -> list:
@@ -357,7 +218,7 @@ def _baseline_weight_rows(cur: sql.Cursor) -> list:
     for locus_id, blob in cur.execute(
         "SELECT locus_id, base_blob FROM multimap_slot_base"
     ).fetchall():
-        base_map = loads(blob)
+        base_map = database.unpickle_blob(blob)
         keys = _slot_keys(base_map, run_index)
         weights = np.fromiter(
             (base_map[k] for k in keys), dtype=np.float64, count=len(keys)
@@ -384,12 +245,13 @@ def slot_locus_ids(db_path: str) -> set:
     set of str
         Locus ids present in ``multimap_slot_base``.
     """
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("SELECT DISTINCT locus_id FROM multimap_slot_base")
-    ids = {loc_id for loc_id, in cur.fetchall()}
-    db.close()
-    return ids
+    with database.connect(db_path) as db:
+        return {
+            loc_id
+            for loc_id, in db.execute(
+                "SELECT DISTINCT locus_id FROM multimap_slot_base"
+            )
+        }
 
 
 def em_resume_point(db_path: str) -> tuple[int, set] | None:
@@ -414,11 +276,9 @@ def em_resume_point(db_path: str) -> tuple[int, set] | None:
         ``(iteration, finished_locus_ids)``, or ``None`` when no weights
         are stored — nothing to resume, the EM starts from scratch.
     """
-    db = sql.connect(db_path, timeout=120)
-    try:
+    with database.connect(db_path) as db:
         cur = db.cursor()
-        cur.execute("PRAGMA busy_timeout = 120000")
-        if not _table_exists(cur, "group_weights"):
+        if not database.table_exists(cur, "group_weights"):
             return None  # never ran an EM here
         row = cur.execute("SELECT MAX(iteration) FROM group_weights").fetchone()
         if row is None or row[0] is None:
@@ -432,8 +292,6 @@ def em_resume_point(db_path: str) -> tuple[int, set] | None:
             )
         }
         return iteration, finished
-    finally:
-        db.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -815,10 +673,8 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
     ) if os.path.isdir(root) else []
 
     if not run_ids:
-        db = sql.connect(db_path, timeout=120)
-        create_em_tables(db.cursor())
-        db.commit()
-        db.close()
+        with database.connect(db_path, commit=True) as db:
+            database.create_em_tables(db.cursor())
         _invalidate_linkage(db_path)
         logger.warning(
             "no multimapping alignments were spilled to %s; the EM linkage "
@@ -835,87 +691,87 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
     # the remaining runs are still being collapsed.
     pool = Pool(n_proc) if n_proc > 1 else None
 
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    create_em_tables(cur)
-    db.commit()
+    with database.connect(db_path, commit=True) as db:
+        cur = db.cursor()
+        database.create_em_tables(cur)
+        db.commit()
 
-    # Merge the per-run results into the global MMG id space and accumulate
-    # per-slot baselines.  Everything below is O(#slots), not O(#alignments).
-    base_by_locus: dict = defaultdict(dict)
-    mmg_id = 0
-    n_slots = 0
+        # Merge the per-run results into the global MMG id space and accumulate
+        # per-slot baselines.  Everything below is O(#slots), not O(#alignments).
+        base_by_locus: dict = defaultdict(dict)
+        mmg_id = 0
+        n_slots = 0
 
-    try:
-        results = (
-            pool.imap(_index_run, tasks) if pool
-            else (_index_run(t) for t in tasks)
+        try:
+            results = (
+                pool.imap(_index_run, tasks) if pool
+                else (_index_run(t) for t in tasks)
+            )
+            for run_id, (counts, slot_k, slot_li, slot_gk) in zip(run_ids, results):
+                if counts.size == 0:
+                    continue
+                mmg_ids = np.arange(mmg_id, mmg_id + counts.size, dtype=np.int64)
+                mmg_id += counts.size
+
+                cur.executemany(
+                    "INSERT INTO multimap_groups VALUES (?, ?, ?)",
+                    zip(mmg_ids.tolist(), [run_id] * counts.size, counts.tolist()),
+                )
+                cur.executemany(
+                    "INSERT INTO multimap_group_slots VALUES (?, ?, ?)",
+                    zip(
+                        np.repeat(mmg_ids, slot_k).tolist(),
+                        # __getitem__ hands back the interned locus string rather
+                        # than minting one per slot row (there are ~4.5e7 of them).
+                        map(locus_ids.__getitem__, slot_li.tolist()),
+                        slot_gk.tolist(),
+                    ),
+                )
+
+                # base[slot] = Σ read counts of the MMGs passing through it.
+                per_slot_count = np.repeat(counts, slot_k)
+                order = np.lexsort((slot_gk, slot_li))
+                s_li = slot_li[order]
+                s_gk = slot_gk[order]
+                new = np.empty(s_li.size, dtype=bool)
+                new[0] = True
+                np.logical_or(
+                    s_li[1:] != s_li[:-1], s_gk[1:] != s_gk[:-1], out=new[1:]
+                )
+                slot_of = np.cumsum(new) - 1
+                totals = np.bincount(slot_of, weights=per_slot_count[order])
+                u_li = s_li[new]
+                u_gk = s_gk[new]
+                n_slots += u_li.size
+
+                # One pickled {(run_id, group_key): base} dict per locus.
+                bounds = np.flatnonzero(
+                    np.concatenate(([True], u_li[1:] != u_li[:-1]))
+                )
+                for b, e in zip(bounds.tolist(), bounds[1:].tolist() + [u_li.size]):
+                    d = base_by_locus[locus_ids[u_li[b]]]
+                    for g, t in zip(u_gk[b:e].tolist(), totals[b:e].tolist()):
+                        d[(run_id, g)] = t
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        base_rows = [
+            (locus_id, database.pickle_blob(d))
+            for locus_id, d in base_by_locus.items()
+        ]
+        cur.executemany("INSERT INTO multimap_slot_base VALUES (?, ?)", base_rows)
+        # Released before the re-read below: at genome scale the baseline is ~4e7
+        # slots, and `_baseline_weight_rows` loads every blob back again.
+        del base_rows, base_by_locus
+        # iteration-0 weights == baseline == full counts (classic behaviour), as a
+        # dense buffer in canonical slot order; reads back the rows just inserted,
+        # so it must share this cursor's transaction.
+        cur.executemany(
+            "INSERT INTO group_weights VALUES (0, ?, ?)",
+            _baseline_weight_rows(cur),
         )
-        for run_id, (counts, slot_k, slot_li, slot_gk) in zip(run_ids, results):
-            if counts.size == 0:
-                continue
-            mmg_ids = np.arange(mmg_id, mmg_id + counts.size, dtype=np.int64)
-            mmg_id += counts.size
-
-            cur.executemany(
-                "INSERT INTO multimap_groups VALUES (?, ?, ?)",
-                zip(mmg_ids.tolist(), [run_id] * counts.size, counts.tolist()),
-            )
-            cur.executemany(
-                "INSERT INTO multimap_group_slots VALUES (?, ?, ?)",
-                zip(
-                    np.repeat(mmg_ids, slot_k).tolist(),
-                    # __getitem__ hands back the interned locus string rather
-                    # than minting one per slot row (there are ~4.5e7 of them).
-                    map(locus_ids.__getitem__, slot_li.tolist()),
-                    slot_gk.tolist(),
-                ),
-            )
-
-            # base[slot] = Σ read counts of the MMGs passing through it.
-            per_slot_count = np.repeat(counts, slot_k)
-            order = np.lexsort((slot_gk, slot_li))
-            s_li = slot_li[order]
-            s_gk = slot_gk[order]
-            new = np.empty(s_li.size, dtype=bool)
-            new[0] = True
-            np.logical_or(
-                s_li[1:] != s_li[:-1], s_gk[1:] != s_gk[:-1], out=new[1:]
-            )
-            slot_of = np.cumsum(new) - 1
-            totals = np.bincount(slot_of, weights=per_slot_count[order])
-            u_li = s_li[new]
-            u_gk = s_gk[new]
-            n_slots += u_li.size
-
-            # One pickled {(run_id, group_key): base} dict per locus.
-            bounds = np.flatnonzero(
-                np.concatenate(([True], u_li[1:] != u_li[:-1]))
-            )
-            for b, e in zip(bounds.tolist(), bounds[1:].tolist() + [u_li.size]):
-                d = base_by_locus[locus_ids[u_li[b]]]
-                for g, t in zip(u_gk[b:e].tolist(), totals[b:e].tolist()):
-                    d[(run_id, g)] = t
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
-
-    base_rows = [(locus_id, dumps(d)) for locus_id, d in base_by_locus.items()]
-    cur.executemany("INSERT INTO multimap_slot_base VALUES (?, ?)", base_rows)
-    # Released before the re-read below: at genome scale the baseline is ~4e7
-    # slots, and `_baseline_weight_rows` loads every blob back again.
-    del base_rows, base_by_locus
-    # iteration-0 weights == baseline == full counts (classic behaviour), as a
-    # dense buffer in canonical slot order; reads back the rows just inserted,
-    # so it must share this cursor's transaction.
-    cur.executemany(
-        "INSERT INTO group_weights VALUES (0, ?, ?)",
-        _baseline_weight_rows(cur),
-    )
-    db.commit()
-    db.close()
 
     _invalidate_linkage(db_path)
     discard_spill(db_path)
@@ -925,19 +781,12 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
 
 def has_multimap_index(db_path: str) -> bool:
     """Return ``True`` if the EM linkage tables exist and are populated."""
-    db = sql.connect(db_path, timeout=120)
-    try:
+    with database.connect(db_path) as db:
         cur = db.cursor()
-        cur.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name='multimap_groups'"
-        )
-        if cur.fetchone() is None:
+        if not database.table_exists(cur, "multimap_groups"):
             return False
         cur.execute("SELECT 1 FROM multimap_groups LIMIT 1")
         return cur.fetchone() is not None
-    finally:
-        db.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -962,12 +811,10 @@ def _run_index(db_path: str) -> dict:
     """Return ``{run_id: run index}``, memoised per process."""
     cached = _RUN_INDEX_CACHE.get(db_path)
     if cached is None:
-        db = sql.connect(db_path, timeout=120)
-        try:
-            db.execute("PRAGMA busy_timeout = 120000")
-            run_ids = sorted(r for (r,) in db.execute("SELECT run_id FROM runs"))
-        finally:
-            db.close()
+        with database.connect(db_path) as db:
+            run_ids = sorted(
+                r for (r,) in db.execute("SELECT run_id FROM runs")
+            )
         cached = {run_id: i for i, run_id in enumerate(run_ids)}
         _RUN_INDEX_CACHE[db_path] = cached
     return cached
@@ -1001,37 +848,37 @@ def _build_linkage(db_path: str) -> dict:
     Here it happens once; afterwards the E-step is two ``bincount``s.
     """
     run_index = _run_index(db_path)
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
+    with database.connect(db_path) as db:
+        cur = db.cursor()
 
-    locus_ids = sorted(
-        lid for (lid,) in cur.execute("SELECT locus_id FROM multimap_slot_base")
-    )
-    locus_index = {lid: i for i, lid in enumerate(locus_ids)}
+        locus_ids = sorted(
+            lid for (lid,) in cur.execute("SELECT locus_id FROM multimap_slot_base")
+        )
+        locus_index = {lid: i for i, lid in enumerate(locus_ids)}
 
-    n_groups = cur.execute("SELECT COUNT(*) FROM multimap_groups").fetchone()[0]
-    mmg_run = np.zeros(n_groups, dtype=np.int32)
-    mmg_count = np.zeros(n_groups, dtype=np.float64)
-    cur.execute("SELECT mmg_id, run_id, count FROM multimap_groups")
-    while chunk := cur.fetchmany(1 << 20):
-        for mmg_id, run_id, count in chunk:
-            mmg_run[mmg_id] = run_index[run_id]
-            mmg_count[mmg_id] = count
+        n_groups = cur.execute("SELECT COUNT(*) FROM multimap_groups").fetchone()[0]
+        mmg_run = np.zeros(n_groups, dtype=np.int32)
+        mmg_count = np.zeros(n_groups, dtype=np.float64)
+        cur.execute("SELECT mmg_id, run_id, count FROM multimap_groups")
+        while chunk := cur.fetchmany(1 << 20):
+            for mmg_id, run_id, count in chunk:
+                mmg_run[mmg_id] = run_index[run_id]
+                mmg_count[mmg_id] = count
 
-    n_members = cur.execute("SELECT COUNT(*) FROM multimap_group_slots").fetchone()[0]
-    member_mmg = np.empty(n_members, dtype=np.int32)
-    member_locus = np.empty(n_members, dtype=np.int32)
-    member_gk = np.empty(n_members, dtype=np.int64)
-    cur.execute("SELECT mmg_id, locus_id, group_key FROM multimap_group_slots")
-    i = 0
-    while chunk := cur.fetchmany(1 << 20):
-        for mmg_id, locus_id, group_key in chunk:
-            member_mmg[i] = mmg_id
-            member_locus[i] = locus_index[locus_id]
-            member_gk[i] = group_key
-            i += 1
-    db.close()
+        n_members = cur.execute(
+            "SELECT COUNT(*) FROM multimap_group_slots"
+        ).fetchone()[0]
+        member_mmg = np.empty(n_members, dtype=np.int32)
+        member_locus = np.empty(n_members, dtype=np.int32)
+        member_gk = np.empty(n_members, dtype=np.int64)
+        cur.execute("SELECT mmg_id, locus_id, group_key FROM multimap_group_slots")
+        i = 0
+        while chunk := cur.fetchmany(1 << 20):
+            for mmg_id, locus_id, group_key in chunk:
+                member_mmg[i] = mmg_id
+                member_locus[i] = locus_index[locus_id]
+                member_gk[i] = group_key
+                i += 1
 
     # Identify slots by sorting membership rows into the canonical order; a
     # slot's run is its group's run.
@@ -1123,27 +970,19 @@ def load_locus_mm_data(
         baseline but missing a weight row (should not happen) falls back
         to its baseline (full weight).
     """
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-
-    cur.execute(
-        "SELECT base_blob FROM multimap_slot_base WHERE locus_id = ?",
-        (locus_id,),
-    )
-    base_row = cur.fetchone()
-    if base_row is None:
-        db.close()
-        return {}
-    base_map = loads(base_row[0])  # {(run_id, group_key): base}
-
-    cur.execute(
-        "SELECT weight_blob FROM group_weights "
-        "WHERE locus_id = ? AND iteration = ?",
-        (locus_id, iteration),
-    )
-    w_row = cur.fetchone()
-    db.close()
+    with database.connect(db_path) as db:
+        base_row = db.execute(
+            "SELECT base_blob FROM multimap_slot_base WHERE locus_id = ?",
+            (locus_id,),
+        ).fetchone()
+        if base_row is None:
+            return {}
+        w_row = db.execute(
+            "SELECT weight_blob FROM group_weights "
+            "WHERE locus_id = ? AND iteration = ?",
+            (locus_id, iteration),
+        ).fetchone()
+    base_map = database.unpickle_blob(base_row[0])  # {(run_id, group_key): base}
     # ``weight_blob`` is a bare float64 buffer over the locus's slots in
     # canonical order (see ``_slot_keys``); a missing row falls back to the
     # baseline, i.e. full weight.
@@ -1180,19 +1019,15 @@ def load_warm_activities(
         ``{rgr_id: numpy.ndarray of shape (num_runs,)}`` or ``None`` when
         no activities were stored for that iteration (e.g. iteration 0).
     """
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    cur.execute(
-        "SELECT activities_blob FROM locus_activities "
-        "WHERE locus_id = ? AND iteration = ?",
-        (locus_id, iteration),
-    )
-    row = cur.fetchone()
-    db.close()
+    with database.connect(db_path) as db:
+        row = db.execute(
+            "SELECT activities_blob FROM locus_activities "
+            "WHERE locus_id = ? AND iteration = ?",
+            (locus_id, iteration),
+        ).fetchone()
     if row is None:
         return None
-    return loads(zlib.decompress(row[0]))
+    return database.decompress_blob(row[0])
 
 
 def write_locus_em_output(
@@ -1224,35 +1059,33 @@ def write_locus_em_output(
         the canonical slot order λ is written in.  Required when *lambdas* is
         non-empty.
     """
-    db = _prepare_writer(db_path)
-    cur = db.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO locus_activities VALUES (?, ?, ?)",
-        (iteration, locus_id, zlib.compress(dumps(activities))),
-    )
-    if lambdas:
-        if mm_data is None:
-            raise ValueError("mm_data is required to order a locus's lambdas")
-        # Dense over the locus's slots, in canonical order, so the E-step can
-        # drop it straight into its per-slot vector.
-        run_index = _run_index(db_path)
-        keys = sorted(
-            (
-                (run_index[run_id], gk)
-                for run_id, slots in mm_data.items()
-                for gk in slots
-            )
-        )
-        position = {key: i for i, key in enumerate(keys)}
-        lam_vector = np.zeros(len(keys), dtype=np.float64)
-        for run_id, gk, lam in lambdas:
-            lam_vector[position[(run_index[run_id], gk)]] = lam
+    with database.connect(db_path, wal_writer=True, commit=True) as db:
+        cur = db.cursor()
         cur.execute(
-            "INSERT OR REPLACE INTO group_lambdas VALUES (?, ?, ?)",
-            (iteration, locus_id, lam_vector.tobytes()),
+            "INSERT OR REPLACE INTO locus_activities VALUES (?, ?, ?)",
+            (iteration, locus_id, database.compress_blob(activities)),
         )
-    db.commit()
-    db.close()
+        if lambdas:
+            if mm_data is None:
+                raise ValueError("mm_data is required to order a locus's lambdas")
+            # Dense over the locus's slots, in canonical order, so the E-step can
+            # drop it straight into its per-slot vector.
+            run_index = _run_index(db_path)
+            keys = sorted(
+                (
+                    (run_index[run_id], gk)
+                    for run_id, slots in mm_data.items()
+                    for gk in slots
+                )
+            )
+            position = {key: i for i, key in enumerate(keys)}
+            lam_vector = np.zeros(len(keys), dtype=np.float64)
+            for run_id, gk, lam in lambdas:
+                lam_vector[position[(run_index[run_id], gk)]] = lam
+            cur.execute(
+                "INSERT OR REPLACE INTO group_lambdas VALUES (?, ?, ?)",
+                (iteration, locus_id, lam_vector.tobytes()),
+            )
 
 
 def save_locus_cache(db_path: str, locus_id: str, loc) -> None:
@@ -1272,34 +1105,28 @@ def save_locus_cache(db_path: str, locus_id: str, loc) -> None:
         A locus whose ``eg_cache`` has been built.
     """
     payload = {"id": loc.id, "iv": loc.iv, "cache": loc.eg_cache}
-    blob = zlib.compress(dumps(payload, protocol=5))
-    db = _prepare_writer(db_path)
-    db.execute(
-        "INSERT OR REPLACE INTO prepared_loci_cache VALUES (?, ?)",
-        (locus_id, blob),
-    )
-    db.commit()
-    db.close()
+    blob = database.compress_blob(payload, protocol=5)
+    with database.connect(db_path, wal_writer=True, commit=True) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO prepared_loci_cache VALUES (?, ?)",
+            (locus_id, blob),
+        )
 
 
 def load_locus_cache(db_path: str, locus_id: str):
     """Return the cached routing payload for *locus_id*, or ``None``."""
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    try:
+    with database.connect(db_path) as db:
+        cur = db.cursor()
         row = None
-        if _table_exists(cur, "prepared_loci_cache"):
+        if database.table_exists(cur, "prepared_loci_cache"):
             cur.execute(
                 "SELECT cache_blob FROM prepared_loci_cache WHERE locus_id = ?",
                 (locus_id,),
             )
             row = cur.fetchone()
-    finally:
-        db.close()
     if row is None:
         return None
-    return loads(zlib.decompress(row[0]))
+    return database.decompress_blob(row[0])
 
 
 def load_light_locus(db_path: str, locus_id: str):
@@ -1387,7 +1214,7 @@ def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
     loc.counted_reads = {}
     loc._eg_y = None
     try:
-        blob = zlib.compress(dumps(loc))
+        blob = database.compress_blob(loc)
     finally:
         loc.rsas_dict = saved_rsas
         loc.run_read_count = saved_rrc
@@ -1396,13 +1223,11 @@ def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
             eg.read_count = count
         for name, value in saved_transient.items():
             setattr(loc, name, value)
-    db = _prepare_writer(db_path)
-    db.execute(
-        "INSERT OR REPLACE INTO prepared_loci VALUES (?, ?)",
-        (locus_id, blob),
-    )
-    db.commit()
-    db.close()
+    with database.connect(db_path, wal_writer=True, commit=True) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO prepared_loci VALUES (?, ?)",
+            (locus_id, blob),
+        )
 
 
 def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
@@ -1426,22 +1251,18 @@ def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
     -------
     Locus or None
     """
-    db = sql.connect(db_path, timeout=120)
-    cur = db.cursor()
-    cur.execute("PRAGMA busy_timeout = 120000")
-    try:
+    with database.connect(db_path) as db:
+        cur = db.cursor()
         row = None
-        if _table_exists(cur, "prepared_loci"):
+        if database.table_exists(cur, "prepared_loci"):
             cur.execute(
                 "SELECT prep_blob FROM prepared_loci WHERE locus_id = ?",
                 (locus_id,),
             )
             row = cur.fetchone()
-    finally:
-        db.close()
     if row is None:
         return None
-    loc = loads(zlib.decompress(row[0]))
+    loc = database.decompress_blob(row[0])
     if with_cache:
         payload = load_locus_cache(db_path, locus_id)
         if payload is not None:
@@ -1452,6 +1273,30 @@ def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
 # --------------------------------------------------------------------------- #
 # Global E-step (run once between M-step fan-outs)                             #
 # --------------------------------------------------------------------------- #
+
+def _slot_vector(
+    cur: sql.Cursor, table: str, column: str, iteration: int, link: dict
+) -> np.ndarray:
+    """Gather one iteration's per-locus blobs into a dense per-slot vector.
+
+    *table* holds one bare ``float64`` buffer per locus in canonical slot
+    order; *link* (see :func:`_linkage`) says where each locus's slots sit.
+    Loci without a row stay zero.
+    """
+    vector = np.zeros(int(link["n_slots"]), dtype=np.float64)
+    locus_index = link["locus_index"]
+    locus_off = link["locus_off"]
+    cur.execute(
+        f"SELECT locus_id, {column} FROM {table} WHERE iteration = ?",
+        (iteration,),
+    )
+    for locus_id, blob in cur.fetchall():
+        i = locus_index[locus_id]
+        vector[locus_off[i]:locus_off[i + 1]] = np.frombuffer(
+            blob, dtype=np.float64
+        )
+    return vector
+
 
 def e_step(db_path: str, iteration: int) -> float:
     """Recompute fractional slot weights from the just-finished M-step.
@@ -1497,19 +1342,10 @@ def e_step(db_path: str, iteration: int) -> float:
     locus_index = link["locus_index"]
     n_groups = mmg_count.size
 
-    db = _prepare_writer(db_path)
-    cur = db.cursor()
-
-    lam_slot = np.zeros(n_slots, dtype=np.float64)
-    cur.execute(
-        "SELECT locus_id, lam_blob FROM group_lambdas WHERE iteration = ?",
-        (iteration,),
-    )
-    for locus_id, blob in cur.fetchall():
-        i = locus_index[locus_id]
-        lam_slot[locus_off[i]:locus_off[i + 1]] = np.frombuffer(
-            blob, dtype=np.float64
-        )
+    with database.connect(db_path) as db:
+        cur = db.cursor()
+        lam_slot = _slot_vector(cur, "group_lambdas", "lam_blob", iteration, link)
+        old_slot = _slot_vector(cur, "group_weights", "weight_blob", iteration, link)
 
     # Responsibility per membership row: λ / Σλ within its group, or a uniform
     # 1/n split when the group's λ sums to zero (its read fits no ORF anywhere,
@@ -1536,18 +1372,6 @@ def e_step(db_path: str, iteration: int) -> float:
     new_slot = np.bincount(member_slot, weights=weight_cell, minlength=n_slots)
     del lam_cell, weight_cell
 
-    # Previous weights, in the same slot order, for the convergence metric.
-    old_slot = np.zeros(n_slots, dtype=np.float64)
-    cur.execute(
-        "SELECT locus_id, weight_blob FROM group_weights WHERE iteration = ?",
-        (iteration,),
-    )
-    for locus_id, blob in cur.fetchall():
-        i = locus_index[locus_id]
-        old_slot[locus_off[i]:locus_off[i + 1]] = np.frombuffer(
-            blob, dtype=np.float64
-        )
-
     # Convergence = Σ|w_new − w_old| / Σ w_new — a total-variation measure
     # robust to the slot count.  From iteration 1 on the total mass is
     # conserved (each read's weight sums to one); iteration 0's large value
@@ -1562,7 +1386,6 @@ def e_step(db_path: str, iteration: int) -> float:
     # run, and enough to end the loop after one iteration.
     if not (np.isfinite(total_mass) and np.isfinite(moved)):
         n_bad = int((~np.isfinite(new_slot)).sum())
-        db.close()
         raise FloatingPointError(
             f"the E-step produced {n_bad} non-finite slot weight(s) of "
             f"{n_slots} at iteration {iteration}; refusing to derive a "
@@ -1578,13 +1401,13 @@ def e_step(db_path: str, iteration: int) -> float:
         (it_next, locus_id, new_slot[locus_off[i]:locus_off[i + 1]].tobytes())
         for locus_id, i in locus_index.items()
     ]
-    cur.execute("DELETE FROM group_weights WHERE iteration = ?", (it_next,))
-    cur.executemany(
-        "INSERT INTO group_weights VALUES (?, ?, ?)", weight_rows
-    )
-    cur.execute("DELETE FROM group_weights WHERE iteration <= ?", (iteration,))
-    cur.execute("DELETE FROM group_lambdas WHERE iteration <= ?", (iteration,))
-    cur.execute("DELETE FROM locus_activities WHERE iteration < ?", (iteration,))
-    db.commit()
-    db.close()
+    with database.connect(db_path, wal_writer=True, commit=True) as db:
+        cur = db.cursor()
+        cur.execute("DELETE FROM group_weights WHERE iteration = ?", (it_next,))
+        cur.executemany("INSERT INTO group_weights VALUES (?, ?, ?)", weight_rows)
+        cur.execute("DELETE FROM group_weights WHERE iteration <= ?", (iteration,))
+        cur.execute("DELETE FROM group_lambdas WHERE iteration <= ?", (iteration,))
+        cur.execute(
+            "DELETE FROM locus_activities WHERE iteration < ?", (iteration,)
+        )
     return rel

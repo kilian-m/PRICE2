@@ -15,11 +15,8 @@ from __future__ import annotations
 import bisect
 import logging
 import os
-import sqlite3 as sql
 import time
-import zlib
 from collections import defaultdict
-from pickle import loads
 
 import HTSeq
 import numpy as np
@@ -33,6 +30,7 @@ from scipy.sparse import csr_matrix
 from scipy.stats import chi2
 from scipy.special import gammaln
 
+from price2 import database
 from price2 import multimap
 from price2.config import Config
 from price2.coverage_model import CoveragePosition
@@ -938,16 +936,11 @@ class Locus:
             Note that ``transcript_read_counts`` -- used only for the
             transcript-support filter -- still includes them in that case.
         """
-        db = sql.connect(db_path, timeout=120)
-        cur = db.cursor()
-        cur.execute("PRAGMA busy_timeout = 120000")
-        reads_dfs = cur.execute(
-            """
-            SELECT * FROM reads 
-            WHERE locus_id = ?
-            """,
-            (self.id,),
-        )
+        with database.connect(db_path) as db:
+            rows = db.execute(
+                "SELECT run_id, reads_blob FROM reads WHERE locus_id = ?",
+                (self.id,),
+            ).fetchall()
         self.run_read_count = {}
         self.rsas_dict = {}
         chrom = self.iv.chrom
@@ -958,8 +951,8 @@ class Locus:
         # one immutable GenomicRegion across runs avoids rebuilding its intervals
         # and hash.  Scoped per locus, so it is freed when the locus is done.
         region_cache: dict[tuple, GenomicRegion] = {}
-        for _, run_id, blob in reads_dfs:
-            reads_df = loads(zlib.decompress(blob))
+        for run_id, blob in rows:
+            reads_df = database.decompress_blob(blob)
 
             # Vectorized: pull columns into numpy arrays and locate per-read
             # boundaries from is_first_iv, avoiding groupby / iterrows / per-row
