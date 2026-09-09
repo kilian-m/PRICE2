@@ -1,16 +1,18 @@
-"""Writing loci and their regions to the TSV, GTF and BED outputs.
+"""Rendering loci and their regions as TSV, GTF and BED, and writing them.
 
-Worker processes append to shared files, so every write takes the file's
-lock first.  The column layout of the TSV tables is defined here and reused
-by :mod:`price2.tpm` and :mod:`price2.run_state`.
+The worker that finishes a locus renders its rows with the functions here
+and hands them back to the parent as a mapping of file name to
+:class:`OutputText`; the parent, the only process that writes to the output
+directory, appends them with :class:`OutputWriter`.  The column layout of
+the TSV tables is defined here and reused by :mod:`price2.tpm` and
+:mod:`price2.run_state`.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
-
-from filelock import FileLock
 
 from price2.config import Config
 
@@ -31,8 +33,8 @@ ORF_TABLE_COLUMNS: tuple[str, ...] = (
 #: Metadata columns of ``regions.tsv`` (ORFs and NOISE regions together).
 REGION_TABLE_COLUMNS: tuple[str, ...] = ("region_id",) + ORF_TABLE_COLUMNS[1:]
 
-#: Sub-directories of ``regions_activities/`` written by ``export_all_steps``,
-#: one per filtering stage.
+#: Filtering stages whose intermediate tables ``export_all_steps`` writes,
+#: as ``<step>_orfs.tsv`` and friends next to the final tables.
 STEP_NAMES = ("all", "coverage_filtered", "deconvolution_filtered", "deconvoluted")
 
 _GTF_SOURCE = "PRICE2"
@@ -54,17 +56,53 @@ _BED_COLOURS: tuple[tuple[str, str], ...] = (
 _BED_COLOUR_DEFAULT = "100,100,100"
 
 
-def append_locked(path: str, text: str) -> None:
-    """Append *text* to *path* under the file's lock."""
-    with FileLock(path + ".lock"):
-        with open(path, "a") as fh:
-            fh.write(text)
+@dataclass(frozen=True)
+class OutputText:
+    """Rows to append to one output file.
+
+    Parameters
+    ----------
+    body : str
+        The rows, each terminated by a newline (may be empty).
+    header : str or None
+        Header line written once, when the file is created.
+    """
+
+    body: str
+    header: str | None = None
 
 
-def _output_path(prefix: str, name: str) -> str:
-    """``<prefix>/<name>`` for a directory prefix, ``<prefix>_<name>`` else."""
-    sep = "" if prefix.endswith("/") else "_"
-    return f"{prefix}{sep}{name}"
+class OutputWriter:
+    """Append rendered rows to the files of one output directory.
+
+    Meant for a single writer: the parent process of the fan-out.  A file
+    is created on first use, with its header when the rows carry one.
+
+    Parameters
+    ----------
+    directory : str
+        The directory the file names in :meth:`write` are relative to.
+    """
+
+    def __init__(self, directory: str) -> None:
+        self.directory = directory
+
+    def write(self, outputs: dict[str, OutputText]) -> None:
+        """Append every entry of *outputs* to its file."""
+        for name, text in outputs.items():
+            path = os.path.join(self.directory, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if text.header is not None and not os.path.exists(path):
+                with open(path, "w") as fh:
+                    fh.write(text.header + "\n")
+            with open(path, "a") as fh:
+                fh.write(text.body)
+
+
+def append_line(path: str, line: str) -> None:
+    """Append one line to *path*, creating it if needed."""
+    with open(path, "a") as fh:
+        fh.write(line + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -145,113 +183,85 @@ def locus_gtf_line(loc: Locus) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def write_gtf(
+def gtf_outputs(
     loc: Locus,
-    prefix: str,
     *,
     write_loci: bool = False,
     write_transcripts: bool = False,
     write_orfs: bool = True,
-) -> None:
-    """Append the locus's features to ``<prefix>{_,/}{loci,transcripts,orfs}.gtf``.
-
-    Parameters
-    ----------
-    loc : Locus
-        The locus to write.
-    prefix : str
-        Output prefix; a trailing slash makes it a directory.
-    write_loci : bool
-        Write the locus interval.
-    write_transcripts : bool
-        Write the NOISE (transcript-level) regions.
-    write_orfs : bool
-        Write the ORF regions.
-    """
+) -> dict[str, OutputText]:
+    """The locus's GTF rows, keyed ``loci.gtf`` / ``transcripts.gtf`` / ``orfs.gtf``."""
+    outputs = {}
     if write_loci:
-        append_locked(_output_path(prefix, "loci.gtf"), locus_gtf_line(loc))
+        outputs["loci.gtf"] = OutputText(locus_gtf_line(loc))
     if write_transcripts:
-        append_locked(
-            _output_path(prefix, "transcripts.gtf"),
-            "".join(rgr_gtf(r, loc.id) for r in loc.rgr_set if r.type == "NOISE"),
+        outputs["transcripts.gtf"] = OutputText(
+            "".join(rgr_gtf(r, loc.id) for r in loc.rgr_set if r.type == "NOISE")
         )
     if write_orfs:
-        append_locked(
-            _output_path(prefix, "orfs.gtf"),
-            "".join(rgr_gtf(r, loc.id) for r in loc.rgr_set if r.type == "ORF"),
+        outputs["orfs.gtf"] = OutputText(
+            "".join(rgr_gtf(r, loc.id) for r in loc.rgr_set if r.type == "ORF")
         )
+    return outputs
 
 
-def write_tsv(
+def tsv_output(
     loc: Locus,
-    prefix: str,
     runs: list[RiboSeqRun] | None = None,
     include_noise: bool = False,
-) -> None:
-    """Append the locus's regions to ``<prefix>{_,/}{orfs,regions}.tsv``.
+) -> tuple[str, OutputText]:
+    """The locus's rows of ``orfs.tsv`` (or ``regions.tsv`` with the NOISE regions).
 
-    With *runs* the table carries a header (written once) and one activity
-    column per run, read from ``loc.result_df``; without, only the metadata
-    columns of :func:`rgr_tsv_line` are written.
+    With *runs* the rows carry one activity column per run, read from
+    ``loc.result_df``, and the table gets a header; without, only the
+    metadata columns of :func:`rgr_tsv_line` are written.
 
-    Parameters
-    ----------
-    loc : Locus
-        The locus to write.
-    prefix : str
-        Output prefix; a trailing slash makes it a directory.
-    runs : list[RiboSeqRun], optional
-        Ribo-seq runs whose ids become the activity columns.
-    include_noise : bool
-        Write the NOISE regions alongside the ORFs (``regions.tsv``).
+    Returns
+    -------
+    tuple[str, OutputText]
+        The file name and its rows.
     """
+    name = "regions.tsv" if include_noise else "orfs.tsv"
     columns = REGION_TABLE_COLUMNS if include_noise else ORF_TABLE_COLUMNS
-    path = _output_path(prefix, "regions.tsv" if include_noise else "orfs.tsv")
-    result_df = loc.result_df
-    with_activities = runs is not None and result_df is not None
-    with FileLock(path + ".lock"):
-        if runs is not None and not os.path.exists(path):
-            header = "\t".join(columns + tuple(run.id for run in runs))
-            with open(path, "w") as fh:
-                fh.write(header + "\n")
-        lines = []
-        for rgr in loc.rgr_set:
-            if not include_noise and rgr.type != "ORF":
-                continue
-            if with_activities:
-                activities = "\t".join(f"{v:.2e}" for v in result_df.loc[rgr.id])
-                orf_type = rgr.orf_type if rgr.orf_type is not None else ""
-                lines.append(
-                    f"{rgr.id}\t{rgr.transcript.gene_id}\t{rgr.transcript.id}"
-                    f"\t{loc.id}\t{rgr.full_genomic_region}\t{orf_type}"
-                    f"\t{activities}\n"
-                )
-            else:
-                lines.append(rgr_tsv_line(rgr, loc.id))
-        with open(path, "a") as fh:
-            fh.write("".join(lines))
+    header = None
+    if runs is not None:
+        header = "\t".join(columns + tuple(run.id for run in runs))
+    with_activities = runs is not None and loc.result_df is not None
+    lines = []
+    for rgr in loc.rgr_set:
+        if not include_noise and rgr.type != "ORF":
+            continue
+        if with_activities:
+            activities = "\t".join(f"{v:.2e}" for v in loc.result_df.loc[rgr.id])
+            orf_type = rgr.orf_type if rgr.orf_type is not None else ""
+            lines.append(
+                f"{rgr.id}\t{rgr.transcript.gene_id}\t{rgr.transcript.id}"
+                f"\t{loc.id}\t{rgr.full_genomic_region}\t{orf_type}"
+                f"\t{activities}\n"
+            )
+        else:
+            lines.append(rgr_tsv_line(rgr, loc.id))
+    return name, OutputText("".join(lines), header)
 
 
-def write_bed(loc: Locus, prefix: str, include_noise: bool = False) -> None:
-    """Append the locus's regions to ``<prefix>{_,/}{orfs,regions}.bed``."""
-    path = _output_path(prefix, "regions.bed" if include_noise else "orfs.bed")
-    append_locked(
-        path,
-        "".join(
-            rgr_bed_line(rgr)
-            for rgr in loc.rgr_set
-            if include_noise or rgr.type == "ORF"
-        ),
+def bed_output(loc: Locus, include_noise: bool = False) -> tuple[str, OutputText]:
+    """The locus's rows of ``orfs.bed`` (or ``regions.bed`` with the NOISE regions)."""
+    name = "regions.bed" if include_noise else "orfs.bed"
+    body = "".join(
+        rgr_bed_line(rgr)
+        for rgr in loc.rgr_set
+        if include_noise or rgr.type == "ORF"
     )
+    return name, OutputText(body)
 
 
 # --------------------------------------------------------------------------- #
-# What the worker exports
+# What the worker hands back
 # --------------------------------------------------------------------------- #
 
 
-def write_step_outputs(loc: Locus, config: Config, step_dir: str) -> None:
-    """Write the intermediate tables of one filtering stage (``export_all_steps``).
+def step_outputs(loc: Locus, config: Config, step: str) -> dict[str, OutputText]:
+    """The intermediate tables of one filtering stage (``export_all_steps``).
 
     Parameters
     ----------
@@ -259,27 +269,32 @@ def write_step_outputs(loc: Locus, config: Config, step_dir: str) -> None:
         The locus after that stage.
     config : Config
         The ``export_*`` selection.
-    step_dir : str
-        ``<regions_activities>/<step>`` prefix.
+    step : str
+        One of :data:`STEP_NAMES`; the files are named ``<step>_<name>``.
     """
+    outputs: dict[str, OutputText] = {}
     if config.export_gtf:
-        write_gtf(
-            loc,
-            step_dir,
-            write_orfs=config.export_orfs,
-            write_loci=config.export_loci,
-            write_transcripts=config.export_transcripts,
+        outputs.update(
+            gtf_outputs(
+                loc,
+                write_orfs=config.export_orfs,
+                write_loci=config.export_loci,
+                write_transcripts=config.export_transcripts,
+            )
         )
     if config.export_tsv and config.export_orfs:
-        write_tsv(loc, step_dir)
+        name, text = tsv_output(loc)
+        outputs[name] = text
     if config.export_bed and config.export_orfs:
-        write_bed(loc, step_dir)
+        name, text = bed_output(loc)
+        outputs[name] = text
+    return {f"{step}_{name}": text for name, text in outputs.items()}
 
 
-def write_final_outputs(
-    loc: Locus, config: Config, output_dir: str, runs: list[RiboSeqRun]
-) -> None:
-    """Write the locus's final result tables into *output_dir*.
+def final_outputs(
+    loc: Locus, config: Config, runs: list[RiboSeqRun]
+) -> dict[str, OutputText]:
+    """The locus's rows of the final result tables.
 
     Parameters
     ----------
@@ -287,28 +302,32 @@ def write_final_outputs(
         The locus after the final activity estimate.
     config : Config
         The ``export_*`` selection.
-    output_dir : str
-        The ``regions_activities`` directory.
     runs : list[RiboSeqRun]
         The runs, in activity-column order.
     """
-    prefix = output_dir.rstrip("/") + "/"
+    outputs: dict[str, OutputText] = {}
     with_regions = config.export_regions and not loc.result_df.empty
     if config.export_tsv:
         if config.export_orfs:
-            write_tsv(loc, prefix, runs=runs)
+            name, text = tsv_output(loc, runs=runs)
+            outputs[name] = text
         if with_regions:
-            write_tsv(loc, prefix, runs=runs, include_noise=True)
+            name, text = tsv_output(loc, runs=runs, include_noise=True)
+            outputs[name] = text
     if config.export_gtf:
-        write_gtf(
-            loc,
-            prefix,
-            write_orfs=config.export_orfs,
-            write_loci=config.export_loci,
-            write_transcripts=config.export_transcripts,
+        outputs.update(
+            gtf_outputs(
+                loc,
+                write_orfs=config.export_orfs,
+                write_loci=config.export_loci,
+                write_transcripts=config.export_transcripts,
+            )
         )
     if config.export_bed:
         if config.export_orfs:
-            write_bed(loc, prefix)
+            name, text = bed_output(loc)
+            outputs[name] = text
         if with_regions:
-            write_bed(loc, prefix, include_noise=True)
+            name, text = bed_output(loc, include_noise=True)
+            outputs[name] = text
+    return outputs

@@ -14,7 +14,6 @@ that worker shares.
 
 from __future__ import annotations
 
-import glob
 import logging
 import logging.handlers
 import multiprocessing as mp
@@ -26,7 +25,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 import pandas as pd
-from filelock import FileLock
 from pebble import ProcessPool
 from pebble.common import CONSTS as _pebble_consts
 from pyfaidx import Fasta
@@ -34,6 +32,7 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from price2 import database, export, multimap
+from price2.export import OutputText
 from price2.config import Config
 from price2.equivalence_groups import make_equivalence_groups
 from price2.layout import RunLayout
@@ -135,6 +134,26 @@ class LocusJob:
     @property
     def em_light(self) -> bool:
         return self.em_mode and not self.em_final
+
+
+@dataclass
+class LocusResult:
+    """What a full pass hands back to the parent for one locus.
+
+    Parameters
+    ----------
+    locus_id : str
+        The locus.
+    outputs : dict[str, OutputText]
+        Rows to append to the files of ``regions_activities/``.
+    perf : dict or None
+        The locus's row of ``performance_measurements.tsv``; ``None`` for a
+        locus that was skipped before any work was measured.
+    """
+
+    locus_id: str
+    outputs: dict[str, OutputText]
+    perf: dict | None = None
 
 
 class PerfLog(dict):
@@ -301,9 +320,10 @@ class ORFActivityEstimator:
 
         Dispatches each locus to a worker process.  On a full pass the loci
         listed in ``<w_dir>/processed_loci.txt`` are skipped, so that an
-        interrupted run resumes where it stopped.  Results are written
-        incrementally to ``<o_dir>/regions_activities/``; failed loci are
-        recorded in ``failed_loci.txt`` there.
+        interrupted run resumes where it stopped.  The workers hand their
+        rows back and this process, the only writer, appends them to
+        ``<o_dir>/regions_activities/`` and records the locus as done;
+        failed loci are recorded in ``failed_loci.txt`` there.
 
         Uses the pool held open by :meth:`worker_pool` when the caller has
         one, otherwise starts a broker and a pool for this call alone.
@@ -345,6 +365,7 @@ class ORFActivityEstimator:
         price2_logger = logging.getLogger("price2")
         log_level = logging.getLevelName(self.config.log_level)
         pbar = tqdm(total=len(loci_ids), disable=log_level > logging.INFO)
+        writer = export.OutputWriter(layout.regions_activities_dir)
         futures = {
             self._pool.schedule(
                 process_loc,
@@ -357,21 +378,30 @@ class ORFActivityEstimator:
             for future in as_completed(futures):
                 locus_id = futures[future]
                 try:
-                    future.result()
+                    result = future.result()
                 except (TimeoutError, Exception) as exc:
                     logger.error("locus %s failed: %s", locus_id, exc)
-                    export.append_locked(
-                        layout.failed_loci_path,
-                        f"{locus_id}\n{exc}\n{traceback.format_exc()}\n\n",
-                    )
+                    with open(layout.failed_loci_path, "a") as fh:
+                        fh.write(f"{locus_id}\n{exc}\n{traceback.format_exc()}\n\n")
+                else:
+                    if result is not None:
+                        self._record(result, writer)
                 finally:
                     pbar.update(1)
         pbar.close()
 
-        for lock_file in glob.glob(
-            os.path.join(layout.regions_activities_dir, "*.lock")
-        ):
-            os.remove(lock_file)
+    def _record(self, result: LocusResult, writer: export.OutputWriter) -> None:
+        """Write a finished locus's rows, then mark it done.
+
+        The order matters for resuming: a locus is only listed in
+        ``processed_loci.txt`` once its rows are on disk, and
+        :func:`price2.run_state.repair_outputs` drops rows of unlisted loci.
+        """
+        layout = self.config.layout
+        writer.write(result.outputs)
+        if result.perf is not None and self.config.export_performance_measurements:
+            _append_performance(layout.performance_path, result.perf)
+        export.append_line(layout.processed_loci_path, result.locus_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -379,13 +409,14 @@ class ORFActivityEstimator:
 # --------------------------------------------------------------------------- #
 
 
-def process_loc(job: LocusJob) -> None:
-    """Process one locus: filter ORFs, deconvolve, write the outputs.
+def process_loc(job: LocusJob) -> LocusResult | None:
+    """Process one locus: filter ORFs, deconvolve, render the outputs.
 
     Runs in a worker process prepared by :func:`init_worker`.  A light EM
-    pass stops after writing its activities and λ for the E-step; a full
-    pass continues through the likelihood-ratio filter, the final activity
-    estimate, the exports and the resume bookkeeping.
+    pass writes its activities and λ for the E-step to the database and
+    returns ``None``; a full pass continues through the likelihood-ratio
+    filter and the final activity estimate and returns the rows for the
+    parent to write.
 
     Parameters
     ----------
@@ -395,15 +426,15 @@ def process_loc(job: LocusJob) -> None:
     ctx = _context()
     config, layout = ctx.config, ctx.layout
     perf = PerfLog(loc_id=job.locus_id)
+    outputs: dict[str, OutputText] = {}
     t_start = time.time()
 
     with perf.timed("db_time"):
         runs = _load_runs(layout.db_path)
         loc, prepared = _load_locus(job, ctx, perf)
-    if not prepared and not _prepare_locus(job, ctx, loc, runs, perf):
-        if not job.em_light:
-            _mark_processed(layout, job.locus_id)
-        return None
+    if not prepared and not _prepare_locus(job, ctx, loc, runs, perf, outputs):
+        # No transcript survived: nothing to solve, nothing to write.
+        return None if job.em_light else LocusResult(job.locus_id, {})
     # The prepared state is persisted after ``assign_reads_to_egs`` below, so
     # that the routing cache it builds is stored with it.
     save_prepared = job.em_light and job.em_iteration == 0
@@ -419,13 +450,10 @@ def process_loc(job: LocusJob) -> None:
         _light_mstep(job, loc, runs, mm_data, save_prepared, config, layout, perf)
         return None
 
-    _full_pass(loc, runs, config, layout, perf)
+    _full_pass(loc, runs, config, perf, outputs)
     perf["overall_time"] = time.time() - t_start
-    export.write_final_outputs(loc, config, layout.regions_activities_dir, runs)
-    if config.export_performance_measurements:
-        _append_performance(layout, perf)
-    _mark_processed(layout, job.locus_id)
-    return None
+    outputs.update(export.final_outputs(loc, config, runs))
+    return LocusResult(job.locus_id, outputs, dict(perf))
 
 
 def _load_runs(db_path: str) -> list[RiboSeqRun]:
@@ -507,17 +535,16 @@ def _prepare_locus(
     loc: Locus,
     runs: list[RiboSeqRun],
     perf: PerfLog,
+    outputs: dict[str, OutputText],
 ) -> bool:
     """Generate the ORF candidates, filter them and build the equivalence groups.
 
-    Returns ``False`` when the locus keeps no transcript and is to be skipped.
+    Adds the intermediate tables of each stage to *outputs* when
+    ``export_all_steps`` is set.  Returns ``False`` when the locus keeps no
+    transcript and is to be skipped.
     """
-    config, layout = ctx.config, ctx.layout
-    db_path = layout.db_path
+    config, db_path = ctx.config, ctx.layout.db_path
     export_steps = config.export_all_steps and not job.em_light
-
-    def step_dir(step: str) -> str:
-        return os.path.join(layout.regions_activities_dir, step)
 
     with perf.timed("build_rgrs_time"):
         min_explained_reads = config.min_explained_reads_per_run * len(runs)
@@ -527,7 +554,7 @@ def _prepare_locus(
     if not has_transcripts:
         return False
     if export_steps:
-        export.write_step_outputs(loc, config, step_dir("all"))
+        outputs.update(export.step_outputs(loc, config, "all"))
 
     with perf.timed("load_reads_time"):
         loc.get_reads_from_db(db_path, drop_multimappers=not config.multimap_em)
@@ -541,7 +568,7 @@ def _prepare_locus(
         if config.coverage_filter:
             loc.coverage_filter_rgrs(config)
         if export_steps:
-            export.write_step_outputs(loc, config, step_dir("coverage_filtered"))
+            outputs.update(export.step_outputs(loc, config, "coverage_filtered"))
         perf["filtered_coverage_rgr_count"] = len(loc.rgr_set)
 
     with perf.timed("filter_2_time"):
@@ -549,7 +576,7 @@ def _prepare_locus(
             loc.deconvolution_filter_rgrs(config)
         perf["filtered_deconvolution_rgr_count"] = len(loc.rgr_set)
     if export_steps:
-        export.write_step_outputs(loc, config, step_dir("deconvolution_filtered"))
+        outputs.update(export.step_outputs(loc, config, "deconvolution_filtered"))
 
     for tr in loc.transcripts:
         tr.update_with_filtered_orfs(loc.rgr_set)
@@ -619,8 +646,8 @@ def _full_pass(
     loc: Locus,
     runs: list[RiboSeqRun],
     config: Config,
-    layout: RunLayout,
     perf: PerfLog,
+    outputs: dict[str, OutputText],
 ) -> None:
     """Group-LASSO deconvolution, likelihood-ratio filter and final estimate."""
     with perf.timed("optimization_time"):
@@ -628,9 +655,7 @@ def _full_pass(
     perf["irls_outer_iterations"] = loc.irls_outer_iterations
     perf["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
     if config.export_all_steps:
-        export.write_step_outputs(
-            loc, config, os.path.join(layout.regions_activities_dir, "deconvoluted")
-        )
+        outputs.update(export.step_outputs(loc, config, "deconvoluted"))
 
     if config.likelihood_ratio_filter:
         with perf.timed("likelihood_ratio_time"):
@@ -646,20 +671,11 @@ def _full_pass(
     perf["exon_length"] = loc.exon_length
 
 
-def _append_performance(layout: RunLayout, perf: PerfLog) -> None:
-    path = layout.performance_path
-    with FileLock(path + ".lock"):
-        header = not os.path.exists(path)
-        with open(path, "a") as fh:
-            fh.write(
-                pd.DataFrame([dict(perf)]).to_csv(
-                    header=header,
-                    index=False,
-                    float_format="{:.2e}".format,
-                    sep="\t",
-                )
+def _append_performance(path: str, perf: dict) -> None:
+    header = not os.path.exists(path)
+    with open(path, "a") as fh:
+        fh.write(
+            pd.DataFrame([perf]).to_csv(
+                header=header, index=False, float_format="{:.2e}".format, sep="\t"
             )
-
-
-def _mark_processed(layout: RunLayout, locus_id: str) -> None:
-    export.append_locked(layout.processed_loci_path, locus_id + "\n")
+        )

@@ -18,7 +18,6 @@ dependencies:
   - samtools             # called via subprocess for BAM downsampling
   # Parallelism & system
   - pebble
-  - filelock
   - psutil
   - tqdm
   # Plotting

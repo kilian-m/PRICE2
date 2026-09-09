@@ -14,7 +14,7 @@ import logging
 import os
 import shutil
 import sys
-import time
+from dataclasses import dataclass
 
 from pyfaidx import Fasta
 
@@ -25,6 +25,7 @@ from price2.config import Config
 from price2.data_collector import DataCollector
 from price2.ribo_seq_run import save_dataset_models
 from price2.orf_activity_estimator import ORFActivityEstimator
+from price2.pipeline import Stage, run_stage, run_stages
 from price2.reference_annotation import ReferenceAnnotation
 from price2.tpm import generate_tpm_output
 
@@ -61,31 +62,6 @@ def setup_logging(config: Config) -> None:
     )
     handler.setFormatter(formatter)
     price2_logger.addHandler(handler)
-
-
-def _timed(label: str, fn, *args, **kwargs):
-    """Run *fn* with *args*/*kwargs*, logging *label* and elapsed time.
-
-    Parameters
-    ----------
-    label : str
-        Message logged before the call.
-    fn : callable
-        Function to call.
-    *args, **kwargs
-        Forwarded to *fn*.
-
-    Returns
-    -------
-    object
-        Whatever *fn* returns.
-    """
-    start = time.time()
-    result = fn(*args, **kwargs)
-    elapsed = time.time() - start
-    if label:
-        logger.info("%s%.2e seconds", label, elapsed)
-    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -263,89 +239,127 @@ def run_pipeline(config: Config) -> None:
     logger.info("%s (%s)", plan.reason, config.w_dir)
 
     if not plan.skip_collection:
-        ref_annotation = _timed(
-            "load reference annotation... ",
-            ReferenceAnnotation,
-            config.gtf_path,
-        )
-
-        genome = _timed(
-            "load genome... ",
-            load_genome,
-            config.fasta_path,
-        )
-
-        # --- Data collection ---
-        data_collector = DataCollector(ref_annotation, genome, config)
-
-        _timed(
-            "compute cleavage and coverage models... ",
-            data_collector.collect_runs,
-        )
-
-        if config.export_dataset_models:
-            _timed(
-                "save dataset model summaries... ",
-                save_dataset_models,
-                data_collector.runs,
-                config.o_dir,
-            )
-
-        _timed(
-            "collect mappings... ",
-            data_collector.collect_mappings,
-        )
-
-        _timed(
-            "generate ORFs and save loci... ",
-            data_collector.collect_loci,
-        )
-
-        # Unlike the stages above, this one is not repeatable: it consumes
-        # the spilled alignments and deletes them, so re-running it after a
-        # successful build would replace a valid index with an empty one.
-        # A populated index with no spill left beside it is therefore taken
-        # as already built; a spill that is still there means alignments
-        # have been collected since, and the index is rebuilt to include
-        # them (that also covers a build interrupted before its cleanup).
-        if config.multimap_em and (
-            not multimap.has_multimap_index(db_path)
-            or os.path.isdir(multimap.spill_dir(db_path))
-        ):
-            _timed(
-                "build multimapping linkage index... ",
-                multimap.build_multimap_index,
-                db_path,
-                processes=config.processes,
-            )
-
+        run_stages(_collection_stages(config))
         run_state.write_state(db_path, collection_complete="1")
 
-    # --- ORF deconvolution ---
-    orf_activity_estimator = ORFActivityEstimator(config)
-
-    n_loci = len(orf_activity_estimator.loci_ids)
-    n_proc = config.processes
+    estimator = ORFActivityEstimator(config)
     logger.info(
         "run ORF deconvolution for %d loci in %d process(es)...",
-        n_loci,
-        n_proc,
+        len(estimator.loci_ids),
+        config.processes,
     )
-
     if config.multimap_em:
-        _run_em_deconvolution(
-            config, orf_activity_estimator, resume=plan.reuse_deconvolution
-        )
+        _run_em_deconvolution(config, estimator, resume=plan.reuse_deconvolution)
     else:
-        _timed("", orf_activity_estimator.run_orf_deconvolution)
+        run_stage("ORF deconvolution", estimator.run_orf_deconvolution)
 
-    # --- TPM output ---
-    _timed(
-        "generate TPM output... ",
-        generate_tpm_output,
-        config.o_dir,
-        export_tsv=config.export_tsv,
+    run_stage(
+        "generate TPM output",
+        lambda: generate_tpm_output(config.o_dir, export_tsv=config.export_tsv),
     )
+
+
+class _Collection:
+    """The data-collection stages and the objects they share."""
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.collector: DataCollector | None = None
+
+    def load_inputs(self) -> None:
+        reference = run_stage(
+            "load reference annotation",
+            lambda: ReferenceAnnotation(self.config.gtf_path),
+        )
+        genome = run_stage("load genome", lambda: load_genome(self.config.fasta_path))
+        self.collector = DataCollector(reference, genome, self.config)
+
+    def collect_runs(self) -> None:
+        self.collector.collect_runs()
+
+    def save_models(self) -> None:
+        save_dataset_models(self.collector.runs, self.config.o_dir)
+
+    def collect_mappings(self) -> None:
+        self.collector.collect_mappings()
+
+    def collect_loci(self) -> None:
+        self.collector.collect_loci()
+
+    def build_multimap_index(self) -> None:
+        multimap.build_multimap_index(
+            self.config.layout.db_path, processes=self.config.processes
+        )
+
+    def multimap_index_built(self) -> bool:
+        # Unlike the other stages this one is not repeatable: it consumes the
+        # spilled alignments and deletes them, so re-running it after a
+        # successful build would replace a valid index with an empty one.  A
+        # populated index with no spill left beside it is therefore taken as
+        # built; a spill that is still there means alignments have been
+        # collected since (or a build was interrupted before its cleanup), and
+        # the index is rebuilt to include them.
+        db_path = self.config.layout.db_path
+        return multimap.has_multimap_index(db_path) and not os.path.isdir(
+            multimap.spill_dir(db_path)
+        )
+
+
+def _collection_stages(config: Config) -> list[Stage]:
+    """The stages that fill ``price.db``, in order."""
+    collection = _Collection(config)
+    return [
+        Stage("load inputs", collection.load_inputs),
+        Stage("compute cleavage and coverage models", collection.collect_runs),
+        Stage(
+            "save dataset model summaries",
+            collection.save_models,
+            enabled=config.export_dataset_models,
+        ),
+        Stage("collect mappings", collection.collect_mappings),
+        Stage("generate ORFs and save loci", collection.collect_loci),
+        Stage(
+            "build multimapping linkage index",
+            collection.build_multimap_index,
+            enabled=config.multimap_em,
+            done=collection.multimap_index_built,
+        ),
+    ]
+
+
+@dataclass(frozen=True)
+class EmCheckpoint:
+    """Where an interrupted multimapping EM continues.
+
+    Parameters
+    ----------
+    start_iteration : int
+        The iteration to run next.
+    finished : set[str]
+        Loci whose light M-step of that iteration already completed.
+    final_only : bool
+        The loop had already converged; only the final full pass is left.
+    """
+
+    start_iteration: int
+    finished: set[str]
+    final_only: bool
+
+
+def _em_checkpoint(db_path: str, resume: bool) -> EmCheckpoint:
+    """Read the EM checkpoint, or reset the EM state for a fresh loop."""
+    point = multimap.em_resume_point(db_path) if resume else None
+    if point is None:
+        # Clear any per-iteration state from a previous run so a warm re-run
+        # cannot consume stale λ / weights / activities.
+        multimap.reset_em_state(db_path)
+        run_state.write_state(db_path, em_final_iteration="")
+        return EmCheckpoint(0, set(), False)
+    start_iteration, finished = point
+    # The loop has already ended if its last run recorded the iteration the
+    # final pass consumes and the checkpoint still sits there.
+    stored_final = run_state.read_state(db_path).get("em_final_iteration")
+    return EmCheckpoint(start_iteration, finished, stored_final == str(start_iteration))
 
 
 def _run_em_deconvolution(
@@ -387,99 +401,89 @@ def _run_em_deconvolution(
             "Running a single classic pass instead.",
             db_path,
         )
-        _timed("", estimator.run_orf_deconvolution)
+        run_stage("ORF deconvolution", estimator.run_orf_deconvolution)
         return
 
     database.enable_wal(db_path)
-
-    checkpoint = multimap.em_resume_point(db_path) if resume else None
-    if checkpoint is None:
-        # Clear any per-iteration state from a previous run so a warm re-run
-        # cannot consume stale λ / weights / activities.
-        multimap.reset_em_state(db_path)
-        run_state.write_state(db_path, em_final_iteration="")
-        start_iteration, finished = 0, set()
-    else:
-        start_iteration, finished = checkpoint
-
-    # Loci with no multimap slots do not change across EM iterations, so
-    # the light passes only need to touch the loci that carry slots.
+    checkpoint = _em_checkpoint(db_path, resume)
+    # Loci with no multimap slots do not change across EM iterations, so the
+    # light passes only need to touch the loci that carry slots.
     slot_loci = multimap.slot_locus_ids(db_path)
-
-    # The loop has already ended if its last run recorded the iteration the
-    # final pass consumes and the checkpoint still sits there; go straight to
-    # the final pass rather than paying another M-step and E-step for nothing.
-    final_iteration = start_iteration
-    stored_final = run_state.read_state(db_path).get("em_final_iteration")
-    skip_loop = checkpoint is not None and stored_final == str(start_iteration)
-    if skip_loop:
+    if checkpoint.final_only:
         logger.info(
             "EM already converged; resuming at the final full M-step "
             "(iteration %d).",
-            start_iteration,
+            checkpoint.start_iteration,
         )
-    elif checkpoint is not None:
+    elif resume and (checkpoint.start_iteration or checkpoint.finished):
         logger.info(
             "resuming the multimapping EM at iteration %d (%d of %d slot "
             "loci already done).",
-            start_iteration,
-            len(finished & slot_loci),
+            checkpoint.start_iteration,
+            len(checkpoint.finished & slot_loci),
             len(slot_loci),
         )
 
-    last_it = start_iteration
-    # One broker pool for the whole EM: every M-step would otherwise rebuild it,
-    # paying a CUDA context per broker process per iteration.  Likewise hold one
-    # worker pool + log listener open across every M-step (and the final pass)
-    # instead of spawning and joining a fresh 40-worker pool + manager each time.
+    # One broker pool and one worker pool for the whole EM: every M-step
+    # would otherwise rebuild them, paying a CUDA context per broker process
+    # and a fresh pool + manager per iteration.
     with estimator.gpu_broker_pool(), estimator.worker_pool():
-        if not skip_loop:
-            for it in range(start_iteration, config.em_max_iter):
-                last_it = it
-                # Only the resumed iteration has loci already behind it; every
-                # later one starts empty.
-                subset = slot_loci - finished
-                finished = set()
-                if subset:
-                    _timed(
-                        f"EM iteration {it} light M-step... ",
-                        estimator.run_orf_deconvolution,
-                        em_iteration=it,
-                        em_final=False,
-                        loci_subset=subset,
-                    )
-                else:
-                    logger.info(
-                        "EM iteration %d light M-step was already complete.",
-                        it,
-                    )
-                delta = multimap.e_step(db_path, iteration=it)
-                logger.info(
-                    "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
-                    it,
-                    delta,
-                )
-                if delta < config.em_tol:
-                    logger.info(
-                        "EM converged after %d iteration(s) (tol=%.1e).",
-                        it + 1,
-                        config.em_tol,
-                    )
-                    break
-
-            final_iteration = last_it + 1
-            # From here a resume can skip straight to the final pass.
-            run_state.write_state(
-                db_path, em_final_iteration=str(final_iteration)
+        final_iteration = checkpoint.start_iteration
+        if not checkpoint.final_only:
+            final_iteration = _em_loop(
+                config, estimator, db_path, checkpoint, slot_loci
             )
-
-        # Final full M-step with the converged fractional weights.
-        _timed(
-            "EM final full M-step... ",
-            estimator.run_orf_deconvolution,
-            em_iteration=final_iteration,
-            em_final=True,
+            # From here a resume can skip straight to the final pass.
+            run_state.write_state(db_path, em_final_iteration=str(final_iteration))
+        run_stage(
+            "EM final full M-step",
+            lambda: estimator.run_orf_deconvolution(
+                em_iteration=final_iteration, em_final=True
+            ),
         )
+
+
+def _em_loop(
+    config: Config,
+    estimator: ORFActivityEstimator,
+    db_path: str,
+    checkpoint: EmCheckpoint,
+    slot_loci: set[str],
+) -> int:
+    """Alternate light M-steps and E-steps; return the final pass's iteration."""
+    finished = checkpoint.finished
+    last_iteration = checkpoint.start_iteration
+    for iteration in range(checkpoint.start_iteration, config.em_max_iter):
+        last_iteration = iteration
+        # Only the resumed iteration has loci already behind it; every later
+        # one starts empty.
+        subset = slot_loci - finished
+        finished = set()
+        if subset:
+            run_stage(
+                f"EM iteration {iteration} light M-step",
+                lambda: estimator.run_orf_deconvolution(
+                    em_iteration=iteration, em_final=False, loci_subset=subset
+                ),
+            )
+        else:
+            logger.info(
+                "EM iteration %d light M-step was already complete.", iteration
+            )
+        delta = multimap.e_step(db_path, iteration=iteration)
+        logger.info(
+            "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
+            iteration,
+            delta,
+        )
+        if delta < config.em_tol:
+            logger.info(
+                "EM converged after %d iteration(s) (tol=%.1e).",
+                iteration + 1,
+                config.em_tol,
+            )
+            break
+    return last_iteration + 1
 
 
 def main(argv: list[str] | None = None) -> None:

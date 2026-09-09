@@ -33,7 +33,6 @@ requirements:
     - pysam
     - pyfaidx
     - pebble
-    - filelock
     - psutil
     - tqdm
     - matplotlib-base
