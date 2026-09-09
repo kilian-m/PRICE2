@@ -1287,7 +1287,7 @@ class Locus:
                 X_filter,
                 eg_read_counts,
                 initial_guess,
-                solver.SolveSpec(theta=theta),
+                solver.SolveSpec(theta=theta, lbfgs_scipy_defaults=True),
                 config,
             )
 

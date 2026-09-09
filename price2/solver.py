@@ -56,6 +56,11 @@ class SolveSpec:
     strict : bool
         Raise when L-BFGS-B reports failure to converge.  The
         multiplicative-update solver always returns its last iterate.
+    lbfgs_scipy_defaults : bool
+        Run L-BFGS-B with scipy's own tolerances and without the
+        relative-change :class:`Callback`, as the deconvolution filter
+        always has.  The other sites use ``config.ftol``/``gtol``/``maxls``
+        and the callback.  Ignored by the multiplicative-update solver.
     """
 
     theta: float | None = None
@@ -64,6 +69,7 @@ class SolveSpec:
     group_shape: tuple[int, int] | None = None
     fixed_mask: np.ndarray | None = None
     strict: bool = False
+    lbfgs_scipy_defaults: bool = False
 
 
 @dataclass
@@ -150,7 +156,17 @@ def _solve_lbfgs(X, y, w0, spec, config):
     else:
         fun = poisson_nll_grad
         args = (X, y, spec.theta)
-    callback = Callback(w0, config)
+    if spec.lbfgs_scipy_defaults:
+        callback = None
+        options = {"maxiter": 10_000}
+    else:
+        callback = Callback(w0, config)
+        options = {
+            "maxiter": 10_000,
+            "ftol": config.ftol,
+            "gtol": config.gtol,
+            "maxls": config.maxls,
+        }
     result = minimize(
         fun,
         w0,
@@ -159,14 +175,10 @@ def _solve_lbfgs(X, y, w0, spec, config):
         jac=True,
         bounds=bounds,
         callback=callback,
-        options={
-            "maxiter": 10_000,
-            "ftol": config.ftol,
-            "gtol": config.gtol,
-            "maxls": config.maxls,
-        },
+        options=options,
     )
-    if spec.strict and not (result.success or callback.success):
+    converged = result.success or (callback is not None and callback.success)
+    if spec.strict and not converged:
         raise RuntimeError(f"L-BFGS-B failed to converge: {result.message}")
     return result.x
 
