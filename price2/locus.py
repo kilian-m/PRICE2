@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import bisect
 import logging
-import os
 import time
 from collections import defaultdict
 
@@ -24,7 +23,6 @@ from pyfaidx import Fasta
 
 logger = logging.getLogger(__name__)
 import pandas as pd
-from filelock import FileLock
 from scipy.sparse import csr_matrix
 
 from price2 import database
@@ -773,153 +771,6 @@ class Locus:
 
         rgr_frame_covpos = frozenset(rgr_frame_covpos)
         return rgr_frame_covpos
-
-    def gtf_line(self) -> str:
-        """Return a single GTF line describing this locus."""
-        seq_id = self.iv.chrom
-        source = "PRICE2"
-        typ = "locus"
-        start = self.iv.start
-        end = self.iv.end
-        score = "."
-        strand = self.iv.strand
-        phase = "."
-        attributes = f'locus_id "{self.id}";'
-
-        return f"{seq_id}\t{source}\t{typ}\t{start}\t{end}\t{score}\t{strand}\t{phase}\t{attributes}\n"
-
-    def to_gtf(
-        self,
-        prefix: str,
-        write_loci: bool = False,
-        write_transcripts: bool = False,
-        write_orfs: bool = True,
-    ) -> None:
-        """Append locus features to GTF files.
-
-        Files are created or appended to with file-lock protection for
-        concurrent writes from multiple worker processes.
-
-        Parameters
-        ----------
-        prefix : str
-            Path prefix; files are named ``<prefix>_loci.gtf``,
-            ``<prefix>_transcripts.gtf``, and ``<prefix>_orfs.gtf``.
-        write_loci : bool
-            Write the locus interval.
-        write_transcripts : bool
-            Write noise (transcript-level) RGRs.
-        write_orfs : bool
-            Write ORF-type RGRs.
-        """
-        sep = "" if prefix.endswith("/") else "_"
-        if write_loci:
-            path = f"{prefix}{sep}loci.gtf"
-            lock = FileLock(path + ".lock")
-            with lock:
-                with open(path, "a") as f:
-                    f.write(self.gtf_line())
-
-        if write_transcripts:
-            path = f"{prefix}{sep}transcripts.gtf"
-            lock = FileLock(path + ".lock")
-            with lock:
-                with open(path, "a") as f:
-                    for rgr in self.rgr_set:
-                        if rgr.type == "NOISE":
-                            f.write(rgr.to_gtf(self.id))
-
-        if write_orfs:
-            path = f"{prefix}{sep}orfs.gtf"
-            lock = FileLock(path + ".lock")
-            with lock:
-                with open(path, "a") as f:
-                    for rgr in self.rgr_set:
-                        if rgr.type == "ORF":
-                            f.write(rgr.to_gtf(self.id))
-
-    def to_tsv(
-        self,
-        prefix: str,
-        runs: list | None = None,
-        include_noise: bool = False,
-    ) -> None:
-        """Append region results to a TSV file.
-
-        When *runs* is provided the output includes a header row
-        (written only once) and per-run activity columns taken from
-        :attr:`result_df`.  Without *runs* only the four annotation
-        columns are written (used for intermediate/verbose output).
-
-        The file is named ``<prefix>_regions.tsv`` when *include_noise*
-        is ``True``, otherwise ``<prefix>_orfs.tsv``.
-
-        Parameters
-        ----------
-        prefix : str
-            Path prefix for the output file.
-        runs : list[RiboSeqRun] | None
-            Ribo-seq runs whose IDs become the activity columns.
-        include_noise : bool
-            When ``True`` NOISE regions are written alongside ORFs.
-        """
-        suffix = "regions" if include_noise else "orfs"
-        id_col = "region_id" if include_noise else "orf_id"
-        sep = "" if prefix.endswith("/") else "_"
-        path = f"{prefix}{sep}{suffix}.tsv"
-        lock = FileLock(path + ".lock")
-        with lock:
-            # Write header once when activity columns are requested.
-            if runs is not None and not os.path.exists(path):
-                run_ids = [run.id for run in runs]
-                with open(path, "w") as f:
-                    f.write(
-                        f"{id_col}\tgene_id\ttranscript_id\tlocus_id"
-                        f"\tgenomic_region\torf_type\t" + "\t".join(run_ids) + "\n"
-                    )
-
-            with open(path, "a") as f:
-                for rgr in self.rgr_set:
-                    if not include_noise and rgr.type != "ORF":
-                        continue
-                    if runs is not None and hasattr(self, "result_df"):
-                        activities = self.result_df.loc[rgr.id]
-                        activity_str = "\t".join(f"{v:.2e}" for v in activities)
-                        orf_type_str = rgr.orf_type if rgr.orf_type is not None else ""
-                        f.write(
-                            f"{rgr.id}\t{rgr.transcript.gene_id}"
-                            f"\t{rgr.transcript.id}"
-                            f"\t{self.id}\t{rgr.full_genomic_region}"
-                            f"\t{orf_type_str}\t{activity_str}\n"
-                        )
-                    else:
-                        f.write(rgr.to_tsv_line(self.id))
-
-    def to_bed(
-        self,
-        prefix: str,
-        include_noise: bool = False,
-    ) -> None:
-        """Append region results to a BED12 file.
-
-        Parameters
-        ----------
-        prefix : str
-            Path prefix; the file is named ``<prefix>_regions.bed`` when
-            *include_noise* is ``True``, otherwise ``<prefix>_orfs.bed``.
-        include_noise : bool
-            When ``True`` NOISE regions are written alongside ORFs.
-        """
-        suffix = "regions" if include_noise else "orfs"
-        sep = "" if prefix.endswith("/") else "_"
-        path = f"{prefix}{sep}{suffix}.bed"
-        lock = FileLock(path + ".lock")
-        with lock:
-            with open(path, "a") as f:
-                for rgr in self.rgr_set:
-                    if not include_noise and rgr.type != "ORF":
-                        continue
-                    f.write(rgr.to_bed_line())
 
     # ------------------------------------------------------------------ #
     # ORF activity estimation                                              #

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 
@@ -362,6 +362,10 @@ class Config:
     #: CUDA stream-threads per broker process (intra-process overlap; limited by
     #: that process's GIL, so scale mu_broker_procs first).
     mu_broker_streams: int = 2
+    #: Runtime only: the request queue of a running GPU broker, set on the copy
+    #: of the configuration handed to the worker processes (see
+    #: ``ORFActivityEstimator``).  Never read from a configuration file.
+    mu_broker_req_q: object = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #

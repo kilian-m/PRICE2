@@ -84,7 +84,7 @@ import shutil
 import sqlite3 as sql
 import struct
 from collections import defaultdict
-from multiprocessing import Pool
+import multiprocessing as mp
 
 import numpy as np
 
@@ -689,7 +689,7 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
     # Fork before opening the database: SQLite connections must not be carried
     # across fork().  ``imap`` then lets the parent insert one run's rows while
     # the remaining runs are still being collapsed.
-    pool = Pool(n_proc) if n_proc > 1 else None
+    pool = mp.get_context("forkserver").Pool(n_proc) if n_proc > 1 else None
 
     with database.connect(db_path, commit=True) as db:
         cur = db.cursor()

@@ -309,10 +309,8 @@ class DataCollector:
         """
         # Fork before opening the database: SQLite connections must not be
         # carried across fork(), and the workers have no use for one.
-        # The context must be requested explicitly: importing
-        # ``orf_activity_estimator`` sets the global start method to
-        # ``forkserver``, under which workers would not inherit
-        # ``_WORKER_LOCI``.
+        # ``fork`` so that the workers inherit ``_WORKER_LOCI`` without
+        # pickling it; the deconvolution pool uses ``forkserver`` instead.
         try:
             pool = mp.get_context("fork").Pool(n_proc)
         except AssertionError:

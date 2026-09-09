@@ -59,6 +59,7 @@ _IGNORED_FIELDS: frozenset[str] = frozenset(
         "mu_broker",
         "mu_broker_procs",
         "mu_broker_streams",
+        "mu_broker_req_q",
     }
 )
 

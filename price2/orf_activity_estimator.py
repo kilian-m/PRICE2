@@ -1,69 +1,165 @@
 """Parallel ORF activity estimation across genomic loci.
 
-This module orchestrates the per-locus deconvolution pipeline:
-loading data from SQLite, filtering ORF candidates, constructing
-equivalence groups, running group-LASSO optimisation and writing
-results.  Each locus is processed in an isolated worker process via
-``pebble.ProcessPool`` so that timeouts and crashes are isolated.
+:class:`ORFActivityEstimator` fans the loci of a run out over a
+``pebble.ProcessPool``; :func:`process_loc` is what one worker does with one
+locus: load it, generate and filter ORF candidates, build the equivalence
+groups, deconvolve, and write the results.  Each locus runs in an isolated
+worker so that timeouts and crashes stay contained.
+
+The workers are started with the ``forkserver`` method: numba's JIT state
+and SQLite handles are not safe to ``fork``.  :func:`init_worker` runs once
+per worker process and installs the :class:`WorkerContext` every locus of
+that worker shares.
 """
+
+from __future__ import annotations
 
 import glob
 import logging
 import logging.handlers
+import multiprocessing as mp
 import os
 import time
 import traceback
 from concurrent.futures import TimeoutError, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 
-import multiprocessing as mp
 import pandas as pd
 from filelock import FileLock
 from pebble import ProcessPool
+from pebble.common import CONSTS as _pebble_consts
 from pyfaidx import Fasta
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from price2 import database
-from price2 import multimap
+from price2 import database, export, multimap
+from price2.config import Config
 from price2.data_collector import build_rgrs
 from price2.equivalence_groups import make_equivalence_groups
-
-# Must be set before any ProcessPool is created.  ``forkserver`` is
-# required because numba JIT state and SQLite handles are not safe to
-# fork directly.
-mp.set_start_method("forkserver", force=True)
-
-# Increase pebble's channel lock timeout.  The default is 60 s; with
-# forkserver and many workers (e.g. 80) the result-pipe mutex can be
-# contended long enough to exceed that, causing workers to exit with
-# code 1 ("Abnormal termination").  600 s gives ample headroom.
-from pebble.common import CONSTS as _pebble_consts
-
-_pebble_consts.channel_lock_timeout = 600
+from price2.layout import RunLayout
+from price2.locus import Locus
+from price2.ribo_seq_run import RiboSeqRun
 
 logger = logging.getLogger(__name__)
 
-# Worker-local pyfaidx handle cache, shared by every locus a worker handles
-# (see ``Config.worker_max_tasks``).
-_genome_cache: dict[str, Fasta] = {}
+_MP_CONTEXT = mp.get_context("forkserver")
+
+#: pebble's default channel lock timeout is 60 s; with ``forkserver`` and many
+#: workers (e.g. 80) the result-pipe mutex can be contended for longer, which
+#: makes workers exit with "Abnormal termination".  600 s gives ample headroom.
+_PEBBLE_CHANNEL_LOCK_TIMEOUT = 600
 
 
-def _get_genome(path: str) -> Fasta:
-    """Return a worker-local :class:`pyfaidx.Fasta` for *path*."""
-    handle = _genome_cache.get(path)
-    if handle is None:
-        handle = Fasta(path)
-        _genome_cache[path] = handle
-    return handle
+# --------------------------------------------------------------------------- #
+# What a worker knows and what a job asks of it
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class WorkerContext:
+    """State shared by every locus a worker process handles.
+
+    Attributes
+    ----------
+    config : Config
+        The run configuration, including a broker queue when a GPU broker
+        is running.
+    layout : RunLayout
+        The run's files.
+    genome : pyfaidx.Fasta
+        The reference genome, opened once per worker.
+    """
+
+    config: Config
+    layout: RunLayout
+    genome: Fasta
+
+
+_CONTEXT: WorkerContext | None = None
+
+
+def init_worker(config: Config, log_queue) -> None:
+    """Prepare a worker process: route its logs to the parent, open the genome.
+
+    Passed to the pool as ``initializer``; in-process callers (tests) call it
+    once before :func:`process_loc`.
+
+    Parameters
+    ----------
+    config : Config
+        The configuration the workers run with.
+    log_queue : multiprocessing.Queue
+        Queue drained by the parent's :class:`logging.handlers.QueueListener`.
+    """
+    global _CONTEXT
+    worker_logger = logging.getLogger("price2")
+    if not worker_logger.handlers:
+        worker_logger.addHandler(logging.handlers.QueueHandler(log_queue))
+        worker_logger.setLevel(config.log_level)
+        worker_logger.propagate = False
+    _CONTEXT = WorkerContext(config, config.layout, Fasta(config.fasta_path))
+
+
+def _context() -> WorkerContext:
+    if _CONTEXT is None:
+        raise RuntimeError("process_loc called before init_worker")
+    return _CONTEXT
+
+
+@dataclass(frozen=True)
+class LocusJob:
+    """One locus to process, and in which pass.
+
+    Parameters
+    ----------
+    locus_id : str
+        The locus id stored in the database.
+    em_iteration : int or None
+        Multimapping-EM iteration; ``None`` for the classic single pass.
+    em_final : bool
+        ``True`` for the classic pass or the final EM pass (full
+        deconvolution, filtering, export and resume bookkeeping); ``False``
+        for a light intermediate EM pass that only writes activities and λ
+        for the E-step.
+    """
+
+    locus_id: str
+    em_iteration: int | None = None
+    em_final: bool = True
+
+    @property
+    def em_mode(self) -> bool:
+        return self.em_iteration is not None
+
+    @property
+    def em_light(self) -> bool:
+        return self.em_mode and not self.em_final
+
+
+class PerfLog(dict):
+    """Per-locus timing and count statistics (``performance_measurements.tsv``)."""
+
+    @contextmanager
+    def timed(self, key: str):
+        """Record the wall-clock seconds spent in the block under *key*."""
+        start = time.time()
+        try:
+            yield
+        finally:
+            self[key] = time.time() - start
+
+
+# --------------------------------------------------------------------------- #
+# The parent: fan-out
+# --------------------------------------------------------------------------- #
 
 
 class ORFActivityEstimator:
     """Orchestrate parallel ORF deconvolution over all genomic loci.
 
-    Each locus stored in the PRICE SQLite database is dispatched to an
-    isolated worker process; every result is written to disk by the
-    worker itself.
+    Each locus stored in the database is dispatched to an isolated worker
+    process; every result is written to disk by the worker itself.
 
     Parameters
     ----------
@@ -79,16 +175,15 @@ class ORFActivityEstimator:
         ``config.timeout`` per Ribo-seq run.
     """
 
-    def __init__(self, config) -> None:
-        """Initialise estimator and load locus IDs from the database.
-
-        Parameters
-        ----------
-        config : Config
-            Parsed PRICE configuration object.
-        """
+    def __init__(self, config: Config) -> None:
         self.config = config
         self.db_path = config.layout.db_path
+        # The configuration handed to the workers; a running GPU broker adds
+        # its request queue to this copy, never to ``config`` itself.
+        self._worker_config = config
+        self._broker = None
+        self._pool: ProcessPool | None = None
+        self._log_queue = None
 
         with database.connect(self.db_path) as db:
             self.loci_ids = [
@@ -110,36 +205,36 @@ class ORFActivityEstimator:
             max(1, n_runs),
         )
 
-    def _start_gpu_broker(self):
-        """Start the single-context GPU deconvolution broker pool.
+    @contextmanager
+    def gpu_broker_pool(self):
+        """Hold one GPU broker pool open for the duration of the block.
 
-        The pool is shared across the whole worker pool via
-        ``config.mu_broker_req_q`` (a Manager queue proxy that pickles to each
-        ``process_loc`` worker).  One broker process holds one CUDA context and
-        serves every worker over shared memory, so device VRAM does not scale
-        with ``config.processes``.
-
-        Returns
-        -------
-        GpuBroker or None
-            The started pool, or ``None`` when the broker is disabled or cannot
-            start — in which case the workers fall back to the configured
-            per-worker MU path.
+        The broker serves every worker over shared memory from a single CUDA
+        context per broker process (see :mod:`price2.gpu_broker`); starting
+        it once around the whole multimapping EM avoids paying that context
+        per M-step.  A no-op when the broker is disabled, cannot start, or is
+        already running.
         """
-        self.config.mu_broker_req_q = None
-        if (
-            self.config.inner_solver != "mu"
-            or not self.config.mu_broker
-        ):
-            return None
+        started = self._broker is None and self._start_gpu_broker()
+        try:
+            yield
+        finally:
+            if started:
+                self._broker.stop()
+                self._broker = None
+                self._worker_config = self.config
 
+    def _start_gpu_broker(self) -> bool:
+        config = self.config
+        if config.inner_solver != "mu" or not config.mu_broker:
+            return False
         try:
             from price2.gpu_broker import GpuBroker
 
             broker = GpuBroker(
-                n_procs=self.config.mu_broker_procs,
-                n_streams=self.config.mu_broker_streams,
-                dtype_str=self.config.mu_dtype,
+                n_procs=config.mu_broker_procs,
+                n_streams=config.mu_broker_streams,
+                dtype_str=config.mu_dtype,
             )
             broker.start()
         except Exception as exc:  # noqa: BLE001
@@ -148,49 +243,30 @@ class ORFActivityEstimator:
                 "per-worker MU path",
                 exc,
             )
-            return None
-
-        self.config.mu_broker_req_q = broker.req_q
+            return False
+        self._broker = broker
+        self._worker_config = replace(config, mu_broker_req_q=broker.req_q)
         logger.info(
             "GPU deconvolution broker pool started (%d procs x %d streams, %s)",
-            self.config.mu_broker_procs,
-            self.config.mu_broker_streams,
-            self.config.mu_dtype,
+            config.mu_broker_procs,
+            config.mu_broker_streams,
+            config.mu_dtype,
         )
-        return broker
-
-    @contextmanager
-    def gpu_broker_pool(self):
-        """Hold one GPU broker pool open for the duration of the block.
-
-        Each :meth:`run_orf_deconvolution` would otherwise start and stop a pool
-        of its own.  That costs a CUDA context per broker process every time,
-        which the multimapping EM pays once per M-step; wrapping the whole loop
-        in this context manager pays it once.  Nested calls to
-        :meth:`run_orf_deconvolution` reuse the pool and leave it running.
-        """
-        broker = self._start_gpu_broker()
-        try:
-            yield
-        finally:
-            if broker is not None:
-                broker.stop()
-            self.config.mu_broker_req_q = None
+        return True
 
     @contextmanager
     def worker_pool(self):
-        """Hold one process pool + log listener open across all EM M-steps.
+        """Hold one process pool and log listener open for the block.
 
-        Each :meth:`run_orf_deconvolution` would otherwise spawn a fresh worker
-        pool, ``multiprocessing`` manager and log ``QueueListener`` and tear
-        them all down again.  The multimapping EM runs ~20 light M-steps plus
-        the final full pass; creating and joining the pool + manager each time
-        costs ~1 s of wall per iteration.  Wrapping the whole loop in this
-        context pays it once.  Nested :meth:`run_orf_deconvolution` calls detect
-        ``self._pool`` and schedule onto it instead of making their own.
+        The multimapping EM runs ~20 light M-steps plus the final full pass;
+        creating and joining a pool and a manager each time costs ~1 s of
+        wall per iteration, so the EM wraps its whole loop in this context.
+        Start a GPU broker (:meth:`gpu_broker_pool`) before the pool: the
+        workers receive its queue at start-up.
         """
+        _pebble_consts.channel_lock_timeout = _PEBBLE_CHANNEL_LOCK_TIMEOUT
         price2_logger = logging.getLogger("price2")
-        manager = mp.Manager()
+        manager = _MP_CONTEXT.Manager()
         log_queue = manager.Queue()
         listener = logging.handlers.QueueListener(
             log_queue, *price2_logger.handlers, respect_handler_level=True
@@ -199,6 +275,9 @@ class ORFActivityEstimator:
         pool = ProcessPool(
             max_workers=self.config.processes,
             max_tasks=self.config.worker_max_tasks,
+            initializer=init_worker,
+            initargs=(self._worker_config, log_queue),
+            context=_MP_CONTEXT,
         )
         self._pool = pool
         self._log_queue = log_queue
@@ -218,226 +297,189 @@ class ORFActivityEstimator:
         em_final: bool = True,
         loci_subset: set | None = None,
     ) -> None:
-        """Run the full per-locus ORF deconvolution pipeline.
+        """Run the per-locus ORF deconvolution over the loci of the run.
 
-        Dispatches each locus to a worker process via
-        :class:`pebble.ProcessPool`.  On a full pass already-processed
-        loci are skipped so that the run can be resumed after a crash;
-        their ids are read from ``<w_dir>/processed_loci.txt``.
+        Dispatches each locus to a worker process.  On a full pass the loci
+        listed in ``<w_dir>/processed_loci.txt`` are skipped, so that an
+        interrupted run resumes where it stopped.  Results are written
+        incrementally to ``<o_dir>/regions_activities/``; failed loci are
+        recorded in ``failed_loci.txt`` there.
 
-        Per-locus results are written incrementally to
-        ``<o_dir>/regions_activities/`` (``orfs.tsv`` and ``orfs.bed``
-        by default; see the ``export_*`` options).  Failed loci are
-        logged to ``<o_dir>/regions_activities/failed_loci.txt``.
+        Uses the pool held open by :meth:`worker_pool` when the caller has
+        one, otherwise starts a broker and a pool for this call alone.
 
         Parameters
         ----------
         em_iteration : int, optional
             Multimapping-EM iteration index.  ``None`` (default) runs the
-            classic single-pass pipeline.  When set, workers load this
-            iteration's fractional weights and the previous iteration's
-            activities (warm start).
+            classic single-pass pipeline.
         em_final : bool, optional
-            ``True`` for a classic run or the final EM pass (full
-            deconvolution + filtering + export + resume bookkeeping).
-            ``False`` for a light intermediate EM pass (one Huber
-            reweight, no pruning/export; writes activities and λ for the
-            E-step).  Intermediate passes do not touch
+            See :class:`LocusJob`.  Intermediate passes do not touch
             ``processed_loci.txt``.
         loci_subset : set, optional
-            When given, restrict the fan-out to these locus ids.  Light EM
-            passes pass the set of loci that carry multimap slots, since
-            loci with no multimapping reads never change across EM
-            iterations and only need computing once (in the final pass).
+            Restrict the fan-out to these locus ids.  Light EM passes pass
+            the loci that carry multimap slots; the others cannot change
+            between iterations and are computed once, in the final pass.
         """
+        if self._pool is None:
+            with self.gpu_broker_pool(), self.worker_pool():
+                self._run_loci(em_iteration, em_final, loci_subset)
+        else:
+            self._run_loci(em_iteration, em_final, loci_subset)
+
+    def _run_loci(
+        self, em_iteration: int | None, em_final: bool, loci_subset: set | None
+    ) -> None:
+        layout = self.config.layout
+        os.makedirs(layout.regions_activities_dir, exist_ok=True)
+
         loci_ids = set(self.loci_ids)
         if loci_subset is not None:
-            loci_ids = loci_ids & loci_subset
-
-        layout = self.config.layout
-        ra_dir = layout.regions_activities_dir
-        os.makedirs(ra_dir, exist_ok=True)
-
+            loci_ids &= loci_subset
         # Resume-skip bookkeeping only applies to full passes; light EM
         # passes intentionally re-run every locus each iteration.
-        if em_final:
-            processed_loci_path = layout.processed_loci_path
-            if os.path.exists(processed_loci_path):
-                with open(processed_loci_path) as fh:
-                    processed_loc_ids = {
-                        line.strip() for line in fh if line.strip()
-                    }
-                loci_ids = loci_ids - processed_loc_ids
-
-        loci_ids = list(loci_ids)
-        log_level_num = logging.getLevelName(self.config.log_level)
-        pbar = tqdm(total=len(loci_ids), disable=log_level_num > logging.INFO)
-
-        # Reuse the caller's broker pool when there is one (the EM outer loop
-        # holds a single pool across all of its M-steps), and tear down only a
-        # pool this call started.
-        broker = None
-        if getattr(self.config, "mu_broker_req_q", None) is None:
-            broker = self._start_gpu_broker()
+        if em_final and os.path.exists(layout.processed_loci_path):
+            with open(layout.processed_loci_path) as fh:
+                loci_ids -= {line.strip() for line in fh if line.strip()}
 
         price2_logger = logging.getLogger("price2")
-        # Reuse a pool + log listener held open by the caller across all EM
-        # M-steps (see :meth:`worker_pool`); otherwise create a private one for
-        # this single call (the classic single-pass path).
-        shared_pool = getattr(self, "_pool", None)
-        own_pool = shared_pool is None
-        if own_pool:
-            manager = mp.Manager()
-            log_queue = manager.Queue()
-            listener = logging.handlers.QueueListener(
-                log_queue, *price2_logger.handlers, respect_handler_level=True
-            )
-            listener.start()
-            pool = ProcessPool(
-                max_workers=self.config.processes,
-                max_tasks=self.config.worker_max_tasks,
-            )
-        else:
-            pool = shared_pool
-            log_queue = self._log_queue
-        try:
-            futures = {
-                pool.schedule(
-                    process_loc,
-                    args=[
-                        (
-                            locus_id,
-                            self.config,
-                            log_queue,
-                            em_iteration,
-                            em_final,
-                        )
-                    ],
-                    timeout=self.locus_timeout,
-                ): locus_id
-                for locus_id in loci_ids
-            }
-
-            with logging_redirect_tqdm(loggers=[price2_logger]):
-                for fut in as_completed(futures):
-                    loc_id = futures[fut]
-                    try:
-                        fut.result()
-                    except (TimeoutError, Exception) as e:
-                        stack = traceback.format_exc()
-                        logger.error("locus %s failed: %s", loc_id, e)
-                        lock = FileLock(layout.failed_loci_path + ".lock")
-                        with lock:
-                            with open(layout.failed_loci_path, "a") as f:
-                                f.write(f"{loc_id}\n{str(e)}\n{stack}\n\n")
-                    finally:
-                        pbar.update(1)
-        finally:
-            if own_pool:
-                pool.close()
-                pool.join()
-                listener.stop()
-                manager.shutdown()
-            if broker is not None:
-                broker.stop()
-                self.config.mu_broker_req_q = None
-            # A caller-owned shared pool stays up for the next M-step.
-
+        log_level = logging.getLevelName(self.config.log_level)
+        pbar = tqdm(total=len(loci_ids), disable=log_level > logging.INFO)
+        futures = {
+            self._pool.schedule(
+                process_loc,
+                args=[LocusJob(locus_id, em_iteration, em_final)],
+                timeout=self.locus_timeout,
+            ): locus_id
+            for locus_id in loci_ids
+        }
+        with logging_redirect_tqdm(loggers=[price2_logger]):
+            for future in as_completed(futures):
+                locus_id = futures[future]
+                try:
+                    future.result()
+                except (TimeoutError, Exception) as exc:
+                    logger.error("locus %s failed: %s", locus_id, exc)
+                    export.append_locked(
+                        layout.failed_loci_path,
+                        f"{locus_id}\n{exc}\n{traceback.format_exc()}\n\n",
+                    )
+                finally:
+                    pbar.update(1)
         pbar.close()
 
-        lock_files = glob.glob(os.path.join(ra_dir, "*.lock"))
-        for lock_file in lock_files:
+        for lock_file in glob.glob(
+            os.path.join(layout.regions_activities_dir, "*.lock")
+        ):
             os.remove(lock_file)
 
 
-def process_loc(arguments: tuple):
-    """Process a single locus: filter ORFs, deconvolve, write output.
+# --------------------------------------------------------------------------- #
+# The worker: one locus
+# --------------------------------------------------------------------------- #
 
-    This function is executed in a separate worker process by
-    :meth:`ORFActivityEstimator.run_orf_deconvolution`.
+
+def process_loc(job: LocusJob) -> None:
+    """Process one locus: filter ORFs, deconvolve, write the outputs.
+
+    Runs in a worker process prepared by :func:`init_worker`.  A light EM
+    pass stops after writing its activities and λ for the E-step; a full
+    pass continues through the likelihood-ratio filter, the final activity
+    estimate, the exports and the resume bookkeeping.
 
     Parameters
     ----------
-    arguments : tuple
-        ``(locus_id, config, log_queue, em_iteration, em_final)`` where
-        *locus_id* is the string identifier stored in the SQLite database,
-        *config* is the :class:`~price2.config.Config` instance, *log_queue*
-        is a :class:`multiprocessing.Queue` connected to the main-process
-        :class:`~logging.handlers.QueueListener`, and *em_iteration* /
-        *em_final* select the multimapping-EM pass (see
-        :meth:`ORFActivityEstimator.run_orf_deconvolution`).
+    job : LocusJob
+        The locus and the pass to run.
     """
-    loc_id, config, log_queue, em_iteration, em_final = arguments
-    em_mode = em_iteration is not None
-    em_light = em_mode and not em_final
-    # No EM to spread a multimapping read over the loci it aligns to, so the
-    # alternative to dropping it is counting it at full weight in each of
-    # them.  A fresh collection already withheld these reads; this also covers
-    # a price.db collected with multimap_em enabled.
-    drop_multimappers = not config.multimap_em
-
-    # Route all price2 log records back to the main process.
-    worker_logger = logging.getLogger("price2")
-    if not worker_logger.handlers:
-        worker_logger.addHandler(logging.handlers.QueueHandler(log_queue))
-        worker_logger.setLevel(config.log_level)
-        worker_logger.propagate = False
-
-    performance_measurements: dict = {}
-    performance_measurements["loc_id"] = loc_id
+    ctx = _context()
+    config, layout = ctx.config, ctx.layout
+    perf = PerfLog(loc_id=job.locus_id)
     t_start = time.time()
-    t1 = time.time()
 
-    layout = config.layout
-    ra_dir = layout.regions_activities_dir
-    db_path = layout.db_path
+    with perf.timed("db_time"):
+        runs = _load_runs(layout.db_path)
+        loc, prepared = _load_locus(job, ctx, perf)
+    if not prepared and not _prepare_locus(job, ctx, loc, runs, perf):
+        if not job.em_light:
+            _mark_processed(layout, job.locus_id)
+        return None
+    # The prepared state is persisted after ``assign_reads_to_egs`` below, so
+    # that the routing cache it builds is stored with it.
+    save_prepared = job.em_light and job.em_iteration == 0
 
-    # --- Load runs (always needed) ---
+    mm_data = _apply_em_state(job, loc, runs, layout.db_path)
+    with perf.timed("proc_reads_2_time"):
+        loc.assign_reads_to_egs(
+            runs, mm_data, build_cache=save_prepared and config.eg_cache
+        )
+    perf["read_count"] = sum(loc.counted_reads.values())
+
+    if job.em_light:
+        _light_mstep(job, loc, runs, mm_data, save_prepared, config, layout, perf)
+        return None
+
+    _full_pass(loc, runs, config, layout, perf)
+    perf["overall_time"] = time.time() - t_start
+    export.write_final_outputs(loc, config, layout.regions_activities_dir, runs)
+    if config.export_performance_measurements:
+        _append_performance(layout, perf)
+    _mark_processed(layout, job.locus_id)
+    return None
+
+
+def _load_runs(db_path: str) -> list[RiboSeqRun]:
     with database.connect(db_path) as db:
-        runs = [
+        return [
             database.unpickle_blob(blob)
             for _, blob in db.execute("SELECT * FROM runs")
         ]
 
-    # In EM mode, reuse the weight-independent prepared state (RGRs, filters,
-    # equivalence-group geometry) cached by the first light pass; only the
-    # fractional response y changes between iterations, so later iterations and
-    # the final pass skip ORF generation, both filter passes and the EG build.
-    # An intermediate light pass touches none of the locus's object graph, so
-    # where a routing cache exists it loads that alone (arrays only) rather
-    # than unpickling transcripts, RGRs and equivalence groups.  ``None`` on a
-    # miss: classic mode, the first light iteration, or a non-multimapping
-    # locus in the final pass.
-    needs_prepared_save = False
-    use_eg_cache = config.eg_cache
-    loc = None
-    if em_light and em_iteration > 0 and use_eg_cache:
-        loc = multimap.load_light_locus(db_path, loc_id)
-    if loc is None and em_mode:
-        loc = multimap.load_prepared_locus(
-            db_path, loc_id, with_cache=use_eg_cache
-        )
 
-    if loc is not None:
-        performance_measurements["chrom"] = loc.iv.chrom
-        performance_measurements["strand"] = loc.iv.strand
-        performance_measurements["start"] = loc.iv.start
-        performance_measurements["end"] = loc.iv.end
-        performance_measurements["db_time"] = time.time() - t1
-        # Reads are excluded from the cache blob.  In an intermediate light
-        # M-step (em_iteration > 0) the response y is rebuilt entirely from the
-        # routing cache (``cache.counts0`` + slot weights); the reads themselves
-        # are only touched for a length sanity check, so skip the
-        # reload+unpickle there.  Iteration 0 (still building the cache) and the
-        # final full pass both genuinely need the reads.  (A light-pass cache
-        # miss falls through to the full-prepare branch below, which loads its
-        # own reads, so this only elides the reload when the cache is present.)
-        t1 = time.time()
-        if not (em_light and em_iteration > 0):
-            loc.get_reads_from_db(db_path, drop_multimappers=drop_multimappers)
-        performance_measurements["load_reads_time"] = time.time() - t1
-        # Keep perf columns aligned with the full-prepare path (the skipped
-        # stages report zero time).  A light locus carries no rgr_set/egs, so
+def _load_locus(
+    job: LocusJob, ctx: WorkerContext, perf: PerfLog
+) -> tuple[Locus, bool]:
+    """Return the locus to work on and whether it is already prepared.
+
+    In EM mode the weight-independent prepared state (RGRs, filters,
+    equivalence-group geometry) cached by the first light pass is reused:
+    only the fractional response changes between iterations.  An
+    intermediate light pass loads just the routing cache (arrays only)
+    rather than the locus's whole object graph.  On a miss — classic mode,
+    the first light iteration, or a non-multimapping locus in the final
+    pass — the pre-RGR skeleton is loaded and still has to be prepared.
+    """
+    config, db_path = ctx.config, ctx.layout.db_path
+    loc = None
+    if job.em_light and job.em_iteration > 0 and config.eg_cache:
+        loc = multimap.load_light_locus(db_path, job.locus_id)
+    if loc is None and job.em_mode:
+        loc = multimap.load_prepared_locus(
+            db_path, job.locus_id, with_cache=config.eg_cache
+        )
+    prepared = loc is not None
+    if loc is None:
+        with database.connect(db_path) as db:
+            row = db.execute(
+                "SELECT loc_blob FROM loci WHERE locus_id = ?", (job.locus_id,)
+            ).fetchone()
+        loc = database.unpickle_blob(row[0])
+    perf["chrom"] = loc.iv.chrom
+    perf["strand"] = loc.iv.strand
+    perf["start"] = loc.iv.start
+    perf["end"] = loc.iv.end
+
+    if prepared:
+        # Reads are excluded from the cache blob.  An intermediate light
+        # M-step rebuilds the response entirely from the routing cache, so
+        # only iteration 0 and the final pass reload them.
+        with perf.timed("load_reads_time"):
+            if not (job.em_light and job.em_iteration > 0):
+                loc.get_reads_from_db(
+                    db_path, drop_multimappers=not config.multimap_em
+                )
+        # Keep the perf columns aligned with the prepare path; the skipped
+        # stages report zero time.  A light locus carries no rgr_set/egs, so
         # the counts come off its routing cache.
         if hasattr(loc, "rgr_set"):
             n_rgrs = len(loc.rgr_set)
@@ -445,287 +487,179 @@ def process_loc(arguments: tuple):
         else:
             n_rgrs = loc.eg_cache.num_rgrs
             n_egs = loc.eg_cache.n_rows
-        performance_measurements["build_rgrs_time"] = 0.0
-        performance_measurements["unfiltered_rgr_count"] = n_rgrs
-        performance_measurements["assign_reads_time"] = 0.0
-        performance_measurements["filtered_coverage_rgr_count"] = n_rgrs
-        performance_measurements["coverage_filter_time"] = 0.0
-        performance_measurements["filtered_deconvolution_rgr_count"] = n_rgrs
-        performance_measurements["filter_2_time"] = 0.0
-        performance_measurements["eg_time"] = 0.0
-        performance_measurements["eg_count"] = n_egs
-    else:
-        # --- Load locus skeleton from database ---
-        with database.connect(db_path) as db:
-            row = db.execute(
-                "SELECT loc_blob FROM loci WHERE locus_id = ?", (loc_id,)
-            ).fetchone()
-        loc = database.unpickle_blob(row[0])
-        performance_measurements["chrom"] = loc.iv.chrom
-        performance_measurements["strand"] = loc.iv.strand
-        performance_measurements["start"] = loc.iv.start
-        performance_measurements["end"] = loc.iv.end
+        perf.update(
+            build_rgrs_time=0.0,
+            unfiltered_rgr_count=n_rgrs,
+            assign_reads_time=0.0,
+            filtered_coverage_rgr_count=n_rgrs,
+            coverage_filter_time=0.0,
+            filtered_deconvolution_rgr_count=n_rgrs,
+            filter_2_time=0.0,
+            eg_time=0.0,
+            eg_count=n_egs,
+        )
+    return loc, prepared
 
-        t2 = time.time()
-        performance_measurements["db_time"] = t2 - t1
 
-        # --- Build ORF candidates (formerly DataCollector.collect_loci) ---
-        t1 = time.time()
-        genome = _get_genome(config.fasta_path)
+def _prepare_locus(
+    job: LocusJob,
+    ctx: WorkerContext,
+    loc: Locus,
+    runs: list[RiboSeqRun],
+    perf: PerfLog,
+) -> bool:
+    """Generate the ORF candidates, filter them and build the equivalence groups.
+
+    Returns ``False`` when the locus keeps no transcript and is to be skipped.
+    """
+    config, layout = ctx.config, ctx.layout
+    db_path = layout.db_path
+    export_steps = config.export_all_steps and not job.em_light
+
+    def step_dir(step: str) -> str:
+        return os.path.join(layout.regions_activities_dir, step)
+
+    with perf.timed("build_rgrs_time"):
         min_explained_reads = config.min_explained_reads_per_run * len(runs)
         has_transcripts = build_rgrs(
-            loc, db_path, genome, config, min_explained_reads
+            loc, db_path, ctx.genome, config, min_explained_reads
         )
-        performance_measurements["build_rgrs_time"] = time.time() - t1
-        if not has_transcripts:
-            if not em_light:
-                processed_loci_path = layout.processed_loci_path
-                lock = FileLock(processed_loci_path + ".lock")
-                with lock:
-                    with open(processed_loci_path, "a") as f:
-                        f.write(loc_id + "\n")
-            return None
+    if not has_transcripts:
+        return False
+    if export_steps:
+        export.write_step_outputs(loc, config, step_dir("all"))
 
-        if config.export_all_steps and not em_light:
-            if config.export_gtf:
-                loc.to_gtf(
-                    f"{ra_dir}/all",
-                    write_orfs=config.export_orfs,
-                    write_loci=config.export_loci,
-                    write_transcripts=config.export_transcripts,
-                )
-            if config.export_tsv and config.export_orfs:
-                loc.to_tsv(f"{ra_dir}/all")
-            if config.export_bed and config.export_orfs:
-                loc.to_bed(f"{ra_dir}/all")
+    with perf.timed("load_reads_time"):
+        loc.get_reads_from_db(db_path, drop_multimappers=not config.multimap_em)
 
-        # --- Load reads ---
-        t1 = time.time()
-        loc.get_reads_from_db(db_path, drop_multimappers=drop_multimappers)
-        t2 = time.time()
-        performance_measurements["load_reads_time"] = t2 - t1
-
-        # --- Assign reads to ORF candidates ---
-        t1 = time.time()
-        performance_measurements["unfiltered_rgr_count"] = len(loc.rgr_set)
-
+    perf["unfiltered_rgr_count"] = len(loc.rgr_set)
+    with perf.timed("assign_reads_time"):
         if config.coverage_filter or config.deconvolution_filter:
             loc.make_well_fitting_reads(runs)
 
-        t2 = time.time()
-        performance_measurements["assign_reads_time"] = t2 - t1
-
-        # --- Coverage filter ---
-        t1 = time.time()
-
+    with perf.timed("coverage_filter_time"):
         if config.coverage_filter:
             loc.coverage_filter_rgrs(config)
+        if export_steps:
+            export.write_step_outputs(loc, config, step_dir("coverage_filtered"))
+        perf["filtered_coverage_rgr_count"] = len(loc.rgr_set)
 
-        if config.export_all_steps and not em_light:
-            if config.export_gtf:
-                loc.to_gtf(
-                    f"{ra_dir}/coverage_filtered",
-                    write_orfs=config.export_orfs,
-                    write_loci=config.export_loci,
-                    write_transcripts=config.export_transcripts,
-                )
-            if config.export_tsv and config.export_orfs:
-                loc.to_tsv(f"{ra_dir}/coverage_filtered")
-            if config.export_bed and config.export_orfs:
-                loc.to_bed(f"{ra_dir}/coverage_filtered")
-
-        performance_measurements["filtered_coverage_rgr_count"] = len(loc.rgr_set)
-        t2 = time.time()
-        performance_measurements["coverage_filter_time"] = t2 - t1
-
-        # --- Deconvolution filter ---
-        t1 = time.time()
+    with perf.timed("filter_2_time"):
         if config.deconvolution_filter:
             loc.deconvolution_filter_rgrs(config)
+        perf["filtered_deconvolution_rgr_count"] = len(loc.rgr_set)
+    if export_steps:
+        export.write_step_outputs(loc, config, step_dir("deconvolution_filtered"))
 
-        performance_measurements["filtered_deconvolution_rgr_count"] = len(
-            loc.rgr_set
-        )
-        t2 = time.time()
-        performance_measurements["filter_2_time"] = t2 - t1
-
-        if config.export_all_steps and not em_light:
-            if config.export_gtf:
-                loc.to_gtf(
-                    f"{ra_dir}/deconvolution_filtered",
-                    write_orfs=config.export_orfs,
-                    write_loci=config.export_loci,
-                    write_transcripts=config.export_transcripts,
-                )
-            if config.export_tsv and config.export_orfs:
-                loc.to_tsv(f"{ra_dir}/deconvolution_filtered")
-            if config.export_bed and config.export_orfs:
-                loc.to_bed(f"{ra_dir}/deconvolution_filtered")
-
-        # --- Equivalence groups ---
-        for tr in loc.transcripts:
-            tr.update_with_filtered_orfs(loc.rgr_set)
-
-        t1 = time.time()
+    for tr in loc.transcripts:
+        tr.update_with_filtered_orfs(loc.rgr_set)
+    with perf.timed("eg_time"):
         loc.egs = make_equivalence_groups(loc, runs)
-        t2 = time.time()
+    perf["eg_count"] = sum(len(egs) for egs in loc.egs.values())
+    return True
 
-        performance_measurements["eg_time"] = t2 - t1
-        performance_measurements["eg_count"] = sum(
-            len(egs) for egs in loc.egs.values()
-        )
 
-        # The prepared state is persisted after ``assign_reads_to_egs`` below,
-        # so that the routing cache it builds is stored with it.
-        needs_prepared_save = em_light and em_iteration == 0
+def _apply_em_state(
+    job: LocusJob, loc: Locus, runs: list[RiboSeqRun], db_path: str
+) -> dict | None:
+    """Warm-start the activities and load the fractional read weights.
 
-    # --- Multimapping EM: warm start + fractional read weights ---
-    # The RGR set is final here (all pre-deconvolution filters have run),
-    # so warm-start activities align by rgr.id and fractional weights can
-    # be applied per multimapping slot.
-    mm_data = None
-    if em_mode:
-        if em_iteration > 0:
-            warm = multimap.load_warm_activities(
-                db_path, loc_id, em_iteration - 1
-            )
-            if warm is not None:
-                loc.set_warm_start(warm, len(runs))
-        mm_data = multimap.load_locus_mm_data(db_path, loc_id, em_iteration)
-
-    # --- Assign reads to equivalence groups ---
-    t1 = time.time()
-    loc.assign_reads_to_egs(
-        runs, mm_data, build_cache=needs_prepared_save and use_eg_cache
-    )
-    t2 = time.time()
-    performance_measurements["proc_reads_2_time"] = t2 - t1
-    performance_measurements["read_count"] = sum(
-        rc for _, rc in loc.counted_reads.items()
-    )
-
-    # --- EM light M-step: one Huber reweight, emit λ + activities, stop ---
-    if em_light:
-        loc.deconvolve(
-            config, runs=runs, max_outer=config.em_huber_steps, prune=False
-        )
-        # After the first M-step, drop ORFs that are inactive (activity below
-        # ``rgr_min_activity``) in every run.  These rarely revive in later
-        # M-steps, so pruning them now shrinks the design matrix that every
-        # subsequent EM iteration and the final full pass rebuild.  The routing
-        # cache, equivalence groups and prepared-locus blob are all rebuilt to
-        # match before they are persisted below.  Flag-gated and only ever
-        # active on iteration 0 (``needs_prepared_save`` is set there only).
-        if needs_prepared_save and getattr(
-            config, "em_prune_after_first_mstep", False
-        ):
-            performance_measurements["mstep_pruned_orf_count"] = (
-                loc.prune_inactive_orfs(config, runs, mm_data)
-            )
-
-        # Cache the prepared state (now reflecting any pruning) for the
-        # subsequent EM iterations and the final full pass.
-        if needs_prepared_save:
-            multimap.save_prepared_locus(db_path, loc_id, loc)
-            if use_eg_cache:
-                multimap.save_locus_cache(db_path, loc_id, loc)
-
-        lambdas = loc.compute_multimap_lambdas(runs)
-        multimap.write_locus_em_output(
-            db_path,
-            loc_id,
-            em_iteration,
-            loc.activities_by_id(),
-            lambdas,
-            mm_data,
-        )
+    The RGR set is final here (all pre-deconvolution filters have run), so
+    warm-start activities align by ``rgr.id`` and the weights apply per
+    multimapping slot.  ``None`` outside EM mode (classic full counting).
+    """
+    if not job.em_mode:
         return None
+    if job.em_iteration > 0:
+        warm = multimap.load_warm_activities(
+            db_path, job.locus_id, job.em_iteration - 1
+        )
+        if warm is not None:
+            loc.set_warm_start(warm, len(runs))
+    return multimap.load_locus_mm_data(db_path, job.locus_id, job.em_iteration)
 
-    # --- Group-LASSO optimisation ---
-    loc.deconvolve(config, runs=runs)
-    performance_measurements["irls_outer_iterations"] = getattr(
-        loc, "irls_outer_iterations", 0
+
+def _light_mstep(
+    job: LocusJob,
+    loc: Locus,
+    runs: list[RiboSeqRun],
+    mm_data: dict | None,
+    save_prepared: bool,
+    config: Config,
+    layout: RunLayout,
+    perf: PerfLog,
+) -> None:
+    """One Huber reweight, then persist activities and λ for the E-step."""
+    db_path = layout.db_path
+    loc.deconvolve(config, runs=runs, max_outer=config.em_huber_steps, prune=False)
+    # After the first M-step, drop ORFs that are inactive in every run.  They
+    # rarely revive in later M-steps, so pruning them now shrinks the design
+    # matrix every later iteration and the final pass rebuild.  The routing
+    # cache, equivalence groups and prepared-locus blob are rebuilt to match
+    # before they are persisted below.
+    if save_prepared and config.em_prune_after_first_mstep:
+        perf["mstep_pruned_orf_count"] = loc.prune_inactive_orfs(
+            config, runs, mm_data
+        )
+    if save_prepared:
+        multimap.save_prepared_locus(db_path, job.locus_id, loc)
+        if config.eg_cache:
+            multimap.save_locus_cache(db_path, job.locus_id, loc)
+    multimap.write_locus_em_output(
+        db_path,
+        job.locus_id,
+        job.em_iteration,
+        loc.activities_by_id(),
+        loc.compute_multimap_lambdas(runs),
+        mm_data,
     )
 
-    performance_measurements["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
-    t2 = time.time()
-    performance_measurements["optimization_time"] = t2 - t1
 
-    if config.export_all_steps and not em_light:
-        if config.export_gtf:
-            loc.to_gtf(
-                f"{ra_dir}/deconvoluted",
-                write_orfs=config.export_orfs,
-                write_loci=config.export_loci,
-                write_transcripts=config.export_transcripts,
-            )
-        if config.export_tsv and config.export_orfs:
-            loc.to_tsv(f"{ra_dir}/deconvoluted")
-        if config.export_bed and config.export_orfs:
-            loc.to_bed(f"{ra_dir}/deconvoluted")
+def _full_pass(
+    loc: Locus,
+    runs: list[RiboSeqRun],
+    config: Config,
+    layout: RunLayout,
+    perf: PerfLog,
+) -> None:
+    """Group-LASSO deconvolution, likelihood-ratio filter and final estimate."""
+    with perf.timed("optimization_time"):
+        loc.deconvolve(config, runs=runs)
+    perf["irls_outer_iterations"] = getattr(loc, "irls_outer_iterations", 0)
+    perf["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
+    if config.export_all_steps:
+        export.write_step_outputs(
+            loc, config, os.path.join(layout.regions_activities_dir, "deconvoluted")
+        )
 
-    # --- Likelihood-ratio filter ---
     if config.likelihood_ratio_filter:
-        t1 = time.time()
-        loc.likelihood_ratio_filtering(config, runs)
-        t2 = time.time()
-        performance_measurements["likelihood_ratio_time"] = t2 - t1
-        performance_measurements["filtered_lrt_rgr_count"] = len(loc.rgr_set)
-        performance_measurements["orf_count"] = sum(
-            1 for rgr in loc.rgr_set if rgr.type == "ORF"
-        )
+        with perf.timed("likelihood_ratio_time"):
+            loc.likelihood_ratio_filtering(config, runs)
+        perf["filtered_lrt_rgr_count"] = len(loc.rgr_set)
+        perf["orf_count"] = sum(1 for rgr in loc.rgr_set if rgr.type == "ORF")
 
-    # --- Estimate activities ---
-    t1 = time.time()
-    loc.estimate_activities(runs, config)
-    t2 = time.time()
-    performance_measurements["activity_time"] = t2 - t1
+    with perf.timed("activity_time"):
+        loc.estimate_activities(runs, config)
 
-    # --- Collect final statistics ---
-    performance_measurements["gene_number"] = len(loc.gene_ids_complete)
-    performance_measurements["transcripts_number"] = loc.transcripts_number
-    t_end = time.time()
-    performance_measurements["overall_time"] = t_end - t_start
-    performance_measurements["exon_length"] = loc.exon_length
+    perf["gene_number"] = len(loc.gene_ids_complete)
+    perf["transcripts_number"] = loc.transcripts_number
+    perf["exon_length"] = loc.exon_length
 
-    if config.export_tsv:
-        if config.export_orfs:
-            loc.to_tsv(f"{ra_dir}/", runs=runs)
-        if config.export_regions and not loc.result_df.empty:
-            loc.to_tsv(f"{ra_dir}/", runs=runs, include_noise=True)
 
-    if config.export_gtf:
-        loc.to_gtf(
-            f"{ra_dir}/",
-            write_orfs=config.export_orfs,
-            write_loci=config.export_loci,
-            write_transcripts=config.export_transcripts,
-        )
-
-    if config.export_bed:
-        if config.export_orfs:
-            loc.to_bed(f"{ra_dir}/")
-        if config.export_regions and not loc.result_df.empty:
-            loc.to_bed(f"{ra_dir}/", include_noise=True)
-
-    if config.export_performance_measurements:
-        perf_path = layout.performance_path
-        header = not os.path.exists(perf_path)
-        lock = FileLock(perf_path + ".lock")
-        with lock:
-            with open(perf_path, "a") as f:
-                f.write(
-                    pd.DataFrame([performance_measurements]).to_csv(
-                        header=header,
-                        index=False,
-                        float_format="{:.2e}".format,
-                        sep="\t",
-                    )
+def _append_performance(layout: RunLayout, perf: PerfLog) -> None:
+    path = layout.performance_path
+    with FileLock(path + ".lock"):
+        header = not os.path.exists(path)
+        with open(path, "a") as fh:
+            fh.write(
+                pd.DataFrame([dict(perf)]).to_csv(
+                    header=header,
+                    index=False,
+                    float_format="{:.2e}".format,
+                    sep="\t",
                 )
+            )
 
-    processed_loci_path = layout.processed_loci_path
-    lock = FileLock(processed_loci_path + ".lock")
-    with lock:
-        with open(processed_loci_path, "a") as f:
-            f.write(loc_id + "\n")
 
+def _mark_processed(layout: RunLayout, locus_id: str) -> None:
+    export.append_locked(layout.processed_loci_path, locus_id + "\n")

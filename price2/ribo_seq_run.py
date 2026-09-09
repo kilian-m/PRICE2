@@ -166,9 +166,8 @@ def ribo_seq_runs_from_bams(
     # and would otherwise build its own copy.
     ref_annotation.build_cds_index()
 
-    # The context must be requested explicitly: importing
-    # ``orf_activity_estimator`` sets the global start method to ``forkserver``,
-    # under which workers would not inherit the module globals below.
+    # ``fork`` so that the workers inherit the module globals below without
+    # pickling them; the deconvolution pool uses ``forkserver`` instead.
     ctx = mp.get_context("fork")
     _WORKER_RA = ref_annotation
     _WORKER_END_TO_END = end_to_end

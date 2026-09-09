@@ -10,6 +10,7 @@ import os
 import numpy as np
 import pandas as pd
 
+from price2.export import ORF_TABLE_COLUMNS, REGION_TABLE_COLUMNS
 from price2.layout import REGIONS_ACTIVITIES_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -39,26 +40,9 @@ def generate_tpm_output(o_dir: str, export_tsv: bool = True) -> None:
         return
 
     ra_dir = os.path.join(o_dir, REGIONS_ACTIVITIES_DIRNAME)
-    meta_cols = [
-        "orf_id",
-        "gene_id",
-        "transcript_id",
-        "locus_id",
-        "genomic_region",
-        "orf_type",
-    ]
-    region_meta_cols = [
-        "region_id",
-        "gene_id",
-        "transcript_id",
-        "locus_id",
-        "genomic_region",
-        "orf_type",
-    ]
-
     for suffix, id_col, cols in [
-        ("orfs", "orf_id", meta_cols),
-        ("regions", "region_id", region_meta_cols),
+        ("orfs", "orf_id", list(ORF_TABLE_COLUMNS)),
+        ("regions", "region_id", list(REGION_TABLE_COLUMNS)),
     ]:
         in_path = os.path.join(ra_dir, f"{suffix}.tsv")
         out_path = os.path.join(ra_dir, f"{suffix}_tpm.tsv")
