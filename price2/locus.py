@@ -6,8 +6,8 @@ penalised maximum-likelihood estimation, and applies filtering steps
 (coverage, deconvolution, likelihood-ratio) to identify actively
 translated regions.
 
-Standalone helper functions for ORF detection and the optimisation
-:class:`Callback` are also provided.
+The ORF-detection helper :func:`find_orfs` and the design-matrix builder
+:func:`egs_to_sparse` are also provided.
 """
 
 from __future__ import annotations
@@ -25,20 +25,32 @@ from pyfaidx import Fasta
 logger = logging.getLogger(__name__)
 import pandas as pd
 from filelock import FileLock
-from scipy.optimize import minimize
 from scipy.sparse import csr_matrix
-from scipy.stats import chi2
-from scipy.special import gammaln
 
 from price2 import database
+from price2 import likelihood
 from price2 import multimap
+from price2 import solver
 from price2.config import Config
 from price2.coverage_model import CoveragePosition
 from price2.equivalence_groups import EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.genomic_region import GenomicRegion
+from price2.likelihood import (
+    distribution_theta,
+    huber_weights,
+    weighted_poisson_log_likelihood_sparse,
+    wilks_test_p,
+)
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
+
+# Re-exported for callers (and tests) that import the objectives from here.
+_huber_weights = huber_weights
+_distribution_theta = distribution_theta
+poisson_nll_grad = likelihood.poisson_nll_grad
+weighted_poisson_nll_grad = likelihood.weighted_poisson_nll_grad
+weighted_poisson_nll_grad_lasso = likelihood.weighted_poisson_nll_grad_lasso
 
 # Transcript biotypes that count as long non-coding RNA.  Ensembl (>=97)
 # and GENCODE (>=v31) use a single "lncRNA" biotype; earlier releases split
@@ -1192,7 +1204,8 @@ class Locus:
     ) -> set[str]:
         """Deconvolve a single optimisation group and return ORF ids to remove.
 
-        Each run is independently optimised using L-BFGS-B.  An ORF is
+        Each run is optimised on its own (see :func:`price2.solver.solve`).
+        An ORF is
         kept if its estimated activity exceeds
         ``config.deconvolution_filter_min_activity`` in at least one run.
 
@@ -1215,7 +1228,7 @@ class Locus:
         min_reads = self.wfr_df.sum().sum() / self.wfr_df.shape[1] * 0.1
 
         number_of_runs = self.wfr_df.shape[1]
-        theta = _distribution_theta(config)
+        theta = distribution_theta(config)
 
         for run_idx in range(number_of_runs):
             rgr_read_counts = self.wfr_df.iloc[:, run_idx].to_dict()
@@ -1249,7 +1262,6 @@ class Locus:
             rc = rgr_read_counts[sorted_rgrs[-1].id]
             egs[frozenset(s)] = (length, rc)
 
-            bounds = [(config.pseudo_min, None) for _ in range(len(egs))]
             initial_guess = np.full(len(egs), 0.1)
 
             eg_lengths = np.array([egs[eg][0] for eg in egs])
@@ -1271,25 +1283,13 @@ class Locus:
                 dtype=np.float64,
             )
 
-            if config.inner_solver == "mu":
-                from price2 import mu_solver
-
-                result_x = mu_solver.mu_inner_cpu(
-                    X_filter, X_filter.T.tocsr(), eg_read_counts,
-                    np.ones(X_filter.shape[0]), initial_guess, 0.0,
-                    len(initial_guess), 1, config.pseudo_min,
-                    config.mu_inner_max_iter,
-                    config.mu_inner_tol, theta=theta)
-            else:
-                result_x = minimize(
-                    poisson_nll_grad,
-                    initial_guess,
-                    args=(X_filter, eg_read_counts, theta),
-                    bounds=bounds,
-                    method="L-BFGS-B",
-                    jac=True,
-                    options={"maxiter": 10_000},
-                ).x
+            result_x = solver.solve(
+                X_filter,
+                eg_read_counts,
+                initial_guess,
+                solver.SolveSpec(theta=theta),
+                config,
+            )
 
             rgr_indices_to_keep_one_run = set(
                 np.where(result_x >= config.deconvolution_filter_min_activity)[0]
@@ -1786,10 +1786,6 @@ class Locus:
             ``(opt_time, data_time)`` — wall-clock seconds spent in
             optimisation vs. data preparation.
         """
-        logger = logging.getLogger("price2")
-        opt_time = 0.0
-        data_time = 0.0
-
         # ── Build sparse system ──────────────────────────────────────────
         s1 = time.time()
         args_dict = self.to_sparse_args(runs)
@@ -1798,153 +1794,38 @@ class Locus:
         num_rgrs = args_dict["num_rgrs"]
         num_runs = args_dict["num_runs"]
         rgr_lengths = args_dict["rgr_lengths"]
-        s2 = time.time()
-        data_time += s2 - s1
+        data_time = time.time() - s1
 
-        n = num_rgrs * num_runs
-        bounds = [(config.pseudo_min, None)] * n
-        c = config.irls_huber_c
-        theta = _distribution_theta(config)
-
-        w_current = args_dict["initial_guess"]
-
-        n_outer = (
-            config.irls_huber_max_outer if max_outer is None else max_outer
-        )
-
-        # Inner-solver setup. "mu" swaps the scipy L-BFGS-B inner solve for
-        # multiplicative (weighted Richardson-Lucy) updates, optionally on GPU.
-        use_mu = config.inner_solver == "mu"
-        if use_mu:
-            from price2 import mu_solver
-
-            XT = X.T.tocsr()
-            gpu = None
-            if (
-                config.mu_gpu
-                and X.shape[0] >= config.mu_gpu_min_rows
-            ):
-                try:
-                    gpu = mu_solver.GpuMuSolver(
-                        X, y, config.mu_dtype
-                    )
-                except Exception as exc:  # torch/CUDA missing -> CPU fallback
-                    logger.warning("GPU MU unavailable (%s); using CPU", exc)
-
-        # Optional single-context GPU broker: when config carries a broker
-        # request queue, ship the whole system to the broker (one shared CUDA
-        # context for the entire pool) instead of each worker holding its own.
-        # The broker runs the full IRLS-Huber MU loop and returns w.
-        broker_req_q = getattr(config, "mu_broker_req_q", None)
-        use_broker = (
-            use_mu and broker_req_q is not None
-            and X.shape[0] >= config.mu_gpu_min_rows
-        )
-
+        # ── Solve ────────────────────────────────────────────────────────
         s1 = time.time()
-        # When the broker is active it runs the full IRLS-Huber MU loop on the
-        # GPU and returns w directly, so the local Python loop below is skipped
-        # (n_outer -> 0). Honour the caller's outer budget: the EM light M-step
-        # passes a small max_outer (already folded into n_outer above) instead
-        # of the config maximum.
-        if use_broker:
-            from price2.gpu_broker import BrokerClient, Params as _BParams
-            _bp = _BParams(
-                num_rgrs=num_rgrs, num_runs=num_runs, lam=config.lam,
-                pseudo_min=config.pseudo_min, huber_c=c,
-                max_outer=n_outer,
-                huber_tol=config.irls_huber_tol,
-                mu_inner_max_iter=config.mu_inner_max_iter,
-                mu_inner_tol=config.mu_inner_tol,
-                theta=theta)
-            w_current = BrokerClient(broker_req_q).solve(X, XT, y, _bp, w0=w_current)
-            broker_outer = n_outer
-            n_outer = 0
-        # Active-set-plateau stopping criterion (flag-gated). The IRLS-Huber
-        # rel-change metric keeps shrinking geometrically long after the set of
-        # ORFs above the activity filter has stabilised; stop once that set is
-        # unchanged for `irls_active_patience` consecutive outer iterations.
-        _use_active_stop = config.irls_stop_on_active_set
-        _active_patience = config.irls_active_patience
-        _thr_hi = config.deconvolution_filter_min_activity
-        _prev_active = None
-        _stable_count = 0
-        outer = -1
-        for outer in range(n_outer):
-            # Fitted values and Huber weights on (NB-aware) Pearson residuals
-            delta = np.asarray(X @ w_current).ravel()
-            weights = _huber_weights(y, delta, c, theta)
-
-            # Solve weighted group-LASSO count-model NLL
-            if use_mu:
-                mi = config.mu_inner_max_iter
-                mt = config.mu_inner_tol
-                if gpu is not None:
-                    w_new = gpu.solve(weights, w_current, config.lam,
-                                      num_rgrs, num_runs, config.pseudo_min, mi, mt,
-                                      theta=theta)
-                else:
-                    w_new = mu_solver.mu_inner_cpu(
-                        X, XT, y, weights, w_current, config.lam,
-                        num_rgrs, num_runs, config.pseudo_min, mi, mt,
-                        theta=theta)
-            else:
-                cb = Callback(w_current, config)
-                result = minimize(
-                    weighted_poisson_nll_grad_lasso,
-                    w_current,
-                    args=(X, y, weights, config.lam, num_rgrs, num_runs, theta),
-                    method="L-BFGS-B",
-                    jac=True,
-                    bounds=bounds,
-                    callback=cb,
-                    options={
-                        "maxiter": 10_000,
-                        "ftol": config.ftol,
-                        "gtol": config.gtol,
-                        "maxls": config.maxls,
-                    },
-                )
-                w_new = result.x
-
-            rel_change = np.linalg.norm(w_new - w_current) / max(
-                np.linalg.norm(w_current), 1e-14
-            )
-            w_current = w_new
-            if rel_change < config.irls_huber_tol:
-                break
-            if _use_active_stop:
-                _g = np.sqrt(
-                    (w_new.reshape(num_rgrs, num_runs) ** 2).sum(axis=1)
-                )
-                _active = frozenset(np.nonzero(_g > _thr_hi)[0].tolist())
-                if _active == _prev_active:
-                    _stable_count += 1
-                else:
-                    _stable_count = 0
-                _prev_active = _active
-                if _stable_count >= _active_patience:
-                    break
-
-        s2 = time.time()
-        opt_time += s2 - s1
-        self.irls_outer_iterations = (
-            broker_outer if use_broker else outer + 1
+        fit = solver.irls_huber(
+            X,
+            y,
+            args_dict["initial_guess"],
+            config,
+            num_rgrs,
+            num_runs,
+            max_outer=max_outer,
         )
+        opt_time = time.time() - s1
+        self.irls_outer_iterations = fit.outer_iterations
         logger.debug(
             "IRLS-Huber: converged in %d outer iterations (c=%.1f)",
-            outer + 1,
-            c,
+            fit.outer_iterations,
+            config.irls_huber_c,
         )
 
         # ── Store result ─────────────────────────────────────────────────
-        result_matrix = w_current.reshape(num_rgrs, num_runs)
+        result_matrix = fit.w.reshape(num_rgrs, num_runs)
         result_matrix[result_matrix <= config.pseudo_min] = 0
         self.result = result_matrix
 
-        # Store Huber weights for use in weighted LRT
-        delta = np.asarray(X @ w_current).ravel()
-        self.irls_huber_weights = _huber_weights(y, delta, c, theta)
+        # Huber weights at the clamped solution, for the weighted LRT.
+        theta = distribution_theta(config)
+        delta = np.asarray(X @ result_matrix.ravel()).ravel()
+        self.irls_huber_weights = huber_weights(
+            y, delta, config.irls_huber_c, theta
+        )
 
         # ── Post-optimisation RGR removal (same as deconvolve) ───────────
         if prune:
@@ -2332,92 +2213,55 @@ class Locus:
             Ribo-seq runs to include.
         """
 
-        weights = self.irls_huber_weights
-        theta = _distribution_theta(config)
-
-        def run_weighted_likelihood_optimization(initial_guess, bounds, optim_args):
-            X_lr, y_lr, ftol, gtol = optim_args
-            if config.inner_solver == "mu":
-                # Weighted Poisson MLE via MU. A (pmin, pmin) box pins a coord to
-                # ~0 (the reduced hypothesis); map those to a fixed_mask.
-                import types
-
-                from price2 import mu_solver
-
-                pmin = config.pseudo_min
-                fixed = np.array(
-                    [b[1] is not None and b[1] <= pmin for b in bounds])
-                w_lr = mu_solver.mu_inner_cpu(
-                    X_lr, XT_lr, y_lr, weights,
-                    np.asarray(initial_guess, dtype=np.float64), 0.0,
-                    len(initial_guess), 1, pmin,
-                    config.mu_inner_max_iter,
-                    config.mu_inner_tol,
-                    fixed_mask=fixed, theta=theta)
-                optimization_result = types.SimpleNamespace(x=w_lr, success=True)
-            else:
-                cb = Callback(initial_guess, config)
-                optimization_result = minimize(
-                    weighted_poisson_nll_grad,
-                    initial_guess,
-                    args=(X_lr, y_lr, weights, theta),
-                    method="L-BFGS-B",
-                    jac=True,
-                    bounds=bounds,
-                    callback=cb,
-                    options={
-                        "maxiter": 10_000,
-                        "ftol": ftol,
-                        "gtol": gtol,
-                        "maxls": config.maxls,
-                    },
-                )
-                if cb.success:
-                    optimization_result.success = True
-                if not optimization_result.success:
-                    raise RuntimeError(
-                        f"Weighted LRT filtering failed to converge. "
-                        f"{optimization_result.message}"
-                    )
-            ll = weighted_poisson_log_likelihood_sparse(
-                optimization_result.x, X_lr, y_lr, weights, theta
-            )
-            return optimization_result, ll
-
+        theta = distribution_theta(config)
         sparse_args = self.to_sparse_args(runs)
         X_lr = sparse_args["X"]
-        # Transpose once for the MU LRT solver (referenced by the closure above);
-        # only needed when inner_solver="mu".
-        XT_lr = (X_lr.T.tocsr()
-                 if config.inner_solver == "mu" else None)
         y_lr = sparse_args["y"]
         num_rgrs = sparse_args["num_rgrs"]
-        initial_guess = sparse_args["initial_guess"]
         num_runs = sparse_args["num_runs"]
-        args = (X_lr, y_lr, config.ftol, config.gtol)
+        initial_guess = sparse_args["initial_guess"]
+        # Transposed once for the many MU solves below.
+        XT_lr = X_lr.T.tocsr() if config.inner_solver == "mu" else None
 
-        # Recompute weights on the current sparse system
-        c = config.irls_huber_c
+        # Huber weights at the current fit, so that outlier EGs contribute
+        # less to the test statistic.
         delta = np.asarray(X_lr @ initial_guess).ravel()
-        weights = _huber_weights(y_lr, delta, c, theta)
+        weights = huber_weights(y_lr, delta, config.irls_huber_c, theta)
 
-        noise_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"}
+        def fit(
+            w0: np.ndarray, kept: set[int] | None
+        ) -> tuple[np.ndarray, float]:
+            """Weighted MLE with every RGR outside *kept* pinned at zero."""
+            fixed_mask = None
+            if kept is not None:
+                fixed = np.ones((num_rgrs, num_runs), dtype=bool)
+                fixed[list(kept)] = False
+                fixed_mask = fixed.ravel()
+            w = solver.solve(
+                X_lr,
+                y_lr,
+                w0,
+                solver.SolveSpec(
+                    theta=theta,
+                    weights=weights,
+                    fixed_mask=fixed_mask,
+                    strict=True,
+                ),
+                config,
+                XT=XT_lr,
+            )
+            log_likelihood = weighted_poisson_log_likelihood_sparse(
+                w, X_lr, y_lr, weights, theta
+            )
+            return w, log_likelihood
+
+        noise_rgr_indices = {
+            rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"
+        }
         test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
         keep_rgr_indices = noise_rgr_indices | test_rgr_indices
 
-        shape = initial_guess.reshape(num_rgrs, -1).shape
-
-        t = np.empty((), dtype=object)
-        t[()] = (config.pseudo_min, None)
-        bounds = list(np.full(initial_guess.shape, t))
-
-        optim_args = args
-
-        optimization_result, full_log_likelihood = run_weighted_likelihood_optimization(
-            initial_guess, bounds, optim_args
-        )
-
-        initial_guess = optimization_result.x
+        full_activities, full_log_likelihood = fit(initial_guess, None)
 
         rgr_ind_list = list(test_rgr_indices)
         try:
@@ -2426,95 +2270,58 @@ class Locus:
         except IndexError:
             rgr_ind_list = []
 
+        # The same set object: removals below shrink ``keep_rgr_indices`` too.
         full_rgr_ind = keep_rgr_indices
-        full_activities = initial_guess
+        log_alpha = np.log(config.likelihood_ratio_alpha)
         for rgr_ind in rgr_ind_list:
             reduced_rgr_ind = full_rgr_ind - {rgr_ind}
 
+            # Cheap test first: clamp this ORF without refitting.  The clamped
+            # likelihood bounds the refit reduced likelihood from below, so a
+            # "not significant" verdict here is final.
             reduced_activities = full_activities.copy().reshape(num_rgrs, -1)
             reduced_activities[rgr_ind] = config.pseudo_min
             reduced_activities = reduced_activities.flatten()
-
             reduced_log_likelihood = weighted_poisson_log_likelihood_sparse(
                 reduced_activities, X_lr, y_lr, weights, theta
             )
-
             log_p = wilks_test_p(
-                full_log_likelihood,
-                reduced_log_likelihood,
-                df_diff=num_runs,
+                full_log_likelihood, reduced_log_likelihood, df_diff=num_runs
             )
-            if log_p > np.log(config.likelihood_ratio_alpha):
+            if log_p > log_alpha:
+                full_rgr_ind.remove(rgr_ind)
+                full_activities = reduced_activities
+                full_log_likelihood = reduced_log_likelihood
+                continue
+
+            # Looks significant: confirm with properly refit full and reduced
+            # models.
+            full_activities, full_log_likelihood = fit(
+                full_activities, full_rgr_ind
+            )
+            reduced_activities, reduced_log_likelihood = fit(
+                full_activities, reduced_rgr_ind
+            )
+            log_p = wilks_test_p(
+                full_log_likelihood, reduced_log_likelihood, df_diff=num_runs
+            )
+            if log_p > log_alpha:
                 full_rgr_ind.remove(rgr_ind)
                 full_activities = reduced_activities
                 full_log_likelihood = reduced_log_likelihood
 
-            else:
-                # optimize full model
-                t = np.empty((), dtype=object)
-                t[()] = (config.pseudo_min, config.pseudo_min)
-                bounds = np.full(shape, t)
-                t[()] = (config.pseudo_min, None)
-                for index in full_rgr_ind:
-                    bounds[index] = t
-                bounds = list(bounds.flatten())
+        full_activities, full_log_likelihood = fit(full_activities, full_rgr_ind)
 
-                optimization_result, full_log_likelihood = (
-                    run_weighted_likelihood_optimization(
-                        full_activities, bounds, optim_args
-                    )
-                )
-                full_activities = optimization_result.x
-
-                # optimize reduced model
-                t = np.empty((), dtype=object)
-                t[()] = (config.pseudo_min, config.pseudo_min)
-                bounds = np.full(shape, t)
-                t[()] = (config.pseudo_min, None)
-                for index in reduced_rgr_ind:
-                    bounds[index] = t
-                bounds = list(bounds.flatten())
-                optimization_result_reduced, reduced_log_likelihood = (
-                    run_weighted_likelihood_optimization(
-                        full_activities, bounds, optim_args
-                    )
-                )
-
-                log_p = wilks_test_p(
-                    full_log_likelihood,
-                    reduced_log_likelihood,
-                    df_diff=num_runs,
-                )
-                if log_p > np.log(config.likelihood_ratio_alpha):
-                    full_rgr_ind.remove(rgr_ind)
-                    full_activities = optimization_result_reduced.x
-                    full_log_likelihood = reduced_log_likelihood
-
-        t = np.empty((), dtype=object)
-        t[()] = (config.pseudo_min, config.pseudo_min)
-        bounds = np.full(shape, t)
-        t[()] = (config.pseudo_min, None)
-        for index in full_rgr_ind:
-            bounds[index] = t
-        bounds = list(bounds.flatten())
-
-        optimization_result, full_log_likelihood = run_weighted_likelihood_optimization(
-            full_activities, bounds, optim_args
-        )
-        full_activities = optimization_result.x
-
-        result = optimization_result.x.reshape(num_rgrs, num_runs)
+        result = full_activities.reshape(num_rgrs, num_runs)
         result[result <= config.pseudo_min] = 0
         self.result = result
 
-        rgrs_to_remove = set()
-        for rgr in self.rgr_set:
-            if rgr.index not in keep_rgr_indices and rgr.type != "NOISE":
-                rgrs_to_remove.add(rgr)
-
+        rgrs_to_remove = {
+            rgr
+            for rgr in self.rgr_set
+            if rgr.index not in keep_rgr_indices and rgr.type != "NOISE"
+        }
         self.remove_rgrs(rgrs_to_remove, runs=runs)
-
-        self.runs = runs
 
     def estimate_activities(
         self,
@@ -2536,56 +2343,24 @@ class Locus:
         config : Config
             Configuration providing convergence and threshold parameters.
         """
-        theta = _distribution_theta(config)
+        theta = distribution_theta(config)
         rgrs_removed = True
         while rgrs_removed:
             args_dict = self.to_sparse_args(runs)
             X_ea = args_dict["X"]
             y_ea = args_dict["y"]
-            obj_fn = poisson_nll_grad
-            obj_args = (X_ea, y_ea, theta)
-
             num_runs = args_dict["num_runs"]
             num_rgrs = args_dict["num_rgrs"]
             initial_guess = args_dict["initial_guess"]
 
-            bounds = [(config.pseudo_min, None)] * len(initial_guess)
-
-            if config.inner_solver == "mu":
-                # Unregularised Poisson MLE via Richardson-Lucy (weights=1, lam=0),
-                # consistent with the MU group-LASSO deconvolution.
-                from price2 import mu_solver
-
-                XT_ea = X_ea.T.tocsr()
-                w_ea = mu_solver.mu_inner_cpu(
-                    X_ea, XT_ea, y_ea, np.ones(X_ea.shape[0]),
-                    initial_guess, 0.0, len(initial_guess), 1, config.pseudo_min,
-                    config.mu_inner_max_iter,
-                    config.mu_inner_tol, theta=theta)
-                tmp = w_ea.copy()
-            else:
-                cb = Callback(initial_guess, config)
-                optimization_result = minimize(
-                    obj_fn,
-                    initial_guess,
-                    args=obj_args,
-                    method="L-BFGS-B",
-                    jac=True,
-                    bounds=bounds,
-                    callback=cb,
-                    options={
-                        "maxiter": 10_000,
-                        "gtol": config.gtol,
-                        "ftol": config.ftol,
-                        "maxls": config.maxls,
-                    },
-                )
-                if cb.success:
-                    optimization_result.success = True
-                if not optimization_result.success:
-                    raise RuntimeError(f"Activity estimation failed to converge.")
-                tmp = optimization_result.x.copy()
-            tmp = tmp.reshape(num_rgrs, num_runs)
+            w = solver.solve(
+                X_ea,
+                y_ea,
+                initial_guess,
+                solver.SolveSpec(theta=theta, strict=True),
+                config,
+            )
+            tmp = w.copy().reshape(num_rgrs, num_runs)
             tmp[tmp <= config.pseudo_min] = 0
             self.result = tmp
 
@@ -2608,74 +2383,6 @@ class Locus:
         temp = {rgr.index: rgr for rgr in self.rgr_set}
         rgr_ids = [temp[i].id for i in range(len(temp))]
         self.result_df = pd.DataFrame(self.result, index=rgr_ids, columns=run_ids)
-
-
-# ------------------------------------------------------------------ #
-# Statistical tests                                                    #
-# ------------------------------------------------------------------ #
-
-
-def _chi2_logsf_asymptotic(x: float, k: int) -> float:
-    """Asymptotic log upper-tail of chi-squared for large x.
-
-    Uses the divergent asymptotic series for the upper regularized
-    incomplete gamma function Q(s, z) with s = k/2, z = x/2:
-
-        log Q(s, z) = -z + (s-1) log(z) - log Γ(s)
-                     + log(1 + (s-1)/z + (s-1)(s-2)/z² + ...)
-
-    The series is truncated before the terms start to grow.
-    """
-    s = 0.5 * k
-    z = 0.5 * x
-    leading = -z + (s - 1.0) * np.log(z) - gammaln(s)
-    term = 1.0
-    total = 1.0
-    prev_abs = 1.0
-    for n in range(1, 64):
-        term *= (s - n) / z
-        if abs(term) > prev_abs:
-            break
-        total += term
-        prev_abs = abs(term)
-        if abs(term) < 1e-16 * abs(total):
-            break
-    return leading + np.log(total)
-
-
-def wilks_test_p(
-    log_likelihood_full: float,
-    log_likelihood_reduced: float,
-    df_diff: int = 1,
-) -> float:
-    """Compute the log p-value for a Wilks likelihood-ratio test.
-
-    Parameters
-    ----------
-    log_likelihood_full : float
-        Log-likelihood of the full model.
-    log_likelihood_reduced : float
-        Log-likelihood of the reduced model.
-    df_diff : int
-        Difference in degrees of freedom.
-
-    Returns
-    -------
-    float
-        Log p-value (use ``np.exp(result)`` for the p-value).
-    """
-    λ = -2 * (log_likelihood_reduced - log_likelihood_full)
-    if λ <= 0:
-        return 0.0
-    logp = chi2.logsf(λ, df_diff)
-    if not np.isfinite(logp):
-        logp = _chi2_logsf_asymptotic(λ, df_diff)
-    return logp
-
-
-# ------------------------------------------------------------------ #
-# Sparse-matrix objective functions                                    #
-# ------------------------------------------------------------------ #
 
 
 def egs_to_sparse(
@@ -2768,268 +2475,6 @@ def egs_to_sparse(
     return X, y
 
 
-def _distribution_theta(config: Config) -> float | None:
-    """Return the negative-binomial dispersion θ, or ``None`` for Poisson.
-
-    Reads ``config.distribution``; when it is ``"nb"`` the fixed global
-    ``config.nb_dispersion`` is returned, otherwise ``None`` (the classic
-    Poisson model).  Every deconvolution solve site funnels the count-model
-    choice through this single helper, so the flag has one source of truth.
-
-    Parameters
-    ----------
-    config : Config
-        Parsed PRICE configuration object.
-
-    Returns
-    -------
-    float or None
-        The dispersion θ for the negative-binomial model, or ``None`` when
-        the Poisson model is selected.
-    """
-    if config.distribution == "nb":
-        return float(config.nb_dispersion)
-    return None
-
-
-def _huber_weights(
-    y: np.ndarray,
-    delta: np.ndarray,
-    c: float,
-    theta: float | None = None,
-) -> np.ndarray:
-    """Huber weights ``ω_i = min(1, c / |r_i|)`` on Pearson residuals.
-
-    The standardised residual is ``r_i = (y_i − δ_i) / √v_i`` with the
-    count-model variance ``v_i``: ``δ_i`` for the Poisson model
-    (``theta is None``) and ``δ_i + δ_i² / θ`` for the negative binomial.
-    Using the NB variance keeps the robustness threshold ``c`` on the same
-    standardised scale as the NB likelihood, so overdispersed-but-inlying
-    observations are not spuriously down-weighted.
-
-    Parameters
-    ----------
-    y : np.ndarray, shape ``(n_samples,)``
-        Observed read counts.
-    delta : np.ndarray, shape ``(n_samples,)``
-        Fitted means ``δ = X @ w``.
-    c : float
-        Huber tuning constant.
-    theta : float or None, optional
-        Negative-binomial dispersion.  ``None`` selects the Poisson variance.
-
-    Returns
-    -------
-    np.ndarray, shape ``(n_samples,)``
-        Per-observation Huber weights in ``(0, 1]``.
-    """
-    delta_safe = np.maximum(delta, 1e-14)
-    if theta is None:
-        var = delta_safe
-    else:
-        var = delta_safe + delta_safe**2 / theta
-    pearson_r = (y - delta_safe) / np.sqrt(var)
-    abs_r = np.abs(pearson_r)
-    return np.where(abs_r <= c, 1.0, c / np.maximum(abs_r, 1e-14))
-
-
-def poisson_nll_grad(
-    w: np.ndarray,
-    X: csr_matrix,
-    y: np.ndarray,
-    theta: float | None = None,
-) -> tuple[float, np.ndarray]:
-    """Identity-link Poisson (or negative-binomial) NLL and gradient.
-
-    With ``theta is None`` (default) this is the classic identity-link
-    Poisson model.  When ``theta`` is a positive float the identity-link
-    **negative-binomial** NLL and gradient are returned instead, with the
-    same mean but variance ``δ + δ²/θ``.  As ``θ → ∞`` the two coincide.
-
-    Model:  δ = X @ w  (mean of the count model)
-    Poisson loss:  Σ_i [δ_i − y_i · ln δ_i]        (zero-zero pairs excluded)
-    Poisson score: r_i = 1 − y_i / δ_i
-    NB loss:       Σ_i [(y_i + θ) · ln(θ + δ_i) − y_i · ln δ_i]
-    NB score:      r_i = (y_i + θ) / (θ + δ_i) − y_i / δ_i
-    Grad (both):   X.T @ r
-
-    (Constants that do not depend on ``w`` are dropped from the loss; they
-    do not affect the gradient or the minimiser.)
-
-    Parameters
-    ----------
-    w : np.ndarray, shape ``(n_features,)``
-        Current activity estimate (must satisfy ``w_j > 0`` via bounds).
-    X : csr_matrix, shape ``(n_samples, n_features)``
-        Non-negative sparse design matrix.
-    y : np.ndarray, shape ``(n_samples,)``
-        Observed read counts.
-    theta : float or None, optional
-        Negative-binomial dispersion.  ``None`` selects the Poisson model.
-
-    Returns
-    -------
-    loss : float
-    grad : np.ndarray, shape ``(n_features,)``
-    """
-    delta = np.asarray(X @ w).ravel()
-    active = ~((delta == 0.0) & (y == 0.0))
-    d_act = delta[active]
-    y_act = y[active]
-    if theta is None:
-        loss = float(d_act.sum() - (y_act * np.log(d_act)).sum())
-        r_act = 1.0 - y_act / d_act
-    else:
-        loss = float(
-            ((y_act + theta) * np.log(theta + d_act) - y_act * np.log(d_act)).sum()
-        )
-        r_act = (y_act + theta) / (theta + d_act) - y_act / d_act
-    r = np.zeros(len(y), dtype=np.float64)
-    r[active] = r_act
-    grad = np.asarray(X.T @ r).ravel()
-    return loss, grad
-
-
-def weighted_poisson_nll_grad(
-    w: np.ndarray,
-    X: csr_matrix,
-    y: np.ndarray,
-    weights: np.ndarray,
-    theta: float | None = None,
-) -> tuple[float, np.ndarray]:
-    """Weighted identity-link Poisson (or negative-binomial) NLL and gradient.
-
-    Poisson loss:  Σ_i ω_i · [δ_i − y_i · ln δ_i]
-    Poisson grad:  X.T @ [ω_i · (1 − y_i / δ_i)]
-    NB loss:       Σ_i ω_i · [(y_i + θ) · ln(θ + δ_i) − y_i · ln δ_i]
-    NB grad:       X.T @ [ω_i · ((y_i + θ) / (θ + δ_i) − y_i / δ_i)]
-
-    Parameters
-    ----------
-    w : np.ndarray, shape ``(n_features,)``
-    X : csr_matrix, shape ``(n_samples, n_features)``
-    y : np.ndarray, shape ``(n_samples,)``
-    weights : np.ndarray, shape ``(n_samples,)``
-        Per-observation Huber weights in [0, 1].
-    theta : float or None, optional
-        Negative-binomial dispersion.  ``None`` selects the Poisson model.
-
-    Returns
-    -------
-    loss : float
-    grad : np.ndarray, shape ``(n_features,)``
-    """
-    delta = np.asarray(X @ w).ravel()
-    active = ~((delta == 0.0) & (y == 0.0))
-    d_act = delta[active]
-    y_act = y[active]
-    w_act = weights[active]
-    if theta is None:
-        loss = float((w_act * (d_act - y_act * np.log(d_act))).sum())
-        r_act = w_act * (1.0 - y_act / d_act)
-    else:
-        loss = float(
-            (
-                w_act
-                * ((y_act + theta) * np.log(theta + d_act) - y_act * np.log(d_act))
-            ).sum()
-        )
-        r_act = w_act * ((y_act + theta) / (theta + d_act) - y_act / d_act)
-    r = np.zeros(len(y), dtype=np.float64)
-    r[active] = r_act
-    grad = np.asarray(X.T @ r).ravel()
-    return loss, grad
-
-
-def weighted_poisson_nll_grad_lasso(
-    w: np.ndarray,
-    X: csr_matrix,
-    y: np.ndarray,
-    weights: np.ndarray,
-    lam: float,
-    num_rgrs: int,
-    num_runs: int,
-    theta: float | None = None,
-) -> tuple[float, np.ndarray]:
-    """Weighted Poisson (or negative-binomial) NLL with group-LASSO penalty.
-
-    Parameters
-    ----------
-    w : np.ndarray, shape ``(num_rgrs * num_runs,)``
-    X : csr_matrix
-    y : np.ndarray
-    weights : np.ndarray, shape ``(n_samples,)``
-    lam : float
-    num_rgrs : int
-    num_runs : int
-    theta : float or None, optional
-        Negative-binomial dispersion.  ``None`` selects the Poisson model.
-
-    Returns
-    -------
-    loss : float
-    grad : np.ndarray, shape ``(num_rgrs * num_runs,)``
-    """
-    loss, grad = weighted_poisson_nll_grad(w, X, y, weights, theta)
-    W = w.reshape(num_rgrs, num_runs)
-    norms = np.sqrt((W**2).sum(axis=1))
-    safe_norms = np.maximum(norms, 1e-300)
-    loss += lam * norms.sum()
-    grad_penalty = lam * (W / safe_norms[:, None])
-    grad = grad + grad_penalty.ravel()
-    return loss, grad
-
-
-def weighted_poisson_log_likelihood_sparse(
-    w: np.ndarray,
-    X: csr_matrix,
-    y: np.ndarray,
-    weights: np.ndarray,
-    theta: float | None = None,
-) -> float:
-    """Weighted Poisson (or negative-binomial) log-likelihood for LRTs.
-
-    The full log-likelihood (including the ``y``-dependent normalising
-    constants) is returned so the Wilks statistic is comparable across
-    models.  The constants cancel in the full-vs-reduced difference, but
-    are kept so the absolute value is a genuine log-likelihood.
-
-    Parameters
-    ----------
-    w : np.ndarray, shape ``(n_features,)``
-    X : csr_matrix
-    y : np.ndarray
-    weights : np.ndarray, shape ``(n_samples,)``
-    theta : float or None, optional
-        Negative-binomial dispersion.  ``None`` selects the Poisson model.
-
-    Returns
-    -------
-    float
-        Weighted log-likelihood value.
-    """
-    delta = np.asarray(X @ w).ravel()
-    active = ~((delta == 0.0) & (y == 0.0))
-    d_act, y_act, w_act = delta[active], y[active], weights[active]
-    if theta is None:
-        return float(
-            (w_act * (y_act * np.log(d_act) - d_act - gammaln(y_act + 1))).sum()
-        )
-    return float(
-        (
-            w_act
-            * (
-                gammaln(y_act + theta)
-                - gammaln(theta)
-                - gammaln(y_act + 1)
-                + theta * np.log(theta)
-                + y_act * np.log(d_act)
-                - (y_act + theta) * np.log(theta + d_act)
-            )
-        ).sum()
-    )
-
-
 # ------------------------------------------------------------------ #
 # ORF detection                                                        #
 # ------------------------------------------------------------------ #
@@ -3078,56 +2523,3 @@ def find_orfs(
                         orf_iv_on_transcript.append((start, j + 3))
                 starts = []
     return orf_iv_on_transcript
-
-
-# ------------------------------------------------------------------ #
-# Optimisation callback                                                #
-# ------------------------------------------------------------------ #
-
-
-class Callback:
-    """Convergence callback for L-BFGS-B optimisation.
-
-    Monitors the relative change in activity estimates between
-    iterations and raises ``StopIteration`` when all active parameters
-    have converged according to ``config.stop_factor_relative``.
-
-    Attributes
-    ----------
-    success : bool
-        ``True`` when convergence was reached.
-    """
-
-    success: bool
-
-    def __init__(
-        self,
-        initial_guess: np.ndarray,
-        config: Config,
-    ) -> None:
-        self.config = config
-        self.previous = initial_guess
-        self.success = False
-
-    def __call__(self, new: np.ndarray) -> None:
-        """Evaluate convergence after an L-BFGS-B iteration.
-
-        Raises
-        ------
-        StopIteration
-            When convergence is detected.
-        """
-        tmp = self.previous / new
-        if not np.any(
-            (
-                (
-                    ((1 - self.config.stop_factor_relative) > tmp)
-                    | (tmp > (1 + self.config.stop_factor_relative))
-                )
-                & (new > self.config.rgr_min_activity)
-            )
-        ):
-            self.success = True
-            raise StopIteration
-        else:
-            self.previous = new
