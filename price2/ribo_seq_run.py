@@ -20,22 +20,11 @@ import numba
 import numpy as np
 import pysam
 
-from price2.cleavage_model import (
-    CleavageEstimator,
-    CleavageModel,
-    _MIN_COUNTED_ALNS,
-    _PLAUSIBLE_P_SITE_OFFSETS,
-)
-from price2.coverage_model import (
-    CoverageModel,
-    build_histograms,
-    _HIST_SIZE,
-    _MIN_READS,
-    _START_CODON_IDX,
-    _START_BODY_SLICE,
-    _STOP_PEAK_IDX,
-    _STOP_BODY_SLICE,
-)
+from price2.bam import cached_alignment_file
+from price2.cleavage_estimator import MIN_COUNTED_ALNS, CleavageEstimator
+from price2.cleavage_model import CleavageModel
+from price2.coverage_estimator import build_histograms
+from price2.coverage_model import HIST_SIZE, CoverageModel
 from price2.reference_annotation import ReferenceAnnotation
 
 logger = logging.getLogger(__name__)
@@ -193,7 +182,7 @@ def ribo_seq_runs_from_bams(
             for window in _coverage_windows(sample_bam)
         ]
         histograms = {
-            run_id: (np.zeros(_HIST_SIZE), np.zeros(_HIST_SIZE))
+            run_id: (np.zeros(HIST_SIZE), np.zeros(HIST_SIZE))
             for run_id, _, _, _, _ in fitted
         }
         with ctx.Pool(min(processes, len(tasks))) as pool:
@@ -242,22 +231,10 @@ def _assemble_run(
     coverage_model: CoverageModel,
 ) -> RiboSeqRun:
     """Bundle the fitted models of one run and score their quality."""
-    max_pos = int(np.argmax(cleavage_model.pl))
-    max_prob = float(cleavage_model.pl[max_pos])
     cleavage_ok = (
-        (max_pos in _PLAUSIBLE_P_SITE_OFFSETS)
-        and (max_prob >= 0.3)
-        and (counted_alns >= _MIN_COUNTED_ALNS)
+        cleavage_model.is_plausible() and counted_alns >= MIN_COUNTED_ALNS
     )
-
-    start_hist = coverage_model.start_hist
-    stop_hist = coverage_model.stop_hist
-    coverage_ok = (
-        start_hist[_START_CODON_IDX] >= _MIN_READS
-        and start_hist[_START_BODY_SLICE].sum() >= _MIN_READS
-        and stop_hist[_STOP_PEAK_IDX] >= _MIN_READS
-        and stop_hist[_STOP_BODY_SLICE].sum() >= _MIN_READS
-    )
+    coverage_ok = coverage_model.is_plausible()
 
     return RiboSeqRun(
         run_id,
@@ -294,17 +271,7 @@ _WORKER_CLEAVAGE: dict[str, CleavageModel] = {}
 _WORKER_END_TO_END: bool = False
 
 #: Per-worker state, populated after the fork.
-_WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
 _WORKER_THREADS: int = 1
-
-
-def _worker_bam(path: str) -> pysam.AlignmentFile:
-    """Return a per-worker BAM handle, so the index is loaded only once."""
-    handle = _WORKER_BAM.get(path)
-    if handle is None:
-        handle = pysam.AlignmentFile(path, "rb")
-        _WORKER_BAM[path] = handle
-    return handle
 
 
 def _init_cleavage_worker(threads: int) -> None:
@@ -367,7 +334,7 @@ def _coverage_window(
     run_id, sample_bam, window = task
     start_hist, stop_hist = build_histograms(
         _WORKER_RA,
-        _worker_bam(sample_bam),
+        cached_alignment_file(sample_bam),
         _WORKER_CLEAVAGE[run_id],
         window,
         end_to_end=_WORKER_END_TO_END,

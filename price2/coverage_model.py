@@ -6,20 +6,27 @@ coverage.  The resulting scale factors are used to weight the expected
 coverage profile when deconvolving overlapping ORFs.
 """
 
+import importlib
 import logging
-from enum import Enum
 from typing import Optional
 
-import matplotlib.pyplot as plt
-import pysam
 import numpy as np
 from scipy.stats import trim_mean
 
-from price2.cleavage_model import CleavageModel, read_in_cds_likelihood
-from price2.reference_annotation import ReferenceAnnotation
-from price2.ribo_seq_alignment import RiboSeqAlignment
-
 logger = logging.getLogger(__name__)
+
+#: Names that moved to other modules, resolved lazily for older imports.
+_MOVED = {
+    "CoveragePosition": "price2.coverage_position",
+    "build_histograms": "price2.coverage_estimator",
+    "_try_assign_p_site": "price2.coverage_estimator",
+}
+
+
+def __getattr__(name: str):
+    if name in _MOVED:
+        return getattr(importlib.import_module(_MOVED[name]), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -27,316 +34,28 @@ logger = logging.getLogger(__name__)
 
 # Size of the accumulation arrays used while building the P-site histograms.
 # Each bin corresponds to one codon (3 nt).
-_HIST_SIZE: int = 120
+HIST_SIZE: int = 120
 
 # Index in the start-histogram that corresponds to CDS position 0 (start codon).
-_START_CODON_IDX: int = 10
+START_CODON_IDX: int = 10
 
 # Slice over the ORF body in the start-histogram (codons 1 .. 100 of CDS).
-_START_BODY_SLICE: slice = slice(11, 111)
+START_BODY_SLICE: slice = slice(11, 111)
 
 # Index in the stop-histogram that corresponds to the last sense codon before
 # the stop codon (CDS position len(cds) − 3).
-_STOP_PEAK_IDX: int = 110
+STOP_PEAK_IDX: int = 110
 
 # Offset applied when filling the stop-histogram:
-#   index = p_site_cds_pos // 3 − len(cds) // 3 + _STOP_HIST_OFFSET
-# so that CDS codon len(cds)//3 maps to index _STOP_HIST_OFFSET.
-_STOP_HIST_OFFSET: int = 111
+#   index = p_site_cds_pos // 3 − len(cds) // 3 + STOP_HIST_OFFSET
+# so that CDS codon len(cds)//3 maps to index STOP_HIST_OFFSET.
+STOP_HIST_OFFSET: int = 111
 
 # Slice over the ORF body in the stop-histogram.
-_STOP_BODY_SLICE: slice = slice(_STOP_PEAK_IDX - 100, _STOP_PEAK_IDX)
+STOP_BODY_SLICE: slice = slice(STOP_PEAK_IDX - 100, STOP_PEAK_IDX)
 
 # Minimum number of reads required for reliable factor estimation.
-_MIN_READS: int = 100
-
-# A read is assigned to a P-site only if the most likely codon carries at
-# least this fraction of the total per-codon likelihood.
-_MIN_DOMINANT_FRACTION: float = 0.8
-
-# Minimum absolute likelihood for any codon to be considered.
-_MIN_CODON_LIKELIHOOD: float = 0.01
-
-# Window (in CDS positions) around the start codon used to select reads.
-_START_WINDOW: tuple[int, int] = (-30, 330)
-
-# Window (in CDS positions relative to CDS end) used to select reads for
-# the stop-codon histogram.
-_STOP_WINDOW: tuple[int, int] = (-330, 30)
-
-# ---------------------------------------------------------------------------
-# P-site lookup table
-# ---------------------------------------------------------------------------
-
-#: Sentinel stored in the P-site table for reads that carry no dominant codon.
-_REJECT: int = -1
-
-
-def _p_site_table(cm: CleavageModel) -> list[Optional[int]]:
-    """Return the memo table for *cm*, creating it on first use.
-
-    The table is indexed by ``(length * 3 + frame) * 2 + oua`` and holds the
-    winning codon index, :data:`_REJECT`, or ``None`` when the entry has not
-    been computed yet.  Its length bounds the read length at
-    ``len(pl) + len(pr) + 4``, the longest read the cleavage model can produce
-    (see :class:`~price2.cleavage_model.CleavageModel`); longer reads have zero
-    likelihood under the model.
-    """
-    try:
-        return cm._p_site_table_cache
-    except AttributeError:
-        max_len = len(cm.pl) + len(cm.pr) + 4
-        table: list[Optional[int]] = [None] * (max_len * 6)
-        cm._p_site_table_cache = table
-        return table
-
-
-def _compute_p_site_codon(
-    cm: CleavageModel, length: int, frame: int, oua: bool
-) -> int:
-    """Return the index of the codon carrying the P-site, or :data:`_REJECT`.
-
-    The per-codon likelihood vector of a read depends only on its matching
-    length, its reading frame and whether it carries an untemplated addition —
-    never on *where* the read sits.  Both acceptance criteria
-    (:data:`_MIN_CODON_LIKELIHOOD`, :data:`_MIN_DOMINANT_FRACTION`) and the
-    winning codon are therefore functions of that triple alone.
-
-    Relative to the *read start* the CDS codon boundaries sit at ``f0``,
-    ``f0 + 3``, ... with ``f0 = (-frame) % 3``, which is the offset convention
-    :func:`read_in_cds_likelihood` uses internally.  Only codons that fit
-    entirely inside the read can carry the P-site.
-    """
-    f0 = (-frame) % 3
-    n_codons = (length - f0) // 3
-    if n_codons <= 0:
-        return _REJECT
-
-    likelihoods = np.array(
-        [
-            read_in_cds_likelihood(
-                cm.pl, cm.pr, cm.pu, length, frame, oua, f0 + 3 * i, f0 + 3 * i + 3
-            )
-            for i in range(n_codons)
-        ]
-    )
-
-    if likelihoods.max() < _MIN_CODON_LIKELIHOOD:
-        return _REJECT
-
-    likelihoods /= likelihoods.sum()
-
-    if likelihoods.max() < _MIN_DOMINANT_FRACTION:
-        return _REJECT
-
-    return int(np.argmax(likelihoods))
-
-
-def _p_site_codon(cm: CleavageModel, length: int, frame: int, oua: int) -> int:
-    """Memoised :func:`_compute_p_site_codon`."""
-    table = _p_site_table(cm)
-    key = (length * 3 + frame) * 2 + oua
-    if key >= len(table):
-        # Longer than any read the cleavage model can generate.
-        return _REJECT
-    winner = table[key]
-    if winner is None:
-        winner = _compute_p_site_codon(cm, length, frame, bool(oua))
-        table[key] = winner
-    return winner
-
-
-# ---------------------------------------------------------------------------
-# Module-level helper
-# ---------------------------------------------------------------------------
-
-
-def _try_assign_p_site(
-    aln: RiboSeqAlignment,
-    ra: ReferenceAnnotation,
-    cm: CleavageModel,
-) -> Optional[tuple[object, tuple[int, int], int]]:
-    """Attempt to assign *aln* to a unique P-site on a coding transcript.
-
-    Parameters
-    ----------
-    aln : RiboSeqAlignment
-        Ribo-seq alignment to process.
-    ra : ReferenceAnnotation
-        Reference annotation used to look up overlapping coding transcripts.
-    cm : CleavageModel
-        Cleavage model providing per-codon likelihoods.
-
-    Returns
-    -------
-    tuple or None
-        ``(transcript, iv_on_cds, p_site_cds_pos)`` when the read can be
-        unambiguously assigned to a single CDS interval and a dominant P-site
-        position; ``None`` otherwise.
-
-        * *transcript* – the coding transcript the read was assigned to.
-        * *iv_on_cds* – ``(start, end)`` of the read projected onto CDS
-          coordinates (0-based, half-open).
-        * *p_site_cds_pos* – CDS coordinate of the inferred P-site.
-    """
-    transcript_candidates = ra.collect_coding_transcripts(aln.genomic_region)
-    if not transcript_candidates:
-        return None
-
-    # Project the read onto CDS coordinates for every candidate transcript.
-    # Accept only reads that map to exactly one unique CDS interval; a second
-    # successful projection already disqualifies the read.
-    transcript = None
-    iv_on_cds = None
-    for tr in transcript_candidates:
-        try:
-            iv_on_exons = tr.exons.map_to_local(aln.genomic_region)
-        except ValueError:
-            continue
-        if transcript is not None:
-            return None
-        transcript = tr
-        iv_on_cds = (
-            iv_on_exons[0] - tr.annotated_cds_iv[0],
-            iv_on_exons[1] - tr.annotated_cds_iv[0],
-        )
-
-    if transcript is None:
-        return None
-
-    frame = iv_on_cds[0] % 3
-    winner = _p_site_codon(cm, len(aln), frame, int(aln.untemplated_addition))
-    if winner == _REJECT:
-        return None
-
-    p_site_cds_pos = iv_on_cds[0] + (-frame) % 3 + winner * 3
-    return transcript, iv_on_cds, p_site_cds_pos
-
-
-def build_histograms(
-    ra: ReferenceAnnotation,
-    bam: "pysam.AlignmentFile",
-    cm: CleavageModel,
-    region: Optional[tuple[str, int, int]] = None,
-    end_to_end: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Accumulate P-site counts around the CDS start and stop codons.
-
-    Both histograms are filled in a single pass: assigning a read to a P-site
-    is by far the most expensive step and its result serves both.
-
-    A read contributes to the start histogram when its P-site falls within
-    :data:`_START_WINDOW` of CDS position 0 and its matching range does not
-    span the CDS end, and to the stop histogram when its P-site falls within
-    :data:`_STOP_WINDOW` of the CDS end and its matching range does not span
-    the CDS start.  The two conditions are not exclusive.
-
-    Only uniquely mapping reads (``NH`` tag equal to 1, or absent) are
-    counted, as in :class:`~price2.cleavage_model.CleavageModel`.
-
-    Parameters
-    ----------
-    ra : ReferenceAnnotation
-        Reference annotation.
-    bam : pysam.AlignmentFile
-        Open, coordinate-sorted BAM file.
-    cm : CleavageModel
-        Cleavage model used to assign reads to P-site positions.
-    region : tuple[str, int, int] or None, optional
-        Restrict the pass to ``(contig, start, end)``.  Requires *bam* to be
-        indexed.  Only reads whose leftmost mapped base lies in ``[start, end)``
-        are counted, so the histograms of a set of regions tiling the genome sum
-        to those of the whole file.  When *None* the whole file is scanned.
-    end_to_end : bool, optional
-        When ``True`` the BAM was mapped with ``--alignEndsType EndToEnd``;
-        the untemplated addition is recovered from the 5'-terminal mismatch
-        instead of a soft-clip (see :meth:`RiboSeqAlignment.from_pysam`).
-
-    Returns
-    -------
-    start_hist : np.ndarray
-        Histogram of shape ``(_HIST_SIZE,)``; index :data:`_START_CODON_IDX`
-        corresponds to CDS position 0.
-    stop_hist : np.ndarray
-        Histogram of shape ``(_HIST_SIZE,)``; index :data:`_STOP_PEAK_IDX`
-        corresponds to CDS position ``len(cds) − 3``.
-    """
-    start_hist = np.zeros(_HIST_SIZE)
-    stop_hist = np.zeros(_HIST_SIZE)
-    start_lo, start_hi = _START_WINDOW
-    stop_lo, stop_hi = _STOP_WINDOW
-
-    if region is None:
-        alns = bam.fetch(until_eof=True)
-        lo = hi = None
-    else:
-        contig, lo, hi = region
-        alns = bam.fetch(contig, lo, hi)
-
-    for raw_aln in alns:
-        if raw_aln.is_unmapped:
-            continue
-        # fetch() also yields reads that merely overlap the window; count each
-        # read in exactly one region.
-        if lo is not None and not (lo <= raw_aln.reference_start < hi):
-            continue
-        # Multimapping reads would contribute the same footprint to every
-        # locus they align to, biasing the metagene profile towards whatever
-        # is repeated in the genome.  Skipped here, before the alignment is
-        # built, as the cleavage model does with its own reads.
-        try:
-            if raw_aln.get_tag("NH") != 1:
-                continue
-        except KeyError:
-            pass  # no NH tag: treat as unique
-
-        result = _try_assign_p_site(
-            RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end), ra, cm
-        )
-        if result is None:
-            continue
-        transcript, iv_on_cds, p_site = result
-
-        coding_length = transcript.coding_length
-
-        if start_lo < iv_on_cds[0] < start_hi and not (
-            iv_on_cds[0] < coding_length < iv_on_cds[1]
-        ):
-            idx = p_site // 3 + _START_CODON_IDX
-            if 0 <= idx < _HIST_SIZE:
-                start_hist[idx] += 1
-
-        dist_to_end = iv_on_cds[1] - coding_length
-        if stop_lo < dist_to_end < stop_hi and not (iv_on_cds[0] < 0 < iv_on_cds[1]):
-            idx = p_site // 3 - coding_length // 3 + _STOP_HIST_OFFSET
-            if 0 <= idx < _HIST_SIZE:
-                stop_hist[idx] += 1
-
-    return start_hist, stop_hist
-
-
-# ---------------------------------------------------------------------------
-# Public classes
-# ---------------------------------------------------------------------------
-
-
-class CoveragePosition(Enum):
-    """Position category of a codon relative to its ORF.
-
-    Members
-    -------
-    start
-        The start (initiator) codon.
-    middle
-        Any codon in the ORF body.
-    stop
-        The codon immediately upstream of the stop codon.
-    """
-
-    start = 0
-    middle = 1
-    stop = 2
-
+MIN_READS: int = 100
 
 class CoverageModel:
     """Position-specific ribosome footprint enrichment model.
@@ -399,17 +118,17 @@ class CoverageModel:
         float
             Enrichment factor >= 1.
         """
-        peak_count = hist[_START_CODON_IDX]
-        body_counts = hist[_START_BODY_SLICE]
+        peak_count = hist[START_CODON_IDX]
+        body_counts = hist[START_BODY_SLICE]
 
-        if peak_count < _MIN_READS:
+        if peak_count < MIN_READS:
             logger.warning(
                 "Only %d reads at start codon position. "
                 "Low evidence for coverage model.  sample: %s",
                 int(peak_count),
                 bam_path,
             )
-        if body_counts.sum() < _MIN_READS:
+        if body_counts.sum() < MIN_READS:
             logger.warning(
                 "Only %d reads at middle codon positions. "
                 "Low evidence for coverage model.  sample: %s",
@@ -446,17 +165,17 @@ class CoverageModel:
         float
             Enrichment factor >= 1.
         """
-        peak_count = hist[_STOP_PEAK_IDX]
-        body_counts = hist[_STOP_BODY_SLICE]
+        peak_count = hist[STOP_PEAK_IDX]
+        body_counts = hist[STOP_BODY_SLICE]
 
-        if peak_count < _MIN_READS:
+        if peak_count < MIN_READS:
             logger.warning(
                 "Only %d reads at stop codon position. "
                 "Low evidence for coverage model.  sample: %s",
                 int(peak_count),
                 bam_path,
             )
-        if body_counts.sum() < _MIN_READS:
+        if body_counts.sum() < MIN_READS:
             logger.warning(
                 "Only %d reads at middle codon positions. "
                 "Low evidence for coverage model.  sample: %s",
@@ -569,10 +288,10 @@ class CoverageModel:
         ----------
         start_hist : np.ndarray
             P-site count histogram around the start codon, shape
-            ``(_HIST_SIZE,)``.
+            ``(HIST_SIZE,)``.
         stop_hist : np.ndarray
             P-site count histogram around the stop codon, shape
-            ``(_HIST_SIZE,)``.
+            ``(HIST_SIZE,)``.
         run_id : str, optional
             Sample identifier used in warning messages.
 
@@ -589,108 +308,25 @@ class CoverageModel:
     # Public API
     # ------------------------------------------------------------------
 
-    def plot(
-        self,
-        axes: Optional[tuple] = None,
-    ) -> plt.Figure:
+    def is_plausible(self) -> bool:
+        """Whether both histograms carry enough reads for a trustworthy model.
+
+        Requires at least :data:`MIN_READS` P-sites on the start codon, on
+        the stop peak, and over each ORF body.
+        """
+        return bool(
+            self.start_hist[START_CODON_IDX] >= MIN_READS
+            and self.start_hist[START_BODY_SLICE].sum() >= MIN_READS
+            and self.stop_hist[STOP_PEAK_IDX] >= MIN_READS
+            and self.stop_hist[STOP_BODY_SLICE].sum() >= MIN_READS
+        )
+
+    def plot(self, axes: Optional[tuple] = None):
         """Plot the start- and stop-codon P-site histograms.
 
-        Two side-by-side panels: CDS start (left) and CDS stop (right).
-        Each panel highlights the peak position in red and annotates the
-        corresponding enrichment factor.
-
-        Parameters
-        ----------
-        axes : tuple of (Axes, Axes) or None, optional
-            A ``(ax_start, ax_stop)`` tuple to draw on.  A new figure is
-            created when *None*.
-
-        Returns
-        -------
-        matplotlib.figure.Figure
-            The figure containing the two panels.
+        See :func:`price2.plotting.plot_coverage`.
         """
-        if axes is None:
-            fig, (ax_start, ax_stop) = plt.subplots(1, 2, figsize=(14, 5))
-        else:
-            ax_start, ax_stop = axes
-            fig = ax_start.get_figure()
+        from price2.plotting import plot_coverage
 
-        # Start-codon histogram (x-axis in codon positions)
-        x_start = np.arange(_HIST_SIZE) - _START_CODON_IDX
-
-        # Determine which body positions survive the 50% trim.
-        start_body_idx = np.arange(_HIST_SIZE)[_START_BODY_SLICE]
-        start_body_vals = self.start_hist[_START_BODY_SLICE]
-        q25, q75 = np.percentile(start_body_vals, [25, 75])
-        start_kept = set(
-            start_body_idx[(start_body_vals >= q25) & (start_body_vals <= q75)]
-        )
-
-        colors_start = []
-        for i in range(_HIST_SIZE):
-            if i == _START_CODON_IDX:
-                colors_start.append("tab:red")
-            elif i in start_kept:
-                colors_start.append("steelblue")
-            elif i in set(start_body_idx):
-                colors_start.append("lightsteelblue")
-            else:
-                colors_start.append("lightsteelblue")
-
-        ax_start.bar(x_start, self.start_hist, width=1, color=colors_start)
-        ax_start.set_xlabel("Codon position relative to translation start")
-        ax_start.set_ylabel("P-site read count")
-        ax_start.set_title("CDS start")
-        ax_start.set_xlim(-12, 105)
-        ax_start.text(
-            0.95,
-            0.95,
-            f"start factor = {self.start_factor:.2f}",
-            transform=ax_start.transAxes,
-            ha="right",
-            va="top",
-            fontsize=10,
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-        )
-
-        # Stop-codon histogram (x-axis in codon positions)
-        x_stop = np.arange(_HIST_SIZE) - _STOP_HIST_OFFSET
-
-        # Determine which body positions survive the 50% trim.
-        stop_body_idx = np.arange(_HIST_SIZE)[_STOP_BODY_SLICE]
-        stop_body_vals = self.stop_hist[_STOP_BODY_SLICE]
-        q25, q75 = np.percentile(stop_body_vals, [25, 75])
-        stop_kept = set(
-            stop_body_idx[(stop_body_vals >= q25) & (stop_body_vals <= q75)]
-        )
-
-        colors_stop = []
-        for i in range(_HIST_SIZE):
-            if i == _STOP_PEAK_IDX:
-                colors_stop.append("tab:red")
-            elif i in stop_kept:
-                colors_stop.append("steelblue")
-            elif i in set(stop_body_idx):
-                colors_stop.append("lightsteelblue")
-            else:
-                colors_stop.append("lightsteelblue")
-
-        ax_stop.bar(x_stop, self.stop_hist, width=1, color=colors_stop)
-        ax_stop.set_xlabel("Codon position relative to translation end")
-        ax_stop.set_ylabel("P-site read count")
-        ax_stop.set_title("CDS stop")
-        ax_stop.set_xlim(-105, 12)
-        ax_stop.text(
-            0.3,
-            0.95,
-            f"stop factor = {self.stop_factor:.2f}",
-            transform=ax_stop.transAxes,
-            ha="right",
-            va="top",
-            fontsize=10,
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-        )
-
-        return fig
+        return plot_coverage(self, axes)
 

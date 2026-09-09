@@ -30,7 +30,7 @@ from price2 import likelihood
 from price2 import multimap
 from price2 import solver
 from price2.config import Config
-from price2.coverage_model import CoveragePosition
+from price2.coverage_position import CoveragePosition
 from price2.equivalence_groups import EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.genomic_region import GenomicRegion

@@ -19,6 +19,7 @@ import multiprocessing as mp
 from collections import defaultdict
 
 from price2 import database
+from price2.bam import cached_alignment_file, first_mapped_read_has_md
 from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import ribo_seq_runs_from_bams
@@ -28,35 +29,6 @@ from price2.genomic_region import GenomicRegion
 from price2.config import Config
 
 logger = logging.getLogger(__name__)
-
-
-def _first_mapped_read_has_md(bam_path: str) -> bool | None:
-    """Return whether the first mapped read of a BAM carries an ``MD`` tag.
-
-    ``None`` when the file cannot be opened or contains no mapped reads.  STAR
-    writes ``MD`` for every alignment or for none, so the first mapped read is
-    representative of the whole file.
-
-    Parameters
-    ----------
-    bam_path : str
-        Path to the BAM file.
-
-    Returns
-    -------
-    bool or None
-        ``True``/``False`` if the presence of an ``MD`` tag could be
-        determined; ``None`` otherwise.
-    """
-    try:
-        with pysam.AlignmentFile(bam_path, "rb") as bam:
-            for aln in bam.fetch(until_eof=True):
-                if aln.is_unmapped:
-                    continue
-                return aln.has_tag("MD")
-    except (OSError, ValueError):
-        return None
-    return None
 
 
 class DataCollector:
@@ -135,7 +107,7 @@ class DataCollector:
 
         if self.config.align_ends_type == "endtoend":
             for bam_id in sorted(bam_ids):
-                if _first_mapped_read_has_md(f"{self.bam_dir}/{bam_id}.bam") is False:
+                if first_mapped_read_has_md(f"{self.bam_dir}/{bam_id}.bam") is False:
                     logger.warning(
                         "align_ends_type='endtoend' but BAM %s has no MD tag. "
                         "The untemplated addition (RT nucleotide) is recovered "
@@ -588,10 +560,6 @@ def build_rgrs(
 #: :meth:`DataCollector.collect_mappings` before the pool is created.
 _WORKER_LOCI: list[Locus] = []
 
-#: Per-process cache of the open BAM handle, keyed by run id.  Chunks of one
-#: run land on the same worker repeatedly, so the index is parsed once.
-_WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
-
 #: Layout of the collapsed-reads blob.  ``count`` is how many identical
 #: mappings collapse into one key; on deep, non-deduplicated libraries a
 #: single key can exceed 65,535, so it must be wider than ``uint16``.
@@ -603,18 +571,6 @@ _READS_COLUMNS = (
     ("unique", bool),
     ("count", np.uint32),
 )
-
-
-def _worker_bam(bam_dir: str, run_id: str) -> pysam.AlignmentFile:
-    """Return this process's open handle for ``run_id``, opening it once."""
-    handle = _WORKER_BAM.get(run_id)
-    if handle is None:
-        for stale in _WORKER_BAM.values():
-            stale.close()
-        _WORKER_BAM.clear()
-        handle = pysam.AlignmentFile(f"{bam_dir}/{run_id}.bam", "rb")
-        _WORKER_BAM[run_id] = handle
-    return handle
 
 
 def _slow_path_transcripts(blocks: list, locus: Locus) -> list:
@@ -751,7 +707,9 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     qname_hash = multimap.qname_hash
     group_key = multimap.group_key
     bisect_right = bisect.bisect_right
-    sf = _worker_bam(bam_dir, run_id)
+    # One handle per worker: chunks of one run land on the same worker
+    # repeatedly, so the index is parsed once.
+    sf = cached_alignment_file(f"{bam_dir}/{run_id}.bam", exclusive=True)
 
     for locus_idx in range(lo, hi):
         locus = _WORKER_LOCI[locus_idx]
