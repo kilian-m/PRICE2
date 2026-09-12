@@ -94,46 +94,54 @@ class CoverageModel:
             self.stop_hist = stop_hist
 
     # ------------------------------------------------------------------
-    # Alternative constructors
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_start_factor(hist: np.ndarray, bam_path: str) -> float:
-        """Compute the start-codon enrichment factor from *hist*.
+    def _enrichment_factor(
+        hist: np.ndarray, peak_idx: int, body: slice, label: str, run_id: str
+    ) -> float:
+        """Enrichment of the P-site count at *peak_idx* over the ORF body.
+
+        The body coverage is the 25 %-trimmed mean of ``hist[body]``.  A
+        body without coverage gives a factor of 1, and the factor is
+        floored at 1 so a depleted peak never down-weights the position.
 
         Parameters
         ----------
         hist : np.ndarray
-            Start-codon P-site histogram as returned by
-            :func:`build_histograms`.
-        bam_path : str
-            BAM path used only for warning messages.
+            P-site histogram as returned by :func:`build_histograms`.
+        peak_idx : int
+            Histogram index of the peak position.
+        body : slice
+            Histogram slice over the ORF body.
+        label : str
+            Name of the peak position used in warning messages.
+        run_id : str
+            Sample identifier used only in warning messages.
 
         Returns
         -------
         float
             Enrichment factor >= 1.
         """
-        peak_count = hist[START_CODON_IDX]
-        body_counts = hist[START_BODY_SLICE]
+        peak_count = hist[peak_idx]
+        body_counts = hist[body]
 
         if peak_count < MIN_READS:
             logger.warning(
-                "Only %d reads at start codon position. "
+                "Only %d reads at %s position. "
                 "Low evidence for coverage model.  sample: %s",
                 int(peak_count),
-                bam_path,
+                label,
+                run_id,
             )
         if body_counts.sum() < MIN_READS:
             logger.warning(
                 "Only %d reads at middle codon positions. "
                 "Low evidence for coverage model.  sample: %s",
                 int(body_counts.sum()),
-                bam_path,
+                run_id,
             )
 
         with np.errstate(divide="raise"):
@@ -143,55 +151,6 @@ class CoverageModel:
                 )
             except (FloatingPointError, ValueError):
                 factor = 1.0
-            except ZeroDivisionError:
-                factor = 1000.0
-
-        return max(1.0, factor)
-
-    @staticmethod
-    def _compute_stop_factor(hist: np.ndarray, bam_path: str) -> float:
-        """Compute the stop-codon enrichment factor from *hist*.
-
-        Parameters
-        ----------
-        hist : np.ndarray
-            Stop-codon P-site histogram as returned by
-            :func:`build_histograms`.
-        bam_path : str
-            BAM path used only for warning messages.
-
-        Returns
-        -------
-        float
-            Enrichment factor >= 1.
-        """
-        peak_count = hist[STOP_PEAK_IDX]
-        body_counts = hist[STOP_BODY_SLICE]
-
-        if peak_count < MIN_READS:
-            logger.warning(
-                "Only %d reads at stop codon position. "
-                "Low evidence for coverage model.  sample: %s",
-                int(peak_count),
-                bam_path,
-            )
-        if body_counts.sum() < MIN_READS:
-            logger.warning(
-                "Only %d reads at middle codon positions. "
-                "Low evidence for coverage model.  sample: %s",
-                int(body_counts.sum()),
-                bam_path,
-            )
-
-        with np.errstate(divide="raise"):
-            try:
-                factor = float(
-                    peak_count / trim_mean(body_counts, proportiontocut=0.25)
-                )
-            except (FloatingPointError, ValueError):
-                factor = 1.0
-            except ZeroDivisionError:
-                factor = 1000.0
 
         return max(1.0, factor)
 
@@ -300,8 +259,12 @@ class CoverageModel:
         CoverageModel
             Model with all attributes (including optional histograms) set.
         """
-        start_factor = cls._compute_start_factor(start_hist, run_id)
-        stop_factor = cls._compute_stop_factor(stop_hist, run_id)
+        start_factor = cls._enrichment_factor(
+            start_hist, START_CODON_IDX, START_BODY_SLICE, "start codon", run_id
+        )
+        stop_factor = cls._enrichment_factor(
+            stop_hist, STOP_PEAK_IDX, STOP_BODY_SLICE, "stop codon", run_id
+        )
         return cls(start_factor, stop_factor, start_hist, stop_hist)
 
     # ------------------------------------------------------------------
