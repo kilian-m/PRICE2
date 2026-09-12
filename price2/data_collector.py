@@ -19,11 +19,15 @@ import multiprocessing as mp
 from collections import defaultdict
 
 from price2 import database
-from price2.bam import cached_alignment_file, first_mapped_read_has_md
+from price2.bam import (
+    cached_alignment_file,
+    first_mapped_read_has_md,
+    footprint,
+    is_unique,
+)
 from price2 import multimap
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_run import ribo_seq_runs_from_bams
-from price2.ribo_seq_alignment import five_prime_terminal_mismatch
 from price2.locus import Locus
 from price2.genomic_region import GenomicRegion
 from price2.config import Config
@@ -516,39 +520,6 @@ def _slow_path_transcripts(blocks: list, locus: Locus) -> list:
     return transcripts
 
 
-def _trim_blocks_5p(blocks: list, is_minus: bool) -> list:
-    """Drop the single 5'-most reference base from a read's reference blocks.
-
-    The EndToEnd counterpart of Local's implicit soft-clip removal: when the
-    force-aligned RT base is recovered as a 5'-terminal mismatch it must be
-    stripped from :meth:`pysam.AlignedSegment.get_blocks` output so the stored
-    footprint matches the Local geometry.  On ``+`` strand the 5' end is the
-    first block's start; on ``-`` strand it is the last block's end.  A block
-    reduced to length zero is dropped.
-
-    Parameters
-    ----------
-    blocks : list of (int, int)
-        Reference blocks in chromosome order.
-    is_minus : bool
-        ``True`` for reverse-strand reads.
-
-    Returns
-    -------
-    list of (int, int)
-        A new block list with one 5'-end base removed.
-    """
-    if is_minus:
-        s, e = blocks[-1]
-        if e - s <= 1:
-            return blocks[:-1]
-        return blocks[:-1] + [(s, e - 1)]
-    s, e = blocks[0]
-    if e - s <= 1:
-        return blocks[1:]
-    return [(s + 1, e)] + blocks[1:]
-
-
 def collect_mappings_chunk(data: tuple) -> tuple:
     """Map one run's reads against a contiguous chunk of loci.
 
@@ -556,9 +527,10 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     themselves are read from the :data:`_WORKER_LOCI` module global, which
     forked workers inherit without pickling.
 
-    Most alignments never need a :class:`RiboSeqAlignment` or a
-    :meth:`~price2.genomic_region.GenomicRegion.map_to_local` call.  A read
-    that is a single block maps into exactly the transcripts common to
+    Alignments are handled as the blocks of :func:`price2.bam.footprint`;
+    most never need a :class:`~price2.ribo_seq_alignment.RiboSeqAlignment`
+    or a :meth:`~price2.genomic_region.GenomicRegion.map_to_local` call.  A
+    read that is a single block maps into exactly the transcripts common to
     every breakpoint step it touches, provided those steps cover it without
     a gap (a transcript's exons are separated by introns, so a gapless
     covered stretch lies inside one exon).  A read that is two blocks maps
@@ -627,32 +599,15 @@ def collect_mappings_chunk(data: tuple) -> tuple:
             if alignment.is_unmapped or alignment.is_reverse != is_minus:
                 continue
 
-            if drop_multimap:
-                # Checked before the transcript mapping: the alignment is
-                # dropped outright, so none of that work is needed.
-                try:
-                    if alignment.get_tag("NH") != 1:
-                        continue
-                except KeyError:
-                    pass  # no NH tag: treat as unique
-
-            cigar = alignment.cigartuples
-            if not cigar:
+            # Checked before the transcript mapping: the alignment is
+            # dropped outright, so none of that work is needed.
+            if drop_multimap and not is_unique(alignment):
                 continue
-            blocks = alignment.get_blocks()
-            if end_to_end:
-                # EndToEnd: the RT base is force-aligned as a 5'-terminal
-                # mismatch. Recover it and trim that base so the footprint
-                # matches what Local's soft-clip would have left behind.
-                ua = five_prime_terminal_mismatch(alignment, is_minus)
-                if ua:
-                    blocks = _trim_blocks_5p(blocks, is_minus)
-                    if not blocks:
-                        continue
-            else:
-                # Local: a 1-nt soft clip at the read's 5' end.
-                ua = cigar[-1] == (4, 1) if is_minus else cigar[0] == (4, 1)
 
+            found = footprint(alignment, end_to_end)
+            if found is None:
+                continue
+            blocks, ua = found
             n_blocks = len(blocks)
 
             if n_blocks == 1 and single_block_fast:
@@ -693,13 +648,8 @@ def collect_mappings_chunk(data: tuple) -> tuple:
             if not transcripts_ids:
                 continue
 
-            if drop_multimap:
-                unique = True  # multimapping alignments were skipped above
-            else:
-                try:
-                    unique = alignment.get_tag("NH") == 1
-                except KeyError:
-                    unique = True
+            # Multimapping alignments were skipped above when dropping them.
+            unique = drop_multimap or is_unique(alignment)
 
             ivs_tuple = tuple(blocks)
             mappings_dict[(ua, unique, ivs_tuple)] += 1

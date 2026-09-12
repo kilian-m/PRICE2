@@ -117,7 +117,7 @@ class CleavageEstimator:
         end_to_end : bool, optional
             When ``True`` the BAM was mapped with ``--alignEndsType EndToEnd``;
             the untemplated addition is recovered from the 5'-terminal mismatch
-            instead of a soft-clip (see :meth:`RiboSeqAlignment.from_pysam`).
+            instead of a soft-clip (see :func:`price2.bam.footprint`).
         """
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
         self.dist_starts = np.zeros(shape=(200,), dtype=np.int32)
@@ -129,8 +129,9 @@ class CleavageEstimator:
         with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
             for raw_aln in iter_mapped(bam):
                 aln = RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end)
-
-                if not aln.unique():
+                if aln is None:
+                    continue
+                if not aln.unique:
                     self.not_unique += 1
                     continue
                 if not min_considered_length <= len(aln) < max_considered_length:

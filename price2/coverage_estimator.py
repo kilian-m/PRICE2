@@ -215,7 +215,7 @@ def build_histograms(
     end_to_end : bool, optional
         When ``True`` the BAM was mapped with ``--alignEndsType EndToEnd``;
         the untemplated addition is recovered from the 5'-terminal mismatch
-        instead of a soft-clip (see :meth:`RiboSeqAlignment.from_pysam`).
+        instead of a soft-clip (see :func:`price2.bam.footprint`).
 
     Returns
     -------
@@ -239,9 +239,10 @@ def build_histograms(
         if not is_unique(raw_aln):
             continue
 
-        result = _try_assign_p_site(
-            RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end), ra, cm
-        )
+        aln = RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end)
+        if aln is None:
+            continue
+        result = _try_assign_p_site(aln, ra, cm)
         if result is None:
             continue
         transcript, iv_on_cds, p_site = result

@@ -186,7 +186,7 @@ def load_reads(
                 )
                 region_cache[sig] = gr
             rsas_run.append(
-                RiboSeqAlignment.from_region(
+                RiboSeqAlignment(
                     gr,
                     untemplated_addition=bool(uas[b]),
                     unique=bool(uniques[b]),
@@ -527,7 +527,7 @@ def assign_reads_to_egs(
                         -1,
                     )
 
-            if run_mm is not None and not rsa.unique():
+            if run_mm is not None and not rsa.unique:
                 gk = multimap.alignment_group_key(rsa)
                 slot = run_mm.get(gk)
                 if slot is not None:
