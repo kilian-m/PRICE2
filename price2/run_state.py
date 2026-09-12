@@ -20,9 +20,10 @@ the configuration:
 ``deconvolution_fingerprint``
     Over every other option that can change a result (filters, penalties,
     solver settings, the EM parameters, the export selection) plus the
-    PRICE2 version.  A change here leaves the collected data usable but
-    invalidates the deconvolution: its outputs, its per-locus progress and
-    the EM checkpoint are dropped and it starts over.
+    PRICE2 version and the layout of the prepared-locus blobs.  A change
+    here leaves the collected data usable but invalidates the
+    deconvolution: its outputs, its per-locus progress and the EM
+    checkpoint are dropped and it starts over.
 
 Path options are fingerprinted by their *basename*, so relocating an
 analysis directory (staging it on a compute node's local disk, say) does not
@@ -171,8 +172,9 @@ def deconvolution_fingerprint(config: Config) -> str:
     """Hash every option that can change a deconvolution result.
 
     Includes the collection options (a different database implies a
-    different deconvolution) and the PRICE2 version, since the cached
-    per-locus state of an EM run is pickled and therefore version-bound.
+    different deconvolution), the PRICE2 version and the layout version of
+    the prepared-locus blobs, since the cached per-locus state of an EM run
+    is pickled and therefore bound to both.
 
     Parameters
     ----------
@@ -190,6 +192,7 @@ def deconvolution_fingerprint(config: Config) -> str:
         if f.name not in _IGNORED_FIELDS
     ]
     items.append(("price2_version", _price2_version()))
+    items.append(("prepared_loci_format", database.PREPARED_LOCI_FORMAT))
     return _digest(items)
 
 

@@ -507,10 +507,10 @@ def _load_locus(
                     db_path, drop_multimappers=not config.multimap_em
                 )
         # Keep the perf columns aligned with the prepare path; the skipped
-        # stages report zero time.  A light locus carries no rgr_set/egs, so
+        # stages report zero time.  A light locus carries no rgrs/egs, so
         # the counts come off its routing cache.
-        if loc.rgr_set is not None:
-            n_rgrs = len(loc.rgr_set)
+        if loc.rgrs is not None:
+            n_rgrs = len(loc.rgrs)
             n_egs = sum(len(egs) for egs in loc.egs.values())
         else:
             n_rgrs = loc.eg_cache.num_rgrs
@@ -559,7 +559,7 @@ def _prepare_locus(
     with perf.timed("load_reads_time"):
         loc.get_reads_from_db(db_path, drop_multimappers=not config.multimap_em)
 
-    perf["unfiltered_rgr_count"] = len(loc.rgr_set)
+    perf["unfiltered_rgr_count"] = len(loc.rgrs)
     with perf.timed("assign_reads_time"):
         if config.coverage_filter or config.deconvolution_filter:
             loc.make_well_fitting_reads(runs)
@@ -569,17 +569,16 @@ def _prepare_locus(
             loc.coverage_filter_rgrs(config)
         if export_steps:
             outputs.update(export.step_outputs(loc, config, "coverage_filtered"))
-        perf["filtered_coverage_rgr_count"] = len(loc.rgr_set)
+        perf["filtered_coverage_rgr_count"] = len(loc.rgrs)
 
     with perf.timed("filter_2_time"):
         if config.deconvolution_filter:
             loc.deconvolution_filter_rgrs(config)
-        perf["filtered_deconvolution_rgr_count"] = len(loc.rgr_set)
+        perf["filtered_deconvolution_rgr_count"] = len(loc.rgrs)
     if export_steps:
         outputs.update(export.step_outputs(loc, config, "deconvolution_filtered"))
 
-    for tr in loc.transcripts:
-        tr.update_with_filtered_orfs(loc.rgr_set)
+    loc.update_transcript_rgrs()
     with perf.timed("eg_time"):
         loc.egs = make_equivalence_groups(loc, runs)
     perf["eg_count"] = sum(len(egs) for egs in loc.egs.values())
@@ -653,15 +652,15 @@ def _full_pass(
     with perf.timed("optimization_time"):
         loc.deconvolve(config, runs=runs)
     perf["irls_outer_iterations"] = loc.irls_outer_iterations
-    perf["filtered_deconvoluted_rgr_count"] = len(loc.rgr_set)
+    perf["filtered_deconvoluted_rgr_count"] = len(loc.rgrs)
     if config.export_all_steps:
         outputs.update(export.step_outputs(loc, config, "deconvoluted"))
 
     if config.likelihood_ratio_filter:
         with perf.timed("likelihood_ratio_time"):
             loc.likelihood_ratio_filtering(config, runs)
-        perf["filtered_lrt_rgr_count"] = len(loc.rgr_set)
-        perf["orf_count"] = sum(1 for rgr in loc.rgr_set if rgr.type == "ORF")
+        perf["filtered_lrt_rgr_count"] = len(loc.rgrs)
+        perf["orf_count"] = sum(1 for rgr in loc.rgrs if rgr.type == "ORF")
 
     with perf.timed("activity_time"):
         loc.estimate_activities(runs, config)

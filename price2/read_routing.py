@@ -400,14 +400,11 @@ def count_well_fitting_reads(loc: Locus, runs: list[RiboSeqRun]) -> None:
     well_fitting_rcs = {}
     for run in runs:
         well_fitting_rcs[run.id] = {}
-        for rgr in loc.rgr_set:
+        for rgr in loc.rgrs:
             if rgr.type == "ORF":
                 well_fitting_rcs[run.id][rgr.id] = 0
     # ORF id by ``rgr.index`` (``None`` for NOISE), to resolve the cells.
-    orf_id_of: list = [None] * len(loc.rgr_set)
-    for rgr in loc.rgr_set:
-        if rgr.type == "ORF":
-            orf_id_of[rgr.index] = rgr.id
+    orf_id_of = [rgr.id if rgr.type == "ORF" else None for rgr in loc.rgrs]
     for run in runs:
         well_fitting_indices = run.cleavage_model.get_high_prob_indices()
         well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}
@@ -653,12 +650,10 @@ def _make_eg_cache(
         slot_rgr[run.id] = np.array(srgr, dtype=np.int32)
         slot_code[run.id] = np.array(scode, dtype=np.uint8)
 
-    num_rgrs = len(loc.rgr_set)
-    rgr_ids: list = [None] * num_rgrs
-    rgr_lengths = np.empty(num_rgrs, dtype=np.int64)
-    for rgr in loc.rgr_set:
-        rgr_ids[rgr.index] = rgr.id
-        rgr_lengths[rgr.index] = len(rgr)
+    num_rgrs = len(loc.rgrs)
+    rgr_lengths = np.fromiter(
+        (len(rgr) for rgr in loc.rgrs), dtype=np.int64, count=num_rgrs
+    )
 
     return EgRoutingCache(
         n_rows=n_rows,
@@ -675,7 +670,7 @@ def _make_eg_cache(
         slot_rgr=slot_rgr,
         slot_code=slot_code,
         num_rgrs=num_rgrs,
-        rgr_ids=tuple(rgr_ids),
+        rgr_ids=tuple(rgr.id for rgr in loc.rgrs),
         rgr_lengths=rgr_lengths,
         cell_rgr=np.array(cell_rgr, dtype=np.int32),
         cell_code=np.array(cell_code, dtype=np.uint8),

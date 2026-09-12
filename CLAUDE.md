@@ -38,6 +38,8 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 
 **Coordinates:** Always 0-based, half-open intervals. GTF input is 1-based and must be converted on load. Multi-exonic regions are stored in chromosome order — negative-strand regions are therefore in reverse translation order; account for this when computing reading frames.
 
+**RGR indexing and equivalence-group keys:** `Locus.rgrs` is an ordered list and an RGR's position in it is `rgr.index`, which addresses its design-matrix column block and its row of `result`. An equivalence-group key is `(cells, read_length, oua)` where each cell is the packed int `rgr.index * 12 + frame_code * 3 + covpos` (`equivalence_groups.pack_cell`; the routing cache and `mm_slots` use the same cells). Never drop RGRs by hand: `Locus.remove_rgrs` compacts the list and remaps every key.
+
 **Numerical stability:** Use `pseudo_min = 1e-14` to guard against `log(0)` in the Poisson likelihood. Do not remove or reduce this.
 
 **Output files:** Workers never write to `o_dir`; they hand their rendered rows back and the parent process (`ORFActivityEstimator._record`) is the only writer of the output tables, `performance_measurements.tsv` and `processed_loci.txt`. Workers do write their own EM state to SQLite through `price2.database.connect` (WAL mode, busy timeout).

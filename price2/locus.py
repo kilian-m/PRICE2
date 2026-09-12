@@ -66,8 +66,10 @@ class Locus:
     transcript_intervals : HTSeq.GenomicArrayOfSets
         Stranded genomic array mapping positions to overlapping
         transcripts.
-    rgr_set : set[ReadGeneratingRegion]
-        Current set of ORF and noise RGR candidates.
+    rgrs : list[ReadGeneratingRegion]
+        The current ORF and noise RGR candidates, in ``rgr.index`` order:
+        an RGR's position in this list is its index, which addresses its
+        design-matrix column block and its row of :attr:`result`.
     egs : dict[RiboSeqRun, dict]
         Per-run equivalence groups built during read assignment.
     read_counts : dict[RiboSeqRun, int]
@@ -83,7 +85,7 @@ class Locus:
     id: str
     transcripts: set[Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
-    rgr_set: set[ReadGeneratingRegion]
+    rgrs: list[ReadGeneratingRegion]
     egs: dict[RiboSeqRun, dict]
     read_counts: dict[RiboSeqRun, int]
     exon_length: int
@@ -129,7 +131,7 @@ class Locus:
     def _init_state(self) -> None:
         """Reset everything a worker fills in after the skeleton is built."""
         # ORF candidates (``make_rgrs`` / ``build_rgrs``).
-        self.rgr_set: set[ReadGeneratingRegion] = set()
+        self.rgrs: list[ReadGeneratingRegion] = []
         self.gene_ids_complete: set[str] = set()
         self.transcripts_number: int = 0
         # Reads (``get_reads_from_db``) and their counts per RGR
@@ -155,7 +157,7 @@ class Locus:
     def light(cls, locus_id: str, iv: HTSeq.GenomicInterval, cache) -> Locus:
         """A locus carrying only its routing cache (an intermediate EM pass).
 
-        It has no transcripts, RGRs or equivalence groups (``rgr_set`` is
+        It has no transcripts, RGRs or equivalence groups (``rgrs`` is
         ``None``); restoring those dominates the cost of loading a prepared
         locus, and a light M-step needs none of them.
         """
@@ -163,13 +165,16 @@ class Locus:
         loc._init_state()
         loc.id = locus_id
         loc.iv = iv
-        loc.rgr_set = None
+        loc.rgrs = None
         loc.eg_cache = cache
         return loc
 
     def __setstate__(self, state: dict) -> None:
         """Restore a pickle, filling in attributes older pickles lack."""
         self._init_state()
+        # Skeletons collected before the RGRs became an ordered list carry
+        # an (empty) ``rgr_set``.
+        state.pop("rgr_set", None)
         self.__dict__.update(state)
 
     def __repr__(self) -> str:
@@ -280,8 +285,9 @@ class Locus:
         state.pop("_has_abutting_exons", None)
         # Sets of RGRs can only be unpickled once the RGRs' state is restored
         # (their hash reads ``genomic_region``).  Emitting the transcripts
-        # first pickles every RGR through ``Transcript.rgr_set`` before any
-        # locus-level set refers to it.
+        # first pickles every RGR through ``Transcript.rgr_set`` before
+        # ``rgrs`` refers to it; an RGR reached through ``rgrs`` first would
+        # be inserted into its transcript's set before its own state is set.
         first = {
             name: state.pop(name)
             for name in ("iv", "id", "transcript_intervals", "transcripts")
@@ -346,7 +352,7 @@ class Locus:
             Configuration providing the coverage threshold.
         """
 
-        rgr_lengths = {rgr.id: len(rgr.genomic_region) for rgr in self.rgr_set}
+        rgr_lengths = {rgr.id: len(rgr.genomic_region) for rgr in self.rgrs}
 
         rgr_lengths = pd.Series(rgr_lengths).reindex(self.wfr_df.index)
         wfr_df_rel = self.wfr_df.div(rgr_lengths, axis=0)
@@ -358,7 +364,7 @@ class Locus:
         )
         rgrs_to_remove = {
             rgr
-            for rgr in self.rgr_set
+            for rgr in self.rgrs
             if rgr.id in rgrs_to_remove_ids and rgr.type == "ORF"
         }
 
@@ -388,7 +394,7 @@ class Locus:
 
         rgrs_to_remove = {
             rgr
-            for rgr in self.rgr_set
+            for rgr in self.rgrs
             if rgr.type == "ORF" and rgr.id in rgr_ids_to_remove
         }
 
@@ -409,7 +415,7 @@ class Locus:
             ORF RGRs ending there.
         """
         stop_groups = {}
-        for rgr in self.rgr_set:
+        for rgr in self.rgrs:
             if rgr.type == "NOISE":
                 continue
             if rgr.genomic_region.strand == "+":
@@ -605,19 +611,17 @@ class Locus:
             coverage_params[i, 1] = 1
             coverage_params[i, 2] = run.coverage_model.stop_factor
 
-        # Must be aligned with ``rgr.index`` (the design-matrix column blocks
-        # and the rows of ``result``), not with ``rgr_set`` iteration order:
-        # the two are different permutations, and ``deconvolve`` multiplies
-        # ``rgr_lengths`` against the index-aligned activity matrix.
+        # Aligned with ``rgr.index`` (the design-matrix column blocks and the
+        # rows of ``result``), which is the order of ``rgrs``.
         cache = self.eg_cache
         if cache is not None:
             num_rgrs = cache.num_rgrs
             rgr_lengths = cache.rgr_lengths
         else:
-            num_rgrs = len(self.rgr_set)
-            rgr_lengths = np.empty(num_rgrs, dtype=np.int64)
-            for rgr in self.rgr_set:
-                rgr_lengths[rgr.index] = len(rgr)
+            num_rgrs = len(self.rgrs)
+            rgr_lengths = np.fromiter(
+                (len(rgr) for rgr in self.rgrs), dtype=np.int64, count=num_rgrs
+            )
 
         if self.result is not None:
             initial_guess = self.result
@@ -747,18 +751,10 @@ class Locus:
                 * config.min_activity_fraction,
                 config.rgr_min_activity,
             )
-            rgr_indices_to_remove = set(
-                np.where(np.all(x < min_activities, axis=1))[0]
+            self.remove_rgrs(
+                self._orfs_at(np.flatnonzero(np.all(x < min_activities, axis=1))),
+                runs=runs,
             )
-            rgrs_to_remove = set(
-                [
-                    rgr
-                    for rgr in self.rgr_set
-                    if rgr.index in rgr_indices_to_remove
-                    and rgr.type == "ORF"
-                ]
-            )
-            self.remove_rgrs(rgrs_to_remove, runs=runs)
 
         return opt_time, data_time
 
@@ -780,7 +776,7 @@ class Locus:
                 rgr_id: self.result[index].copy()
                 for index, rgr_id in enumerate(cache.rgr_ids)
             }
-        return {rgr.id: self.result[rgr.index].copy() for rgr in self.rgr_set}
+        return {rgr.id: self.result[rgr.index].copy() for rgr in self.rgrs}
 
     def set_warm_start(self, activities: dict, num_runs: int) -> None:
         """Seed :attr:`result` from persisted per-``rgr.id`` activities.
@@ -804,12 +800,30 @@ class Locus:
                 if a is not None:
                     result[index] = a
         else:
-            result = np.ones((len(self.rgr_set), num_runs))
-            for rgr in self.rgr_set:
+            result = np.ones((len(self.rgrs), num_runs))
+            for rgr in self.rgrs:
                 a = activities.get(rgr.id)
                 if a is not None:
                     result[rgr.index] = a
         self.result = result
+
+    def _orfs_at(self, indices) -> set[ReadGeneratingRegion]:
+        """The ORF-type RGRs among ``rgrs[i] for i in indices``."""
+        return {
+            rgr for rgr in map(self.rgrs.__getitem__, indices) if rgr.type == "ORF"
+        }
+
+    def update_transcript_rgrs(self) -> None:
+        """Restrict every transcript's ORF and RGR sets to :attr:`rgrs`.
+
+        The equivalence-group build and the read routing iterate the
+        transcript-side sets, so they have to agree with the locus; this is
+        called once the pre-deconvolution filters are done and after the EM
+        prunes ORFs.
+        """
+        kept = set(self.rgrs)
+        for tr in self.transcripts:
+            tr.update_with_filtered_orfs(kept)
 
     def remove_rgrs(
         self,
@@ -818,9 +832,10 @@ class Locus:
     ) -> None:
         """Remove a set of RGRs and update all dependent data structures.
 
-        Updates :attr:`rgr_set`, re-indexes remaining RGRs, collapses
-        equivalence groups (if present), and re-slices :attr:`result` (if
-        present).
+        Compacts :attr:`rgrs` (the survivors keep their relative order and
+        take their new position as ``rgr.index``), remaps the equivalence
+        groups (if present) and drops the removed rows of :attr:`result`
+        (if present).
 
         Parameters
         ----------
@@ -829,35 +844,23 @@ class Locus:
         runs : list[RiboSeqRun] or None
             Required when equivalence groups need collapsing.
         """
-        old_rgr_set = self.rgr_set
-        self.rgr_set = self.rgr_set - rgrs_to_remove
+        kept = [rgr for rgr in self.rgrs if rgr not in rgrs_to_remove]
+        old_to_new = [-1] * len(self.rgrs)
+        for c, rgr in enumerate(kept):
+            old_to_new[rgr.index] = c
+            rgr.index = c
+        self.rgrs = kept
 
         # The cached routing keys off rgr.index and the equivalence-group
         # layout, both of which this method invalidates.
         self.eg_cache = None
         self._eg_y = None
 
-        # The equivalence-group cells and the rows of ``result`` are keyed by
-        # the *old* rgr.index, which the re-indexing below overwrites.
-        # ``rgr_set`` iteration order is not the index order (it changes
-        # across a pickle round-trip), so the old indices have to be captured
-        # rather than re-derived by enumeration.
-        old_index = {rgr: rgr.index for rgr in old_rgr_set}
-        old_to_new = [-1] * len(old_rgr_set)
-        for c, rgr in enumerate(self.rgr_set):
-            old_to_new[old_index[rgr]] = c
-            rgr.index = c
-
-        # egs
         if self.egs is not None:
             self.collapse_egs(runs, old_to_new)
 
-        # results
         if self.result is not None:
-            index_array = np.zeros(len(self.rgr_set), dtype=int)
-            for rgr in self.rgr_set:
-                index_array[rgr.index] = old_index[rgr]
-            self.result = self.result[index_array]
+            self.result = self.result[np.array(old_to_new) >= 0]
 
     def collapse_egs(
         self,
@@ -969,14 +972,7 @@ class Locus:
         # ``result`` rows are keyed by ``rgr.index`` (identical to the routing
         # cache's column order), so the inactive mask indexes RGRs directly.
         inactive = np.all(result < config.rgr_min_activity, axis=1)
-        indices_to_remove = set(np.nonzero(inactive)[0].tolist())
-        if not indices_to_remove:
-            return 0
-        rgrs_to_remove = {
-            rgr
-            for rgr in self.rgr_set
-            if rgr.type == "ORF" and rgr.index in indices_to_remove
-        }
+        rgrs_to_remove = self._orfs_at(np.flatnonzero(inactive))
         if not rgrs_to_remove:
             return 0
 
@@ -985,11 +981,10 @@ class Locus:
         # new indices).  Also clears ``eg_cache`` / ``_eg_y``.
         self.remove_rgrs(rgrs_to_remove, runs=runs)
 
-        # Keep the transcripts' ORF views consistent with the pruned RGR set
+        # Keep the transcripts' ORF views consistent with the pruned RGRs
         # (mirrors the pre-``make_equivalence_groups`` step of a full prepare),
         # so the persisted locus is self-consistent.
-        for tr in self.transcripts:
-            tr.update_with_filtered_orfs(self.rgr_set)
+        self.update_transcript_rgrs()
 
         # Rebuild the routing cache over the collapsed equivalence groups.
         # ``collapse_egs`` already produced the correct group geometry and
@@ -1083,9 +1078,9 @@ class Locus:
             return w, log_likelihood
 
         noise_rgr_indices = {
-            rgr.index for rgr in self.rgr_set if rgr.type == "NOISE"
+            rgr.index for rgr in self.rgrs if rgr.type == "NOISE"
         }
-        test_rgr_indices = {rgr.index for rgr in self.rgr_set if rgr.type == "ORF"}
+        test_rgr_indices = {rgr.index for rgr in self.rgrs if rgr.type == "ORF"}
         keep_rgr_indices = noise_rgr_indices | test_rgr_indices
 
         full_activities, full_log_likelihood = fit(initial_guess, None)
@@ -1143,12 +1138,10 @@ class Locus:
         result[result <= config.pseudo_min] = 0
         self.result = result
 
-        rgrs_to_remove = {
-            rgr
-            for rgr in self.rgr_set
-            if rgr.index not in keep_rgr_indices and rgr.type != "NOISE"
-        }
-        self.remove_rgrs(rgrs_to_remove, runs=runs)
+        self.remove_rgrs(
+            self._orfs_at(set(range(len(self.rgrs))) - keep_rgr_indices),
+            runs=runs,
+        )
 
     def estimate_activities(
         self,
@@ -1191,25 +1184,19 @@ class Locus:
             tmp[tmp <= config.pseudo_min] = 0
             self.result = tmp
 
-            rgr_indices_to_remove = set(
-                np.where(np.all(self.result < config.rgr_min_activity, axis=1))[0]
-            )
-            rgrs_to_remove = set(
-                [
-                    rgr
-                    for rgr in self.rgr_set
-                    if rgr.index in rgr_indices_to_remove and rgr.type == "ORF"
-                ]
+            rgrs_to_remove = self._orfs_at(
+                np.flatnonzero(np.all(self.result < config.rgr_min_activity, axis=1))
             )
             if rgrs_to_remove:
                 self.remove_rgrs(rgrs_to_remove, runs=runs)
             else:
                 rgrs_removed = False
 
-        run_ids = [run.id for run in runs]
-        temp = {rgr.index: rgr for rgr in self.rgr_set}
-        rgr_ids = [temp[i].id for i in range(len(temp))]
-        self.result_df = pd.DataFrame(self.result, index=rgr_ids, columns=run_ids)
+        self.result_df = pd.DataFrame(
+            self.result,
+            index=[rgr.id for rgr in self.rgrs],
+            columns=[run.id for run in runs],
+        )
 
 
 # ------------------------------------------------------------------ #

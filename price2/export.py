@@ -196,11 +196,11 @@ def gtf_outputs(
         outputs["loci.gtf"] = OutputText(locus_gtf_line(loc))
     if write_transcripts:
         outputs["transcripts.gtf"] = OutputText(
-            "".join(rgr_gtf(r, loc.id) for r in loc.rgr_set if r.type == "NOISE")
+            "".join(rgr_gtf(r, loc.id) for r in loc.rgrs if r.type == "NOISE")
         )
     if write_orfs:
         outputs["orfs.gtf"] = OutputText(
-            "".join(rgr_gtf(r, loc.id) for r in loc.rgr_set if r.type == "ORF")
+            "".join(rgr_gtf(r, loc.id) for r in loc.rgrs if r.type == "ORF")
         )
     return outputs
 
@@ -228,7 +228,7 @@ def tsv_output(
         header = "\t".join(columns + tuple(run.id for run in runs))
     with_activities = runs is not None and loc.result_df is not None
     lines = []
-    for rgr in loc.rgr_set:
+    for rgr in loc.rgrs:
         if not include_noise and rgr.type != "ORF":
             continue
         if with_activities:
@@ -249,7 +249,7 @@ def bed_output(loc: Locus, include_noise: bool = False) -> tuple[str, OutputText
     name = "regions.bed" if include_noise else "orfs.bed"
     body = "".join(
         rgr_bed_line(rgr)
-        for rgr in loc.rgr_set
+        for rgr in loc.rgrs
         if include_noise or rgr.type == "ORF"
     )
     return name, OutputText(body)

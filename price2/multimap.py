@@ -1135,7 +1135,7 @@ def load_light_locus(db_path: str, locus_id: str):
     The returned locus carries only ``id``, ``iv`` and ``eg_cache`` — enough
     for ``get_reads_from_db``, ``set_warm_start``, ``assign_reads_to_egs``,
     ``deconvolve(prune=False)``, ``compute_multimap_lambdas`` and
-    ``activities_by_id``.  It has no ``rgr_set``, ``egs`` or ``transcripts``,
+    ``activities_by_id``.  It has no ``rgrs``, ``egs`` or ``transcripts``,
     which is the whole point: restoring those dominates the cost of loading a
     prepared locus.
 

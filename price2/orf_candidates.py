@@ -212,7 +212,6 @@ def make_rgrs(
         Minimum combined length of ORF plus flanking transcript
         distance (in nucleotides) for an ORF to be retained.
     """
-    loc.rgr_set: set[ReadGeneratingRegion] = set()
     orf_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
     noise_dict: dict[ReadGeneratingRegion, ReadGeneratingRegion] = {}
 
@@ -307,20 +306,21 @@ def make_rgrs(
 
     for noise in noise_dict.values():
         noise.transcript.rgr_set.add(noise)
-    loc.rgr_set |= set(noise_dict.values())
     for orf in orf_dict.values():
         orf.orf_type = get_orf_type(orf, loc.transcripts)
         orf.transcript.add_orf(orf)
-    loc.rgr_set |= set(orf_dict.values())
 
-    # ``rgr.index`` addresses the design-matrix column blocks and the rows
-    # of ``result``, so every RGR carries one from the moment the set is
-    # built.  ``remove_rgrs`` re-densifies them after a removal.
-    for c, rgr in enumerate(loc.rgr_set):
+    # The position in ``loc.rgrs`` is ``rgr.index``, which addresses the
+    # design-matrix column blocks and the rows of ``result``; the order is
+    # the generation order (noise regions, then ORFs, transcript by
+    # transcript), so it does not depend on the hash seed.  ``remove_rgrs``
+    # compacts the list after a removal.
+    loc.rgrs = list(noise_dict.values()) + list(orf_dict.values())
+    for c, rgr in enumerate(loc.rgrs):
         rgr.index = c
 
     loc.gene_ids_complete = {
-        rgr.transcript.gene_id for rgr in loc.rgr_set
+        rgr.transcript.gene_id for rgr in loc.rgrs
     }
 
 
@@ -336,7 +336,7 @@ def build_rgrs(
     Greedily selects transcripts that jointly explain the most observed
     reads above ``min_explained_reads``, prunes the locus's transcript
     set and ``transcript_intervals`` accordingly, and calls
-    :meth:`~price2.locus.Locus.make_rgrs` when transcripts remain.
+    :func:`make_rgrs` when transcripts remain.
 
     Parameters
     ----------

@@ -179,6 +179,15 @@ def create_state_table(cur: sql.Cursor) -> None:
     )
 
 
+#: Layout version of the ``prepared_loci`` blobs (pickled ``Locus`` objects
+#: with their equivalence groups).  Part of the deconvolution fingerprint
+#: (:func:`price2.run_state.deconvolution_fingerprint`), so a run resumed by
+#: a PRICE2 that pickles the locus differently starts its EM over instead of
+#: unpickling blobs it cannot use.  Bump it whenever the pickled state
+#: changes shape.
+PREPARED_LOCI_FORMAT = "2"
+
+
 def create_em_tables(cur: sql.Cursor) -> None:
     """Create the multimapping-EM state tables, dropping any stale copies.
 
