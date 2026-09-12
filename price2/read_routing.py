@@ -38,7 +38,14 @@ if TYPE_CHECKING:
 _START = CoveragePosition.start.value
 _MIDDLE = CoveragePosition.middle.value
 _STOP = CoveragePosition.stop.value
-_NOISE_MIDDLE = NO_FRAME * 3 + _MIDDLE
+_NOISE_FRAME = NO_FRAME * 3
+
+# The regions a read overlapping the end of an RGR is tested against, as
+# ``(coverage position, from, to)`` with ``from`` / ``to`` indexing the RGR's
+# boundaries ``(lo, lo + 3, hi - 3, hi)``: an ORF's start codon, its body and
+# its last codon before the stop; a NOISE region is one middle from lo to hi.
+_ORF_REGIONS = ((_START, 0, 1), (_MIDDLE, 1, 2), (_STOP, 2, 3))
+_NOISE_REGIONS = ((_MIDDLE, 0, 3),)
 
 
 class ReadRouting:
@@ -621,12 +628,16 @@ def rgr_compatibility(
 ) -> frozenset[int] | None:
     """Determine which RGRs a read alignment is compatible with.
 
-    For each RGR overlapping the read, compute the reading frame and
-    coverage-profile position (start / middle / stop).  Partial
-    overlaps are kept only when the cleavage-model probability ratio
-    exceeds *overlap_likelihood_ratio_threshold*.  Each combination is
-    returned as a packed cell (``equivalence_groups.pack_cell``), so the
-    result is the first element of the read's equivalence-group key.
+    For each RGR of a transcript the read maps to, compute the reading frame
+    and the coverage positions the read can cover.  A read lying entirely
+    inside the RGR covers its middle.  A read overlapping one of the RGR's
+    ends is tested against each region of :data:`_ORF_REGIONS` (or
+    :data:`_NOISE_REGIONS`): the region is covered when the cleavage
+    likelihood of the read bounded to that region exceeds
+    *overlap_likelihood_ratio_threshold* times its unbounded likelihood.
+    Each combination is returned as a packed cell
+    (``equivalence_groups.pack_cell``), so the result is the first element
+    of the read's equivalence-group key.
 
     Parameters
     ----------
@@ -656,14 +667,10 @@ def rgr_compatibility(
             overlap_transcripts &= bp_sets[i]
             i += 1
 
-    # Hoist per-read / per-run invariants out of the transcript x rgr
-    # loops.  ``len(rsa) == len(rsa.genomic_region)`` (a cached value) and
-    # the untemplated-addition flag are the same for every candidate RGR,
-    # so compute them once.  The full-overlap cleavage likelihood is an
-    # exact lookup-table entry (verified bit-identical to
-    # ``CleavageModel.pmf`` across the whole domain), so index the LUT
-    # directly instead of paying a pmf() call frame per RGR — only the
-    # partial-overlap (region-bounded) likelihoods still call pmf.
+    # The read's length and untemplated-addition flag are the same for every
+    # candidate RGR.  The unbounded cleavage likelihood is an exact
+    # lookup-table entry (bit-identical to ``CleavageModel.pmf``), so index
+    # the tables directly; only the region-bounded likelihoods call pmf.
     pmf = run.cleavage_model.pmf
     cds_lut = run.cleavage_model.cds_lut
     noise_lut = run.cleavage_model.noise_lut
@@ -677,120 +684,42 @@ def rgr_compatibility(
 
     for tr in overlap_transcripts:
         try:
-            rsa_iv_on_tr = tr.exons.map_to_local(rsa.genomic_region)
+            rsa_lo, rsa_hi = tr.exons.map_to_local(rsa.genomic_region)
         except ValueError:
             continue
-        rsa_lo, rsa_hi = rsa_iv_on_tr
         for rgr in tr.rgr_set:
             rgr_lo, rgr_hi = rgr.iv_on_transcript
-            # full overlap with orf
+            inside = rgr_lo <= rsa_lo and rgr_hi >= rsa_hi
+            if not inside and not (
+                rsa_lo <= rgr_lo <= rsa_hi or rsa_lo <= rgr_hi <= rsa_hi
+            ):
+                continue
             if rgr.type == "NOISE":
                 frame = None
-                if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
-                    if noise_cl > 0:
-                        cells.add(rgr.index * CELL_CODES + _NOISE_MIDDLE)
-                elif (rsa_lo <= rgr_lo <= rsa_hi) or (
-                    rsa_lo <= rgr_hi <= rsa_hi
+                cl = noise_cl
+                base = rgr.index * CELL_CODES + _NOISE_FRAME
+                regions = _NOISE_REGIONS
+            else:
+                frame = (rsa_lo - rgr_lo) % 3
+                cl = cds_lut[read_length, frame, oua_i] if in_lut else 0.0
+                base = rgr.index * CELL_CODES + frame * 3
+                regions = _ORF_REGIONS
+            if cl == 0:
+                continue
+            if inside:
+                cells.add(base + _MIDDLE)
+                continue
+            # Region bounds relative to the read start.  ``cl > 0`` here, so
+            # ``ol > thr * cl`` is ``ol / cl > thr`` without a scalar-divide
+            # overflow for a denormal ``cl``.
+            bounds = (rgr_lo - rsa_lo, rgr_lo + 3 - rsa_lo, rgr_hi - 3 - rsa_lo, rgr_hi - rsa_lo)
+            thr_cl = thr * cl
+            for covpos, lo, hi in regions:
+                if (
+                    pmf(read_length, oua, frame, region_start=bounds[lo], region_end=bounds[hi])
+                    > thr_cl
                 ):
-                    region_start = rgr_lo - rsa_lo
-                    region_end = rgr_hi - rsa_lo
-                    if (
-                        ol := pmf(
-                            read_length,
-                            oua,
-                            frame,
-                            region_start=region_start,
-                            region_end=region_end,
-                        )
-                    ) > 0:
-                        cl = noise_cl
-                        if cl == 0:
-                            continue
-                        # cl > 0 here, so test ol > thr*cl instead of
-                        # ol/cl > thr: same result, no scalar-divide overflow
-                        # when cl is a tiny denormal.
-                        if ol > thr * cl:
-                            cells.add(rgr.index * CELL_CODES + _NOISE_MIDDLE)
-            elif rgr.type == "ORF":
-                orf = rgr
-                if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
-                    frame = (rsa_lo - rgr_lo) % 3
-                    if (cds_lut[read_length, frame, oua_i] if in_lut else 0.0) > 0:
-                        cells.add(orf.index * CELL_CODES + frame * 3 + _MIDDLE)
-                # part overlap with orf
-                elif (rsa_lo <= rgr_lo <= rsa_hi) or (
-                    rsa_lo <= rgr_hi <= rsa_hi
-                ):
-                    frame = (rsa_lo - rgr_lo) % 3
-                    orf_cells = orf.index * CELL_CODES + frame * 3
-                    cl = cds_lut[read_length, frame, oua_i] if in_lut else 0.0
-                    cl_ok = not cl == 0
-                    # consider overlap likelihood
-                    # compute at which position in the read the orf starts
-                    region_start = rgr_lo + 3 - rsa_lo
-                    # compute at which position in the read the orf ends
-                    region_end = rgr_hi - 3 - rsa_lo
-                    if (
-                        ol := pmf(
-                            read_length,
-                            oua,
-                            frame,
-                            region_start=region_start,
-                            region_end=region_end,
-                        )
-                    ) > 0:
-                        # ol > thr*cl avoids the ol/cl scalar-divide overflow
-                        # when cl is a tiny denormal (cl_ok guarantees cl > 0);
-                        # identical result since thr > 0.
-                        if cl_ok and (ol > thr * cl):
-                            cells.add(orf_cells + _MIDDLE)
-                    # consider coverage profile - start
-                    # compute where the orf starts relative to the read
-                    start_position = (
-                        rgr_lo - rsa_lo,
-                        rgr_lo + 3 - rsa_lo,
-                    )
-                    if (
-                        ol := pmf(
-                            read_length,
-                            oua,
-                            frame,
-                            region_start=start_position[0],
-                            region_end=start_position[1],
-                        )
-                    ) > 0:
-                        if cl_ok and (
-                            # ol * run.coverage_model.start_factor / cl
-                            # (as ol > thr*cl: avoids scalar-divide overflow
-                            #  for denormal cl; cl_ok guarantees cl > 0)
-                            ol
-                            > thr * cl
-                        ):
-                            cells.add(orf_cells + _START)
-
-                    # consider coverage profile - stop
-                    # compute where the orf ends relative to the read
-                    stop_position = (
-                        rgr_hi - 3 - rsa_lo,
-                        rgr_hi - rsa_lo,
-                    )
-                    if (
-                        ol := pmf(
-                            read_length,
-                            oua,
-                            frame,
-                            region_start=stop_position[0],
-                            region_end=stop_position[1],
-                        )
-                    ) > 0:
-                        if cl_ok and (
-                            # ol * run.coverage_model.stop_factor / cl
-                            # (as ol > thr*cl: avoids scalar-divide overflow
-                            #  for denormal cl; cl_ok guarantees cl > 0)
-                            ol
-                            > thr * cl
-                        ):
-                            cells.add(orf_cells + _STOP)
+                    cells.add(base + covpos)
 
     if not cells:
         return None
