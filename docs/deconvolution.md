@@ -104,9 +104,12 @@ flowchart TD
 ```
 
 Everything above `assign_reads_to_egs` depends only on **unweighted** reads, so it is
-identical in every EM iteration. That is exactly the state cached in `prepared_loci`
-and reused from iteration 1 onward — ORF generation, both filters and the EG DAG build
-are the dominant per-locus cost.
+identical in every EM iteration. That is exactly the state stored in `prepared_loci`
+(the locus) and `prepared_loci_cache` (its `ReadRouting`: the reads routed to the
+design-matrix rows, arrays only) and reused from iteration 1 onward — ORF generation,
+both filters, the EG DAG build and the per-read compatibility are the dominant
+per-locus cost. A light M-step loads the routing alone and derives the response from
+it with a weighted `bincount`.
 
 ---
 
@@ -116,7 +119,7 @@ are the dominant per-locus cost.
 
 ```mermaid
 flowchart TD
-    A(["deconvolve(config, runs, max_outer, prune)"]) --> B["<b>to_sparse_args</b> → egs_to_sparse<br/>row = one EG × run pair<br/>X[row, rgr·n_runs + run] =<br/>length · cleavage(len, frame, oua) · coverage(pos)<br/>y[row] = EG read count"]
+    A(["deconvolve(config, runs, max_outer, prune)"]) --> B["<b>to_sparse_args</b> → ReadRouting.design_matrix<br/>row = one EG × run pair<br/>X[row, rgr·n_runs + run] =<br/>length · cleavage(len, frame, oua) · coverage(pos)<br/>y[row] = EG read count"]
     B --> C["w ← self.result if warm-started,<br/>else all ones"]
 
     subgraph IRLS ["IRLS outer loop — up to irls_huber_max_outer = 10"]

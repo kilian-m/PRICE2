@@ -1088,11 +1088,11 @@ def write_locus_em_output(
             )
 
 
-def save_locus_cache(db_path: str, locus_id: str, loc) -> None:
-    """Persist a locus's :class:`~price2.read_routing.EgRoutingCache` on its own.
+def save_locus_routing(db_path: str, locus_id: str, loc) -> None:
+    """Persist a locus's :class:`~price2.read_routing.ReadRouting` on its own.
 
-    The cache references no RGR, transcript or equivalence-group objects, so
-    a light M-step can restore it — plus the locus id and interval, all it
+    The routing references no RGR, transcript or read objects, so a light
+    M-step can restore it — plus the locus id and interval, all it
     otherwise needs — without unpickling the locus itself.
 
     Parameters
@@ -1102,9 +1102,9 @@ def save_locus_cache(db_path: str, locus_id: str, loc) -> None:
     locus_id : str
         Locus identifier.
     loc : Locus
-        A locus whose ``eg_cache`` has been built.
+        A locus whose ``routing`` has been built.
     """
-    payload = {"id": loc.id, "iv": loc.iv, "cache": loc.eg_cache}
+    payload = {"id": loc.id, "iv": loc.iv, "routing": loc.routing}
     blob = database.compress_blob(payload, protocol=5)
     with database.connect(db_path, wal_writer=True, commit=True) as db:
         db.execute(
@@ -1113,8 +1113,8 @@ def save_locus_cache(db_path: str, locus_id: str, loc) -> None:
         )
 
 
-def load_locus_cache(db_path: str, locus_id: str):
-    """Return the cached routing payload for *locus_id*, or ``None``."""
+def load_locus_routing(db_path: str, locus_id: str):
+    """Return the stored routing payload for *locus_id*, or ``None``."""
     with database.connect(db_path) as db:
         cur = db.cursor()
         row = None
@@ -1132,12 +1132,11 @@ def load_locus_cache(db_path: str, locus_id: str):
 def load_light_locus(db_path: str, locus_id: str):
     """Return a minimal :class:`~price2.locus.Locus` for a light M-step.
 
-    The returned locus carries only ``id``, ``iv`` and ``eg_cache`` — enough
-    for ``get_reads_from_db``, ``set_warm_start``, ``assign_reads_to_egs``,
-    ``deconvolve(prune=False)``, ``compute_multimap_lambdas`` and
-    ``activities_by_id``.  It has no ``rgrs``, ``egs`` or ``transcripts``,
-    which is the whole point: restoring those dominates the cost of loading a
-    prepared locus.
+    The returned locus carries only ``id``, ``iv`` and ``routing`` — enough
+    for ``set_warm_start``, ``assign_reads_to_egs``, ``deconvolve(prune=False)``,
+    ``compute_multimap_lambdas`` and ``activities_by_id``.  It has no ``rgrs``
+    or ``transcripts``, which is the whole point: restoring those dominates
+    the cost of loading a prepared locus.
 
     Parameters
     ----------
@@ -1149,26 +1148,27 @@ def load_light_locus(db_path: str, locus_id: str):
     Returns
     -------
     Locus or None
-        ``None`` when no cache was stored for this locus.
+        ``None`` when no routing was stored for this locus.
     """
     from price2.locus import Locus  # local: locus imports this module
 
-    payload = load_locus_cache(db_path, locus_id)
+    payload = load_locus_routing(db_path, locus_id)
     if payload is None:
         return None
-    return Locus.light(payload["id"], payload["iv"], payload["cache"])
+    return Locus.light(payload["id"], payload["iv"], payload["routing"])
 
 
 def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
     """Cache a locus's weight-independent prepared state for later EM passes.
 
-    The RGR candidate set, coverage/deconvolution-filter results and
-    equivalence-group *geometry* depend only on raw (unweighted) reads, so
-    they are identical in every EM iteration.  Persisting them after the
-    first light M-step lets subsequent iterations skip ORF generation, the
-    two filter passes and the EG DAG build — the dominant per-locus cost.
-    The bulky ``rsas_dict`` (reads) is excluded from the blob and reloaded
-    from the ``reads`` table on a cache hit.
+    The RGR candidate set and the coverage/deconvolution-filter results
+    depend only on raw (unweighted) reads, so they are identical in every EM
+    iteration.  Persisting them after the first light M-step lets subsequent
+    iterations skip ORF generation and the two filter passes — the dominant
+    per-locus cost.  The reads are reloaded from the ``reads`` table on a
+    hit, and the routing (which also holds the equivalence-group geometry)
+    lives in its own table (:func:`save_locus_routing`); see
+    :meth:`~price2.locus.Locus.prepared_copy`.
 
     Parameters
     ----------
@@ -1177,45 +1177,9 @@ def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
     locus_id : str
         Locus identifier.
     loc : Locus
-        A locus prepared up to and including ``make_equivalence_groups``
-        (accumulators still zero, no ``result`` yet).
+        A prepared locus.
     """
-    saved_rsas = getattr(loc, "rsas_dict", None)
-    saved_rrc = getattr(loc, "run_read_count", None)
-    saved_cache = getattr(loc, "eg_cache", None)
-    loc.rsas_dict = {}
-    loc.run_read_count = {}
-    # The routing cache lives in its own table (``save_locus_cache``).
-    loc.eg_cache = None
-    # Per-iteration state must not ride along: a cached locus is reloaded for
-    # every later iteration, and its equivalence groups accumulate read counts
-    # with ``+=``.
-    saved_eg_counts = [
-        (eg, eg.read_count)
-        for egs in getattr(loc, "egs", {}).values()
-        for eg in egs.values()
-    ]
-    saved_transient = {
-        name: getattr(loc, name)
-        for name in ("uncounted_reads", "read_counts", "counted_reads", "_eg_y")
-        if hasattr(loc, name)
-    }
-    for eg, _ in saved_eg_counts:
-        eg.read_count = 0
-    loc.uncounted_reads = 0
-    loc.read_counts = {}
-    loc.counted_reads = {}
-    loc._eg_y = None
-    try:
-        blob = database.compress_blob(loc)
-    finally:
-        loc.rsas_dict = saved_rsas
-        loc.run_read_count = saved_rrc
-        loc.eg_cache = saved_cache
-        for eg, count in saved_eg_counts:
-            eg.read_count = count
-        for name, value in saved_transient.items():
-            setattr(loc, name, value)
+    blob = database.compress_blob(loc.prepared_copy())
     with database.connect(db_path, wal_writer=True, commit=True) as db:
         db.execute(
             "INSERT OR REPLACE INTO prepared_loci VALUES (?, ?)",
@@ -1223,11 +1187,13 @@ def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
         )
 
 
-def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
-    """Return a cached prepared :class:`Locus`, or ``None`` if absent.
+def load_prepared_locus(db_path: str, locus_id: str):
+    """Return a stored prepared :class:`Locus` with its routing, or ``None``.
 
     The returned locus has an empty ``rsas_dict``; the caller must call
     ``get_reads_from_db`` to repopulate reads before assigning them.
+    ``None`` when either the locus or its routing is absent (both are
+    written by the first light M-step).
 
     Parameters
     ----------
@@ -1235,10 +1201,6 @@ def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
         Path to ``price.db``.
     locus_id : str
         Locus identifier.
-
-    with_cache : bool, optional
-        Re-attach the locus's ``eg_cache`` from ``prepared_loci_cache``
-        (default).  The final full pass needs both.
 
     Returns
     -------
@@ -1255,11 +1217,11 @@ def load_prepared_locus(db_path: str, locus_id: str, with_cache: bool = True):
             row = cur.fetchone()
     if row is None:
         return None
+    payload = load_locus_routing(db_path, locus_id)
+    if payload is None:
+        return None
     loc = database.decompress_blob(row[0])
-    if with_cache:
-        payload = load_locus_cache(db_path, locus_id)
-        if payload is not None:
-            loc.eg_cache = payload["cache"]
+    loc.routing = payload["routing"]
     return loc
 
 

@@ -208,7 +208,7 @@ class Config:
     #: bound RSS growth from the occasional very large locus.
     #:
     #: Retuned 50 -> 1000: that ``0.70`` per-locus figure predates the
-    #: ``eg_cache`` EM light M-step, which reduced the per-locus work of an EM
+    #: routing-based EM light M-step, which reduced the per-locus work of an EM
     #: iteration to a few milliseconds (a cached bincount + a small MU solve).
     #: Against that, recycling every 50 loci means a worker spends far more time
     #: respawning than computing: at ~13K slot loci per light iteration that is
@@ -412,21 +412,12 @@ class Config:
     #: One keeps Huber and EM in a single shared loop (as intended); the
     #: robust weights refine together with the fractional assignments.
     em_huber_steps: int = 1
-    #: Cache the weight-independent read → design-matrix-row routing and the
-    #: geometry of ``X`` beside each prepared locus.  Only the fractional
-    #: weights change between light M-steps, so an iteration then reduces to a
-    #: weighted ``bincount`` plus a vectorised ``X.data`` rebuild, instead of
-    #: re-deriving ``get_rgr_frame_covpos`` for every read and walking every
-    #: design-matrix cell in Python.  The cache holds no locus objects, so an
-    #: intermediate pass loads it alone rather than unpickling the locus.
-    #: Costs ~65% more space per prepared locus (~95 KB on top of ~148 KB).
-    eg_cache: bool = True
     #: Prune ORF candidates that the first EM light M-step finds inactive
     #: (activity below ``rgr_min_activity`` in *every* run) so that all later
     #: EM iterations and the final full pass work on the smaller design matrix.
     #: A runtime heuristic: such ORFs seldom revive in later M-steps. When it
-    #: fires the locus's equivalence groups are collapsed and the routing cache
-    #: is rebuilt before the prepared state is persisted. This CHANGES the call
+    #: fires the locus's read routing is rebuilt before the prepared state is
+    #: persisted. This CHANGES the call
     #: set slightly versus carrying every candidate through the EM (a pruned
     #: ORF cannot come back), so it is kept separable for A/B testing.
     em_prune_after_first_mstep: bool = True

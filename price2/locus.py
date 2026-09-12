@@ -12,9 +12,9 @@ and equivalence-group assignment in :mod:`price2.read_routing`.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
-from collections import defaultdict
 
 import HTSeq
 import numpy as np
@@ -27,7 +27,6 @@ from price2 import likelihood
 from price2 import read_routing
 from price2 import solver
 from price2.config import Config
-from price2.equivalence_groups import CELL_CODES, EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.likelihood import (
     distribution_theta,
@@ -70,10 +69,13 @@ class Locus:
         The current ORF and noise RGR candidates, in ``rgr.index`` order:
         an RGR's position in this list is its index, which addresses its
         design-matrix column block and its row of :attr:`result`.
-    egs : dict[RiboSeqRun, dict]
-        Per-run equivalence groups built during read assignment.
-    read_counts : dict[RiboSeqRun, int]
-        Number of reads assigned to this locus per run.
+    routing : read_routing.ReadRouting | None
+        The reads routed to the rows of the design matrix, once
+        :meth:`assign_reads_to_egs` has run; the sole representation of the
+        equivalence groups from then on.
+    eg_read_counts : np.ndarray | None
+        The response ``y`` under the current read weights, one entry per
+        row of :attr:`routing`.
     exon_length : int
         Total exonic length (bp) covered by the locus.
     result : np.ndarray | None
@@ -86,8 +88,8 @@ class Locus:
     transcripts: set[Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
     rgrs: list[ReadGeneratingRegion]
-    egs: dict[RiboSeqRun, dict]
-    read_counts: dict[RiboSeqRun, int]
+    routing: read_routing.ReadRouting | None
+    eg_read_counts: np.ndarray | None
     exon_length: int
     result: np.ndarray | None
 
@@ -139,14 +141,13 @@ class Locus:
         self.rsas_dict: dict[str, list[RiboSeqAlignment]] = {}
         self.run_read_count: dict[str, int] = {}
         self.wfr_df: pd.DataFrame | None = None
-        # Equivalence groups and the reads assigned to them.
+        # Equivalence groups: the geometry from ``make_equivalence_groups``
+        # (``{run: {key: length}}``, consumed by ``assign_reads_to_egs``), then
+        # the routing of the reads to the design-matrix rows and the response.
         self.egs: dict[RiboSeqRun, dict] | None = None
-        self.mm_slots: dict[str, dict] = {}
-        self.read_counts: dict[RiboSeqRun, float] = {}
+        self.routing: read_routing.ReadRouting | None = None
+        self.eg_read_counts: np.ndarray | None = None
         self.counted_reads: dict[str, float] = {}
-        self.uncounted_reads: float = 0
-        self.eg_cache: read_routing.EgRoutingCache | None = None
-        self._eg_y: np.ndarray | None = None
         # Deconvolution results.
         self.result: np.ndarray | None = None
         self.result_df: pd.DataFrame | None = None
@@ -154,20 +155,38 @@ class Locus:
         self.irls_outer_iterations: int = 0
 
     @classmethod
-    def light(cls, locus_id: str, iv: HTSeq.GenomicInterval, cache) -> Locus:
-        """A locus carrying only its routing cache (an intermediate EM pass).
+    def light(
+        cls, locus_id: str, iv: HTSeq.GenomicInterval, routing: read_routing.ReadRouting
+    ) -> Locus:
+        """A locus carrying only its read routing (an intermediate EM pass).
 
-        It has no transcripts, RGRs or equivalence groups (``rgrs`` is
-        ``None``); restoring those dominates the cost of loading a prepared
-        locus, and a light M-step needs none of them.
+        It has no transcripts or RGRs (``rgrs`` is ``None``); restoring
+        those dominates the cost of loading a prepared locus, and a light
+        M-step needs none of them.
         """
         loc = cls.__new__(cls)
         loc._init_state()
         loc.id = locus_id
         loc.iv = iv
         loc.rgrs = None
-        loc.eg_cache = cache
+        loc.routing = routing
         return loc
+
+    def prepared_copy(self) -> Locus:
+        """A shallow copy without the reads, the routing and the response.
+
+        This is the state persisted between EM passes (``prepared_loci``):
+        everything that depends only on the raw reads and is identical in
+        every iteration.  The routing is stored on its own
+        (``prepared_loci_cache``) so a light pass can load it alone.
+        """
+        clone = copy.copy(self)
+        clone.rsas_dict = {}
+        clone.run_read_count = {}
+        clone.routing = None
+        clone.eg_read_counts = None
+        clone.counted_reads = {}
+        return clone
 
     def __setstate__(self, state: dict) -> None:
         """Restore a pickle, filling in attributes older pickles lack."""
@@ -323,13 +342,12 @@ class Locus:
         self,
         runs: list[RiboSeqRun],
         mm_data: dict | None = None,
-        build_cache: bool = False,
     ) -> None:
-        """Assign reads to equivalence groups.
+        """Route the reads (once) and compute the response.
 
         See :func:`price2.read_routing.assign_reads_to_egs`.
         """
-        read_routing.assign_reads_to_egs(self, runs, mm_data, build_cache)
+        read_routing.assign_reads_to_egs(self, runs, mm_data)
 
     def compute_multimap_lambdas(self, runs: list[RiboSeqRun]) -> list:
         """Per-slot origin rates (see :func:`price2.read_routing.multimap_lambdas`)."""
@@ -583,9 +601,8 @@ class Locus:
     ) -> dict:
         """Build argument dictionary for the sparse-matrix objective functions.
 
-        Assembles cleavage-model look-up tables, coverage-model parameters,
-        a CSR sparse design matrix, the response vector, and an initial-guess
-        vector.
+        Assembles the CSR design matrix and the response from the read
+        routing, plus the initial-guess vector.
 
         Parameters
         ----------
@@ -595,63 +612,26 @@ class Locus:
         Returns
         -------
         dict
-            Keys: ``X``, ``y``, ``cleavage_model``, ``coverage_model``,
-            ``num_rgrs``, ``rgr_lengths``, ``num_runs``, ``initial_guess``.
+            Keys: ``X``, ``y``, ``num_rgrs``, ``rgr_lengths``, ``num_runs``,
+            ``initial_guess``.
         """
         num_runs = len(runs)
-
-        cm_lut = np.zeros((num_runs, runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
-        for i, run in enumerate(runs):
-            cm_lut[i, :, 3, :] = run.cleavage_model.noise_lut
-            cm_lut[i, :, :3, :] = run.cleavage_model.cds_lut
-
-        coverage_params = np.zeros((num_runs, 3))
-        for i, run in enumerate(runs):
-            coverage_params[i, 0] = run.coverage_model.start_factor
-            coverage_params[i, 1] = 1
-            coverage_params[i, 2] = run.coverage_model.stop_factor
-
-        # Aligned with ``rgr.index`` (the design-matrix column blocks and the
-        # rows of ``result``), which is the order of ``rgrs``.
-        cache = self.eg_cache
-        if cache is not None:
-            num_rgrs = cache.num_rgrs
-            rgr_lengths = cache.rgr_lengths
-        else:
-            num_rgrs = len(self.rgrs)
-            rgr_lengths = np.fromiter(
-                (len(rgr) for rgr in self.rgrs), dtype=np.int64, count=num_rgrs
-            )
-
+        routing = self.routing
+        # ``rgr_lengths`` is aligned with ``rgr.index`` (the design-matrix
+        # column blocks and the rows of ``result``).
+        num_rgrs = routing.num_rgrs
         if self.result is not None:
             initial_guess = self.result
         else:
             initial_guess = np.ones((num_rgrs, num_runs))
-        initial_guess = initial_guess.flatten()
-
-        # ``X`` depends only on the equivalence-group geometry and the
-        # cleavage/coverage models, all fixed across EM iterations, so a
-        # cached locus rebuilds it vectorised instead of walking every cell
-        # in Python.  ``y`` came out of the cached read routing.
-        y = self._eg_y
-        if cache is not None and y is not None:
-            X = read_routing.design_matrix_from_cache(
-                cache, cm_lut, coverage_params, num_runs
-            )
-        else:
-            X, y = read_routing.egs_to_sparse(
-                self.egs, runs, cm_lut, coverage_params, num_rgrs, num_runs
-            )
-
+        cm_lut, coverage_params = read_routing.model_tables(runs)
         return {
-            "X": X,
-            "y": y,
-            "cleavage_model": cm_lut,
-            "coverage_model": coverage_params,
+            "X": routing.design_matrix(cm_lut, coverage_params, num_runs),
+            "y": self.eg_read_counts,
             "num_rgrs": num_rgrs,
-            "rgr_lengths": rgr_lengths,
+            "rgr_lengths": routing.rgr_lengths,
             "num_runs": num_runs,
-            "initial_guess": initial_guess,
+            "initial_guess": initial_guess.flatten(),
         }
 
     def deconvolve(
@@ -752,8 +732,7 @@ class Locus:
                 config.rgr_min_activity,
             )
             self.remove_rgrs(
-                self._orfs_at(np.flatnonzero(np.all(x < min_activities, axis=1))),
-                runs=runs,
+                self._orfs_at(np.flatnonzero(np.all(x < min_activities, axis=1)))
             )
 
         return opt_time, data_time
@@ -770,13 +749,16 @@ class Locus:
         dict
             ``{rgr_id: numpy.ndarray of shape (num_runs,)}``.
         """
-        cache = self.eg_cache
-        if cache is not None:
-            return {
-                rgr_id: self.result[index].copy()
-                for index, rgr_id in enumerate(cache.rgr_ids)
-            }
-        return {rgr.id: self.result[rgr.index].copy() for rgr in self.rgrs}
+        return {
+            rgr_id: self.result[index].copy()
+            for index, rgr_id in enumerate(self._rgr_ids())
+        }
+
+    def _rgr_ids(self) -> tuple[str, ...]:
+        """RGR ids by ``rgr.index``, off the routing for a light locus."""
+        if self.rgrs is None:
+            return self.routing.rgr_ids
+        return tuple(rgr.id for rgr in self.rgrs)
 
     def set_warm_start(self, activities: dict, num_runs: int) -> None:
         """Seed :attr:`result` from persisted per-``rgr.id`` activities.
@@ -792,19 +774,12 @@ class Locus:
         num_runs : int
             Number of Ribo-seq runs (columns of the activity matrix).
         """
-        cache = self.eg_cache
-        if cache is not None:
-            result = np.ones((cache.num_rgrs, num_runs))
-            for index, rgr_id in enumerate(cache.rgr_ids):
-                a = activities.get(rgr_id)
-                if a is not None:
-                    result[index] = a
-        else:
-            result = np.ones((len(self.rgrs), num_runs))
-            for rgr in self.rgrs:
-                a = activities.get(rgr.id)
-                if a is not None:
-                    result[rgr.index] = a
+        rgr_ids = self._rgr_ids()
+        result = np.ones((len(rgr_ids), num_runs))
+        for index, rgr_id in enumerate(rgr_ids):
+            a = activities.get(rgr_id)
+            if a is not None:
+                result[index] = a
         self.result = result
 
     def _orfs_at(self, indices) -> set[ReadGeneratingRegion]:
@@ -825,24 +800,19 @@ class Locus:
         for tr in self.transcripts:
             tr.update_with_filtered_orfs(kept)
 
-    def remove_rgrs(
-        self,
-        rgrs_to_remove: set[ReadGeneratingRegion],
-        runs: list[RiboSeqRun] | None = None,
-    ) -> None:
+    def remove_rgrs(self, rgrs_to_remove: set[ReadGeneratingRegion]) -> None:
         """Remove a set of RGRs and update all dependent data structures.
 
         Compacts :attr:`rgrs` (the survivors keep their relative order and
-        take their new position as ``rgr.index``), remaps the equivalence
-        groups (if present) and drops the removed rows of :attr:`result`
-        (if present).
+        take their new position as ``rgr.index``), rebuilds the routing (if
+        present) with the response carried over — merged rows add up, as
+        their reads are the same — and drops the removed rows of
+        :attr:`result` (if present).
 
         Parameters
         ----------
         rgrs_to_remove : set[ReadGeneratingRegion]
             RGRs to discard.
-        runs : list[RiboSeqRun] or None
-            Required when equivalence groups need collapsing.
         """
         kept = [rgr for rgr in self.rgrs if rgr not in rgrs_to_remove]
         old_to_new = [-1] * len(self.rgrs)
@@ -851,76 +821,17 @@ class Locus:
             rgr.index = c
         self.rgrs = kept
 
-        # The cached routing keys off rgr.index and the equivalence-group
-        # layout, both of which this method invalidates.
-        self.eg_cache = None
-        self._eg_y = None
-
-        if self.egs is not None:
-            self.collapse_egs(runs, old_to_new)
+        if self.routing is not None:
+            self.routing, row_map = self.routing.without_rgrs(old_to_new)
+            merged = row_map >= 0
+            self.eg_read_counts = np.bincount(
+                row_map[merged],
+                weights=self.eg_read_counts[merged],
+                minlength=self.routing.n_rows,
+            )
 
         if self.result is not None:
             self.result = self.result[np.array(old_to_new) >= 0]
-
-    def collapse_egs(
-        self,
-        runs: list[RiboSeqRun],
-        old_to_new: list[int],
-    ) -> None:
-        """Collapse equivalence groups after RGR removal.
-
-        The cells of a group key carry ``rgr.index`` (see
-        :mod:`price2.equivalence_groups`), so every key is remapped to the
-        survivors' new indices; the cells of removed RGRs are dropped, and
-        entries whose keys become identical are merged.
-
-        Two memory optimisations:
-
-        * a cache maps each old key to its remapped key, so the new cell
-          set is materialised only once per distinct old key (rather than
-          once per (old key, run));
-        * per-run dicts are rebuilt one at a time and the old dict for
-          that run is released immediately, bounding the doubled-allocation
-          transient to a single run instead of the full ``len(runs)``.
-
-        Parameters
-        ----------
-        runs : list[RiboSeqRun]
-            Ribo-seq runs whose EGs should be rebuilt.
-        old_to_new : list[int]
-            The new ``rgr.index`` of every old index, ``-1`` for a removed
-            RGR.
-        """
-        # Old cell -> new cell (``-1`` for a removed RGR), one list lookup
-        # per cell.
-        cell_map = [
-            -1 if new < 0 else new * CELL_CODES + code
-            for new in old_to_new
-            for code in range(CELL_CODES)
-        ]
-        key_map: dict[tuple, tuple] = {}
-
-        new_egs: dict = {}
-        for run in runs:
-            old_run_egs = self.egs.pop(run)
-            new_run_egs: dict = defaultdict(EquivalenceGroup)
-            for old_eg_key, old_eg in old_run_egs.items():
-                new_eg_key = key_map.get(old_eg_key)
-                if new_eg_key is None:
-                    cells, read_length, oua = old_eg_key
-                    new_cells = frozenset(
-                        c for c in map(cell_map.__getitem__, cells) if c >= 0
-                    )
-                    new_eg_key = (new_cells, read_length, oua)
-                    key_map[old_eg_key] = new_eg_key
-
-                new_eg = new_run_egs[new_eg_key]
-                new_eg.length += old_eg.length
-                new_eg.read_count += old_eg.read_count
-
-            new_egs[run] = new_run_egs
-
-        self.egs = new_egs
 
     def prune_inactive_orfs(
         self,
@@ -944,11 +855,10 @@ class Locus:
         activity.
 
         After removing the RGRs (via :meth:`remove_rgrs`, which re-indexes the
-        survivors, re-slices :attr:`result` and collapses the equivalence
-        groups) the read-routing cache is rebuilt over the pruned equivalence
-        groups so that the prepared-locus blob and the
-        :class:`EgRoutingCache` persisted for later passes describe the smaller
-        system.
+        survivors, re-slices :attr:`result` and rebuilds the routing) the
+        reads are re-keyed against the merged groups and the response is
+        recomputed, so that the routing persisted for the later passes is
+        the one a rebuild from the reads would give.
 
         Parameters
         ----------
@@ -957,8 +867,7 @@ class Locus:
         runs : list[RiboSeqRun]
             Ribo-seq runs, in the order used to build :attr:`result`.
         mm_data : dict, optional
-            This locus's multimapping-slot data, forwarded to the cache rebuild
-            so fractional weights and slot routing are recorded.
+            This locus's multimapping-slot data, for the recomputed response.
 
         Returns
         -------
@@ -976,34 +885,18 @@ class Locus:
         if not rgrs_to_remove:
             return 0
 
-        # Removes the RGRs, re-indexes survivors, re-slices ``result`` and
-        # collapses the equivalence groups (remapping every group key to the
-        # new indices).  Also clears ``eg_cache`` / ``_eg_y``.
-        self.remove_rgrs(rgrs_to_remove, runs=runs)
+        self.remove_rgrs(rgrs_to_remove)
 
         # Keep the transcripts' ORF views consistent with the pruned RGRs
         # (mirrors the pre-``make_equivalence_groups`` step of a full prepare),
         # so the persisted locus is self-consistent.
         self.update_transcript_rgrs()
 
-        # Rebuild the routing cache over the collapsed equivalence groups.
-        # ``collapse_egs`` already produced the correct group geometry and
-        # merged read counts, but the per-read routing arrays the cache stores
-        # must be re-derived from the reads.  Re-running ``assign_reads_to_egs``
-        # with ``build_cache=True`` does exactly that; the group read counts are
-        # zeroed first (and the plain-dict conversion restores the KeyError-
-        # based "uncounted" handling that ``collapse_egs``'s ``defaultdict``
-        # would otherwise mask) so the reassignment recomputes them cleanly.
-        for run in runs:
-            run_egs = self.egs[run]
-            for eg in run_egs.values():
-                eg.read_count = 0
-            self.egs[run] = dict(run_egs)
-            run.read_count = 0
-        self.read_counts = {}
-        self.counted_reads = {}
-        self.uncounted_reads = 0
-        self.assign_reads_to_egs(runs, mm_data, build_cache=True)
+        # A read whose key matched no group before may match one of the
+        # merged groups: re-key the reads and recompute the response, as
+        # rebuilding the routing from the reads would.
+        self.routing.rekey()
+        self.assign_reads_to_egs(runs, mm_data)
 
         return len(rgrs_to_remove)
 
@@ -1139,8 +1032,7 @@ class Locus:
         self.result = result
 
         self.remove_rgrs(
-            self._orfs_at(set(range(len(self.rgrs))) - keep_rgr_indices),
-            runs=runs,
+            self._orfs_at(set(range(len(self.rgrs))) - keep_rgr_indices)
         )
 
     def estimate_activities(
@@ -1188,7 +1080,7 @@ class Locus:
                 np.flatnonzero(np.all(self.result < config.rgr_min_activity, axis=1))
             )
             if rgrs_to_remove:
-                self.remove_rgrs(rgrs_to_remove, runs=runs)
+                self.remove_rgrs(rgrs_to_remove)
             else:
                 rgrs_removed = False
 

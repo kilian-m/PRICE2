@@ -436,14 +436,12 @@ def process_loc(job: LocusJob) -> LocusResult | None:
         # No transcript survived: nothing to solve, nothing to write.
         return None if job.em_light else LocusResult(job.locus_id, {})
     # The prepared state is persisted after ``assign_reads_to_egs`` below, so
-    # that the routing cache it builds is stored with it.
+    # that the routing it builds is stored with it.
     save_prepared = job.em_light and job.em_iteration == 0
 
     mm_data = _apply_em_state(job, loc, runs, layout.db_path)
     with perf.timed("proc_reads_2_time"):
-        loc.assign_reads_to_egs(
-            runs, mm_data, build_cache=save_prepared and config.eg_cache
-        )
+        loc.assign_reads_to_egs(runs, mm_data)
     perf["read_count"] = sum(loc.counted_reads.values())
 
     if job.em_light:
@@ -469,22 +467,20 @@ def _load_locus(
 ) -> tuple[Locus, bool]:
     """Return the locus to work on and whether it is already prepared.
 
-    In EM mode the weight-independent prepared state (RGRs, filters,
-    equivalence-group geometry) cached by the first light pass is reused:
-    only the fractional response changes between iterations.  An
-    intermediate light pass loads just the routing cache (arrays only)
-    rather than the locus's whole object graph.  On a miss — classic mode,
-    the first light iteration, or a non-multimapping locus in the final
-    pass — the pre-RGR skeleton is loaded and still has to be prepared.
+    In EM mode the weight-independent prepared state (RGRs, filters, read
+    routing) stored by the first light pass is reused: only the fractional
+    response changes between iterations.  An intermediate light pass loads
+    just the routing (arrays only) rather than the locus's whole object
+    graph.  On a miss — classic mode, the first light iteration, or a
+    non-multimapping locus in the final pass — the pre-RGR skeleton is
+    loaded and still has to be prepared.
     """
     config, db_path = ctx.config, ctx.layout.db_path
     loc = None
-    if job.em_light and job.em_iteration > 0 and config.eg_cache:
+    if job.em_light and job.em_iteration > 0:
         loc = multimap.load_light_locus(db_path, job.locus_id)
     if loc is None and job.em_mode:
-        loc = multimap.load_prepared_locus(
-            db_path, job.locus_id, with_cache=config.eg_cache
-        )
+        loc = multimap.load_prepared_locus(db_path, job.locus_id)
     prepared = loc is not None
     if loc is None:
         with database.connect(db_path) as db:
@@ -498,23 +494,17 @@ def _load_locus(
     perf["end"] = loc.iv.end
 
     if prepared:
-        # Reads are excluded from the cache blob.  An intermediate light
-        # M-step rebuilds the response entirely from the routing cache, so
-        # only iteration 0 and the final pass reload them.
+        # Reads are excluded from the prepared blob.  An intermediate light
+        # M-step derives the response entirely from the routing, so only
+        # iteration 0 and the final pass reload them.
         with perf.timed("load_reads_time"):
             if not (job.em_light and job.em_iteration > 0):
                 loc.get_reads_from_db(
                     db_path, drop_multimappers=not config.multimap_em
                 )
         # Keep the perf columns aligned with the prepare path; the skipped
-        # stages report zero time.  A light locus carries no rgrs/egs, so
-        # the counts come off its routing cache.
-        if loc.rgrs is not None:
-            n_rgrs = len(loc.rgrs)
-            n_egs = sum(len(egs) for egs in loc.egs.values())
-        else:
-            n_rgrs = loc.eg_cache.num_rgrs
-            n_egs = loc.eg_cache.n_rows
+        # stages report zero time and the counts come off the routing.
+        n_rgrs = loc.routing.num_rgrs
         perf.update(
             build_rgrs_time=0.0,
             unfiltered_rgr_count=n_rgrs,
@@ -524,7 +514,7 @@ def _load_locus(
             filtered_deconvolution_rgr_count=n_rgrs,
             filter_2_time=0.0,
             eg_time=0.0,
-            eg_count=n_egs,
+            eg_count=loc.routing.n_rows,
         )
     return loc, prepared
 
@@ -621,16 +611,15 @@ def _light_mstep(
     # After the first M-step, drop ORFs that are inactive in every run.  They
     # rarely revive in later M-steps, so pruning them now shrinks the design
     # matrix every later iteration and the final pass rebuild.  The routing
-    # cache, equivalence groups and prepared-locus blob are rebuilt to match
-    # before they are persisted below.
+    # and the prepared locus are rebuilt to match before they are persisted
+    # below.
     if save_prepared and config.em_prune_after_first_mstep:
         perf["mstep_pruned_orf_count"] = loc.prune_inactive_orfs(
             config, runs, mm_data
         )
     if save_prepared:
         multimap.save_prepared_locus(db_path, job.locus_id, loc)
-        if config.eg_cache:
-            multimap.save_locus_cache(db_path, job.locus_id, loc)
+        multimap.save_locus_routing(db_path, job.locus_id, loc)
     multimap.write_locus_em_output(
         db_path,
         job.locus_id,

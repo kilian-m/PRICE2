@@ -15,11 +15,12 @@ packed into one integer *cell* (see :func:`pack_cell`)::
     cell = rgr.index * CELL_CODES + frame_code * 3 + coverage_position
 
 with ``frame_code`` 0-2 for the reading frame of an ORF and 3 for a NOISE
-region, so ``cells`` is a ``frozenset[int]``.  The same integers address the
-design matrix (:func:`price2.read_routing.egs_to_sparse`) and the routing
-cache (:class:`price2.read_routing.EgRoutingCache`).  Because the cells
-carry ``rgr.index``, every key has to be remapped when RGRs are removed and
-the survivors are re-indexed (:meth:`price2.locus.Locus.collapse_egs`).
+region, so ``cells`` is a ``frozenset[int]``.  :func:`make_equivalence_groups`
+maps every key to the group's length (in codons); the same cells then make
+up the rows of :class:`price2.read_routing.ReadRouting`, which is where the
+groups live once the reads are routed.  Because the cells carry
+``rgr.index``, every key has to be remapped when RGRs are removed and the
+survivors are re-indexed (:meth:`~price2.read_routing.ReadRouting.without_rgrs`).
 """
 
 from __future__ import annotations
@@ -34,31 +35,6 @@ from price2.coverage_position import CoveragePosition
 from price2.genomic_features import Transcript
 
 logger = logging.getLogger(__name__)
-
-
-class EquivalenceGroup:
-    """A group of reads that are compatible with the same set of ORFs.
-
-    Attributes
-    ----------
-    length : int
-        Number of genomic positions (in codon-space) belonging to this group.
-    read_count : int
-        Number of observed reads assigned to this group.
-    """
-
-    __slots__ = ("length", "read_count")
-
-    length: int
-    read_count: int
-
-    def __init__(
-        self,
-        length: int = 0,
-        read_count: int = 0,
-    ) -> None:
-        self.length = length
-        self.read_count = read_count
 
 
 #: Distinct ``frame_code * 3 + coverage_position`` values per RGR: four frame
@@ -240,9 +216,9 @@ class EquivalenceGroupIntervals:
         -------
         dict
             Maps ``(cells, read_length, oua)`` keys (see the module
-            docstring) to :class:`EquivalenceGroup` values.
+            docstring) to the group's length in codons.
         """
-        egs: dict = defaultdict(EquivalenceGroup)
+        egs: dict = defaultdict(int)
         for phase in range(3):
             interval_list = self.intervals[phase]
             if not interval_list:
@@ -271,7 +247,7 @@ class EquivalenceGroupIntervals:
                     key = (frozenset(active), read_length, oua)
                     if key_cache is not None:
                         key = key_cache.setdefault(key, key)
-                    egs[key].length += pos - prev_pos
+                    egs[key] += pos - prev_pos
                 if typ == 0:  # end event
                     cnt = active.get(cell, 1) - 1
                     if cnt <= 0:
@@ -708,7 +684,7 @@ def get_equivalence_groups_dict(
     Returns
     -------
     dict
-        Maps equivalence-group keys to :class:`EquivalenceGroup` instances.
+        Maps equivalence-group keys to their lengths.
     """
     egs_dict: dict = {}
     stack: list[Node] = []
@@ -733,11 +709,8 @@ def get_equivalence_groups_dict(
             current_node.iv.length,
         ).get_egs_dict(read_length, oua, key_cache=key_cache)
 
-        for k, v in node_eg_dict.items():
-            try:
-                egs_dict[k].length += v.length
-            except KeyError:
-                egs_dict[k] = v
+        for k, length in node_eg_dict.items():
+            egs_dict[k] = egs_dict.get(k, 0) + length
 
     return egs_dict
 
@@ -814,8 +787,7 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     Returns
     -------
     dict
-        Maps each run to a dict of equivalence-group key →
-        :class:`EquivalenceGroup`.
+        Maps each run to a dict of equivalence-group key → length in codons.
     """
     egs: dict = {}
     key_cache: dict = {}
@@ -823,9 +795,7 @@ def make_equivalence_groups(loc, runs: list) -> dict:
 
     # read_length -> read-equivalence DAG (run-independent).
     dag_cache: dict = {}
-    # (read_length, oua, cleavage signature) -> {eg_key: length}.  A fresh
-    # EquivalenceGroup is created per run on lookup because read_count is
-    # accumulated per run downstream, so the cached objects must not be shared.
+    # (read_length, oua, cleavage signature) -> {eg_key: length}.
     contrib_cache: dict = {}
 
     for run in runs:
@@ -852,24 +822,17 @@ def make_equivalence_groups(loc, runs: list) -> dict:
                         )
                         for tr in loc.transcripts
                     }
-                    contrib = {
-                        k: v.length
-                        for k, v in get_equivalence_groups_dict(
-                            read_equivalence_graph,
-                            egis,
-                            read_length,
-                            oua,
-                            key_cache=key_cache,
-                        ).items()
-                    }
+                    contrib = get_equivalence_groups_dict(
+                        read_equivalence_graph,
+                        egis,
+                        read_length,
+                        oua,
+                        key_cache=key_cache,
+                    )
                     contrib_cache[ckey] = contrib
 
                 for k, length in contrib.items():
-                    eg = run_egs.get(k)
-                    if eg is None:
-                        run_egs[k] = EquivalenceGroup(length=length)
-                    else:
-                        eg.length += length
+                    run_egs[k] = run_egs.get(k, 0) + length
 
     return egs
 

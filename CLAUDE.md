@@ -29,7 +29,7 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 **Core data structures:**
 - `Locus` (`locus.py`): the transcripts of one genomic unit, its RGR candidates, equivalence groups and activity matrix; every attribute a worker fills in is declared in `_init_state`.
 - `ReadGeneratingRegion` (RGR, `genomic_features.py`): A candidate translated region (ORF or NOISE type).
-- `EquivalenceGroup` (`equivalence_groups.py`): Reads compatible with the same ORF set — the rows of the sparse design matrix fed to the optimizer. `read_routing.EgRoutingCache` freezes that routing for the EM.
+- Equivalence groups (`equivalence_groups.py`): reads compatible with the same ORF set — the rows of the sparse design matrix fed to the optimizer. `make_equivalence_groups` yields their geometry (`{run: {key: length}}`); `read_routing.ReadRouting` is the sole representation once the reads are routed (response, design matrix, multimapping rates and RGR removal all derive from its arrays), and the light EM M-steps load it alone.
 - `CleavageModel` / `CoverageModel`: Per-dataset learned distributions used to compute per-read per-ORF likelihoods.
 
 **Output**: Per-locus TSV/GTF/BED rows under `regions_activities/` (per filtering stage with `export_all_steps`), then aggregated TPM-normalized output (`orfs_tpm.tsv`, `regions_tpm.tsv`).
@@ -38,7 +38,7 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 
 **Coordinates:** Always 0-based, half-open intervals. GTF input is 1-based and must be converted on load. Multi-exonic regions are stored in chromosome order — negative-strand regions are therefore in reverse translation order; account for this when computing reading frames.
 
-**RGR indexing and equivalence-group keys:** `Locus.rgrs` is an ordered list and an RGR's position in it is `rgr.index`, which addresses its design-matrix column block and its row of `result`. An equivalence-group key is `(cells, read_length, oua)` where each cell is the packed int `rgr.index * 12 + frame_code * 3 + covpos` (`equivalence_groups.pack_cell`; the routing cache and `mm_slots` use the same cells). Never drop RGRs by hand: `Locus.remove_rgrs` compacts the list and remaps every key.
+**RGR indexing and equivalence-group keys:** `Locus.rgrs` is an ordered list and an RGR's position in it is `rgr.index`, which addresses its design-matrix column block and its row of `result`. An equivalence-group key is `(cells, read_length, oua)` where each cell is the packed int `rgr.index * 12 + frame_code * 3 + covpos` (`equivalence_groups.pack_cell`; `ReadRouting` stores the same cells per row and per read). Never drop RGRs by hand: `Locus.remove_rgrs` compacts the list and rebuilds the routing.
 
 **Numerical stability:** Use `pseudo_min = 1e-14` to guard against `log(0)` in the Poisson likelihood. Do not remove or reduce this.
 
