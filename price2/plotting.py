@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 
+from price2.cleavage_model import DIST_STARTS_CENTRE
 from price2.coverage_model import (
     HIST_SIZE,
     START_BODY_SLICE,
@@ -241,7 +242,7 @@ def plot_cleavage_full(
     ax0.legend()
 
     # Panel 2: P-site distribution around CDS start
-    x = np.arange(len(model.dist_starts)) - 100
+    x = np.arange(len(model.dist_starts)) - DIST_STARTS_CENTRE
     ax1.bar(x, model.dist_starts, width=1, color="steelblue")
     ax1.set_xlabel("read-start position relative to CDS start")
     ax1.set_ylabel("read count")
@@ -250,7 +251,7 @@ def plot_cleavage_full(
     p_site_offset = int(np.argmax(model.pl))
     ax1.bar(
         -p_site_offset,
-        model.dist_starts[-p_site_offset + 100],
+        model.dist_starts[DIST_STARTS_CENTRE - p_site_offset],
         width=1,
         color="tab:red",
     )

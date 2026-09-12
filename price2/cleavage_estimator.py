@@ -18,6 +18,7 @@ from numba import njit, prange
 
 from price2.bam import iter_mapped
 from price2.cleavage_model import (
+    DIST_STARTS_CENTRE,
     MIN_PEAK_PROBABILITY,
     PLAUSIBLE_P_SITE_OFFSETS,
     CleavageModel,
@@ -120,7 +121,7 @@ class CleavageEstimator:
             instead of a soft-clip (see :func:`price2.bam.footprint`).
         """
         self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
-        self.dist_starts = np.zeros(shape=(200,), dtype=np.int32)
+        self.dist_starts = np.zeros(shape=(2 * DIST_STARTS_CENTRE,), dtype=np.int32)
         self.outside_cds = 0
         self.not_unique = 0
         self.not_countable = 0
@@ -203,8 +204,8 @@ class CleavageEstimator:
                         elif dist_to_start != new_dist_to_start:
                             break
                 else:
-                    if isinstance(dist_to_start, int) and (-100 < dist_to_start < 100):
-                        self.dist_starts[dist_to_start + 100] += 1
+                    if isinstance(dist_to_start, int) and abs(dist_to_start) < DIST_STARTS_CENTRE:
+                        self.dist_starts[DIST_STARTS_CENTRE + dist_to_start] += 1
 
         if self.counted_alns < min_counted_alns:
             logger.warning(
@@ -303,11 +304,11 @@ class CleavageEstimator:
     def _height(self, offset: int) -> float:
         """Read-start count at ``offset`` nt upstream of the CDS start.
 
-        ``dist_starts`` index 100 holds a read start sitting on the CDS start,
-        so an offset of ``o`` upstream sits at index ``100 - o``.
+        ``dist_starts`` index ``DIST_STARTS_CENTRE`` holds a read start sitting
+        on the CDS start, so an offset of ``o`` upstream sits ``o`` bins below it.
         """
         dist_starts = self.dist_starts
-        idx = 100 - offset
+        idx = DIST_STARTS_CENTRE - offset
         return float(dist_starts[idx]) if 0 <= idx < len(dist_starts) else 0.0
 
     def _reading_frame(self, min_offset: int = 6, max_offset: int = 25) -> int:
@@ -339,8 +340,10 @@ class CleavageEstimator:
         def correlation(offset: int) -> float:
             # Place ``pl`` with its peak at ``offset`` and correlate it with the
             # metagene, counting only positions inside the start-region window.
-            idx = 100 - (offset - peak + k)
-            inside = (100 - max_offset <= idx) & (idx <= 100 - min_offset)
+            idx = DIST_STARTS_CENTRE - (offset - peak + k)
+            inside = (DIST_STARTS_CENTRE - max_offset <= idx) & (
+                idx <= DIST_STARTS_CENTRE - min_offset
+            )
             return float(np.dot(pl[inside], self.dist_starts[idx[inside]]))
 
         offsets = range(min_offset, max_offset + 1)

@@ -1,8 +1,42 @@
 """Cleavage site estimation for Ribo-seq data.
 
 Provides the cleavage model (probability distributions for left and right
-cleavage positions relative to the P-site) and an EM-based estimator that
-learns the model parameters from mapped Ribo-seq reads.
+cleavage positions relative to the P-site) and its likelihood kernels; the
+EM-based estimator that learns the parameters from mapped Ribo-seq reads
+lives in :mod:`price2.cleavage_estimator`.
+
+Conventions
+-----------
+**Read-relative offsets.**  ``region_start`` / ``region_end`` of
+:meth:`CleavageModel.pmf`, :func:`read_in_cds_likelihood` and
+:func:`read_in_noise_likelihood` are 0-based, half-open offsets from the read
+start (the first aligned base is offset 0); ``length`` is the aligned length.
+``region_end = UNBOUNDED`` means "no downstream bound", and a call with the
+default region ``(0, UNBOUNDED)`` is served from the lookup tables.
+
+**Frame.**  ``frame`` is the phase of the read start relative to the CDS start,
+``(read_start - cds_start) % 3`` (``iv_on_cds[0] % 3`` in the estimator,
+``(read_start - rgr_start) % 3`` in the read routing).  Seen from the read
+start the codon boundaries therefore sit at ``f0 = (-frame) % 3``, ``f0 + 3``,
+...; an in-frame region bound must be ``≡ f0 (mod 3)``, and a P-site offset of
+``i`` nt puts the read in frame ``(-i) % 3``.  ``frame=None`` selects the
+noise model, which has no frame.  The estimator's count table is collected
+with column ``frame`` and, after ``CleavageEstimator.correct_table``, holds in
+column ``c`` the reads with P-site offset ``≡ c (mod 3)``, i.e. frame
+``(-c) % 3`` -- the convention of the EM and of :func:`read_in_cds_likelihood`.
+
+**Distances to the ORF bounds.**  ``dist_to_orf_start[(length, oua, frame)]``
+is ``-p`` for the largest region-start offset ``p`` at which the read keeps at
+least the overlap likelihood ratio, i.e. the most upstream read start relative
+to an ORF start that still plausibly overlaps it; ``dist_to_orf_end`` is
+``-p`` for the smallest offset ``p`` of the start of the region's last base
+(noise) or last codon (in frame) at which it still does, i.e. the most
+downstream such read start.  Both are ``<= 0``; a missing key means no such
+position.
+
+**``dist_starts``.**  Histogram of the read-start position relative to the CDS
+start: index ``DIST_STARTS_CENTRE + d`` counts the read starts ``d`` nt
+downstream of the CDS start (``d < 0`` upstream), ``|d| < DIST_STARTS_CENTRE``.
 """
 
 import importlib
@@ -22,6 +56,13 @@ PLAUSIBLE_P_SITE_OFFSETS: frozenset[int] = frozenset({11, 12, 13})
 
 #: Minimum probability mass on the upstream cleavage peak of a healthy model.
 MIN_PEAK_PROBABILITY: float = 0.3
+
+#: ``region_end`` value meaning "no downstream bound" (see *Conventions*).
+UNBOUNDED: int = 10**10
+
+#: Index of ``dist_starts`` that counts the read starts sitting on the CDS
+#: start; the histogram has ``2 * DIST_STARTS_CENTRE`` bins.
+DIST_STARTS_CENTRE: int = 100
 
 #: Names that moved to :mod:`price2.cleavage_estimator`, resolved lazily for
 #: older imports.
@@ -90,7 +131,7 @@ class CleavageModel:
                         frame=frame,
                         oua=oua,
                         region_start=0,
-                        region_end=10**10,
+                        region_end=UNBOUNDED,
                     )
         self.noise_lut = np.zeros((lut_len, 2), dtype=np.float64)
         for length in range(lut_len):
@@ -102,12 +143,12 @@ class CleavageModel:
                     length=length,
                     oua=oua,
                     region_start=0,
-                    region_end=10**10,
+                    region_end=UNBOUNDED,
                 )
 
         self.non_zero_lengths = np.nonzero(self.noise_lut.sum(axis=1))[0]
-        self.fill_dist_to_orf_start()
-        self.fill_dist_to_orf_end()
+        self.dist_to_orf_start = self._dist_to_orf_bound(end=False)
+        self.dist_to_orf_end = self._dist_to_orf_bound(end=True)
 
     def pmf(
         self,
@@ -115,7 +156,7 @@ class CleavageModel:
         oua: bool,
         frame: Optional[int] = None,
         region_start: int = 0,
-        region_end: int = 10**10,
+        region_end: int = UNBOUNDED,
     ) -> float:
         """Compute the probability of observing a read.
 
@@ -138,14 +179,11 @@ class CleavageModel:
         float
             Probability of the read under the model.
         """
-        # region_start relative to read start
-        # region_end relative to read start
-        # length is the matching length of the alignment
         if length >= len(self.pl) + len(self.pr) + 3 + int(oua):
             return 0
 
         if frame is None:  # noise
-            if region_start == 0 and region_end == 10**10:
+            if region_start == 0 and region_end == UNBOUNDED:
                 return self.noise_lut[length, int(oua)]
             return read_in_noise_likelihood(
                 self.pl,
@@ -157,14 +195,14 @@ class CleavageModel:
                 region_end,
             )
         else:  # CDS
-            if region_start == 0 and region_end == 10**10:
+            if region_start == 0 and region_end == UNBOUNDED:
                 return self.cds_lut[length, frame, int(oua)]
             f0 = (-frame) % 3
 
             if region_start and f0 != region_start % 3:
                 raise ValueError("region_start and frame are not compatible")
 
-            if region_end < 10**10 and f0 != region_end % 3:
+            if region_end < UNBOUNDED and f0 != region_end % 3:
                 raise ValueError("region_end and frame are not compatible")
 
             return read_in_cds_likelihood(
@@ -204,131 +242,64 @@ class CleavageModel:
             lut[index] = 0
         return max_prob_positions
 
-    def fill_dist_to_orf_start(
-        self, overlap_likelihood_ratio_thresh: float = 0.2
-    ) -> None:
-        """Pre-compute minimum distance from read start to ORF start.
+    def _dist_to_orf_bound(
+        self, end: bool, overlap_likelihood_ratio_thresh: float = 0.2
+    ) -> dict[tuple[int, bool, Optional[int]], int]:
+        """Distances from the read start to the ORF start or end (*Conventions*).
 
-        For every valid ``(read_length, oua, frame)`` combination,
-        determine the farthest upstream position where the
-        likelihood ratio still exceeds *overlap_likelihood_ratio_thresh*.
+        For every ``(read_length, oua, frame)`` with a non-zero unbounded
+        likelihood, scan the region-start offsets (``end=False``) or the
+        offsets of the region's last base / codon (``end=True``) and keep
+        the farthest one at which the bounded-to-unbounded likelihood ratio
+        still exceeds *overlap_likelihood_ratio_thresh*.  In-frame offsets
+        step through the codon starts ``(-frame) % 3, +3, ...``; the noise
+        model scans every base.
 
-        Parameters
-        ----------
-        overlap_likelihood_ratio_thresh : float, optional
-            Likelihood ratio threshold (default 0.2).
+        Returns
+        -------
+        dict
+            ``(read_length, oua, frame) -> -offset``; a combination without
+            any qualifying offset is absent.
         """
-        self.dist_to_orf_start: dict[tuple[int, bool, Optional[int]], int] = {}
+        dist: dict[tuple[int, bool, Optional[int]], int] = {}
         for read_length in self.non_zero_lengths:
-            for oua in [True, False]:
-                for frame in [None, 0, 1, 2]:
+            for oua in (True, False):
+                for frame in (None, 0, 1, 2):
                     cl = self.pmf(read_length, oua, frame)
                     if cl == 0:
                         continue
-                    if isinstance(frame, int):
-                        positions = np.arange(-frame % 3, read_length, 3)
-                    else:
+                    if frame is None:
                         positions = np.arange(read_length)
-                    likelihoods = np.empty(positions.shape)
+                        unit = 1
+                    else:
+                        positions = np.arange((-frame) % 3, read_length, 3)
+                        unit = 3
+                    ratios = np.empty(positions.shape)
                     for i, pos in enumerate(positions):
-                        ol = self.pmf(
-                            read_length,
-                            oua,
-                            frame,
-                            region_start=pos,
-                        )
-                        likelihoods[i] = ol / cl
-                    try:
-                        position = -positions[
-                            likelihoods > overlap_likelihood_ratio_thresh
-                        ].max()
-                        self.dist_to_orf_start[(read_length, oua, frame)] = position
-                    except ValueError:
-                        pass
+                        if end:
+                            ol = self.pmf(read_length, oua, frame, region_end=pos + unit)
+                        else:
+                            ol = self.pmf(read_length, oua, frame, region_start=pos)
+                        ratios[i] = ol / cl
+                    kept = positions[ratios > overlap_likelihood_ratio_thresh]
+                    if kept.size:
+                        dist[(read_length, oua, frame)] = -(kept.min() if end else kept.max())
+        return dist
 
     def get_dist_to_orf_start(
-        self,
-        read_length: int,
-        oua: bool,
-        frame: Optional[int],
+        self, read_length: int, oua: bool, frame: Optional[int]
     ) -> int:
-        """Return minimum distance from read start to ORF start.
-
-        Lazily initialises the lookup via
-        :meth:`fill_dist_to_orf_start` on first access.
-        """
-        try:
-            return self.dist_to_orf_start[(read_length, oua, frame)]
-        except AttributeError:
-            self.fill_dist_to_orf_start()
-            return self.dist_to_orf_start[(read_length, oua, frame)]
-
-    def fill_dist_to_orf_end(
-        self, overlap_likelihood_ratio_thresh: float = 0.2
-    ) -> None:
-        """Pre-compute minimum distance from read start to ORF end.
-
-        For every valid ``(read_length, oua, frame)`` combination,
-        determine the farthest downstream position where the
-        likelihood ratio still exceeds *overlap_likelihood_ratio_thresh*.
-
-        Parameters
-        ----------
-        overlap_likelihood_ratio_thresh : float, optional
-            Likelihood ratio threshold (default 0.2).
-        """
-        self.dist_to_orf_end: dict[tuple[int, bool, Optional[int]], int] = {}
-        for read_length in self.non_zero_lengths:
-            for oua in [True, False]:
-                for frame in [None, 0, 1, 2]:
-                    cl = self.pmf(read_length, oua, frame)
-                    if cl == 0:
-                        continue
-                    if isinstance(frame, int):
-                        positions = np.arange(-frame % 3, read_length, 3)
-                    else:
-                        positions = np.arange(read_length)
-                    likelihoods = np.empty(positions.shape)
-                    for i, pos in enumerate(positions):
-                        if frame is None:
-                            ol = self.pmf(
-                                read_length,
-                                oua,
-                                frame,
-                                region_end=pos + 1,
-                            )
-                        else:
-                            ol = self.pmf(
-                                read_length,
-                                oua,
-                                frame,
-                                region_end=pos + 3,
-                            )
-                        likelihoods[i] = ol / cl
-                    try:
-                        position = -positions[
-                            likelihoods > overlap_likelihood_ratio_thresh
-                        ].min()
-                        self.dist_to_orf_end[(read_length, oua, frame)] = position
-                    except ValueError:
-                        pass
+        """Offset (``<= 0``) of the most upstream plausible read start relative
+        to an ORF start; ``KeyError`` when none exists (*Conventions*)."""
+        return self.dist_to_orf_start[(read_length, oua, frame)]
 
     def get_dist_to_orf_end(
-        self,
-        read_length: int,
-        oua: bool,
-        frame: Optional[int],
+        self, read_length: int, oua: bool, frame: Optional[int]
     ) -> int:
-        """Return minimum distance from read start to ORF end.
-
-        Lazily initialises the lookup via
-        :meth:`fill_dist_to_orf_end` on first access.
-        """
-        try:
-            return self.dist_to_orf_end[(read_length, oua, frame)]
-        except AttributeError:
-            self.fill_dist_to_orf_end()
-            return self.dist_to_orf_end[(read_length, oua, frame)]
+        """Offset (``<= 0``) of the most downstream plausible read start
+        relative to the start of an ORF's last base (noise) or last codon (in
+        frame); ``KeyError`` when none exists (*Conventions*)."""
+        return self.dist_to_orf_end[(read_length, oua, frame)]
 
     def is_plausible(self) -> bool:
         """Whether the upstream cleavage peak looks like a healthy library's.
@@ -447,7 +418,7 @@ def read_in_cds_likelihood(
     frame: int,
     oua: bool,
     region_start: int = 0,
-    region_end: int = 10**10,
+    region_end: int = UNBOUNDED,
 ) -> float:
     """Compute the likelihood of a read under the CDS model.
 
@@ -526,7 +497,7 @@ def read_in_noise_likelihood(
     length: int,
     oua: bool,
     region_start: int = 0,
-    region_end: int = 10**10,
+    region_end: int = UNBOUNDED,
 ) -> float:
     """Compute the likelihood of a read under the noise model.
 
