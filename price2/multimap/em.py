@@ -7,28 +7,25 @@ import sqlite3 as sql
 import numpy as np
 
 from price2 import database
-from price2.multimap.linkage import _linkage
+from price2.multimap.linkage import Linkage, _linkage
 
 
 def _slot_vector(
-    cur: sql.Cursor, table: str, column: str, iteration: int, link: dict
+    cur: sql.Cursor, table: str, column: str, iteration: int, link: Linkage
 ) -> np.ndarray:
     """Gather one iteration's per-locus blobs into a dense per-slot vector.
 
     *table* holds one bare ``float64`` buffer per locus in canonical slot
-    order; *link* (see :func:`_linkage`) says where each locus's slots sit.
-    Loci without a row stay zero.
+    order; *link* says where each locus's slots sit.  Loci without a row
+    stay zero.
     """
-    vector = np.zeros(int(link["n_slots"]), dtype=np.float64)
-    locus_index = link["locus_index"]
-    locus_off = link["locus_off"]
+    vector = np.zeros(link.n_slots, dtype=np.float64)
     cur.execute(
         f"SELECT locus_id, {column} FROM {table} WHERE iteration = ?",
         (iteration,),
     )
     for locus_id, blob in cur.fetchall():
-        i = locus_index[locus_id]
-        vector[locus_off[i]:locus_off[i + 1]] = np.frombuffer(
+        vector[link.locus_slice(link.locus_index[locus_id])] = np.frombuffer(
             blob, dtype=np.float64
         )
     return vector
@@ -68,14 +65,12 @@ def e_step(db_path: str, iteration: int) -> float:
     the canonical per-locus slot order, so no key matching is needed.
     """
     link = _linkage(db_path)
-    n_slots = int(link["n_slots"])
+    n_slots = link.n_slots
     if n_slots == 0:
         return 0.0
-    member_mmg = link["member_mmg"]
-    member_slot = link["member_slot"]
-    mmg_count = link["mmg_count"]
-    locus_off = link["locus_off"]
-    locus_index = link["locus_index"]
+    member_mmg = link.member_mmg
+    member_slot = link.member_slot
+    mmg_count = link.mmg_count
     n_groups = mmg_count.size
 
     with database.connect(db_path) as db:
@@ -134,8 +129,8 @@ def e_step(db_path: str, iteration: int) -> float:
     # needed.
     it_next = iteration + 1
     weight_rows = [
-        (it_next, locus_id, new_slot[locus_off[i]:locus_off[i + 1]].tobytes())
-        for locus_id, i in locus_index.items()
+        (it_next, locus_id, new_slot[link.locus_slice(i)].tobytes())
+        for locus_id, i in link.locus_index.items()
     ]
     with database.connect(db_path, wal_writer=True, commit=True) as db:
         cur = db.cursor()

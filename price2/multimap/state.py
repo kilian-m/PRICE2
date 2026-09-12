@@ -21,12 +21,11 @@ the baseline keeps its keys, since the workers need them.
 from __future__ import annotations
 
 import sqlite3 as sql
-from collections import defaultdict
 
 import numpy as np
 
 from price2 import database
-from price2.multimap.linkage import _run_index, _slot_keys
+from price2.multimap.linkage import LocusSlots, _run_index
 
 
 def reset_em_state(db_path: str) -> None:
@@ -73,17 +72,17 @@ def _baseline_weight_rows(cur: sql.Cursor) -> list:
     """
     run_ids = sorted(r for (r,) in cur.execute("SELECT run_id FROM runs").fetchall())
     run_index = {run_id: i for i, run_id in enumerate(run_ids)}
-    rows = []
-    for locus_id, blob in cur.execute(
-        "SELECT locus_id, base_blob FROM multimap_slot_base"
-    ).fetchall():
-        base_map = database.unpickle_blob(blob)
-        keys = _slot_keys(base_map, run_index)
-        weights = np.fromiter(
-            (base_map[k] for k in keys), dtype=np.float64, count=len(keys)
+    return [
+        (
+            locus_id,
+            LocusSlots.from_base_map(
+                database.unpickle_blob(blob), run_index
+            ).base.tobytes(),
         )
-        rows.append((locus_id, weights.tobytes()))
-    return rows
+        for locus_id, blob in cur.execute(
+            "SELECT locus_id, base_blob FROM multimap_slot_base"
+        ).fetchall()
+    ]
 
 
 def slot_locus_ids(db_path: str) -> set:
@@ -155,8 +154,8 @@ def em_resume_point(db_path: str) -> tuple[int, set] | None:
 
 def load_locus_mm_data(
     db_path: str, locus_id: str, iteration: int
-) -> dict:
-    """Load per-slot ``(base, weight)`` for a locus at a given iteration.
+) -> LocusSlots | None:
+    """Load a locus's multimapping slots with their weights at an iteration.
 
     Parameters
     ----------
@@ -169,10 +168,10 @@ def load_locus_mm_data(
 
     Returns
     -------
-    dict
-        ``{run_id: {group_key: (base, weight)}}``.  A slot present in the
-        baseline but missing a weight row (should not happen) falls back
-        to its baseline (full weight).
+    LocusSlots or None
+        ``None`` when the locus has no multimapping slot.  A locus whose
+        weight row is missing for the iteration (should not happen) gets
+        its baseline, i.e. full weights.
     """
     with database.connect(db_path) as db:
         base_row = db.execute(
@@ -180,27 +179,17 @@ def load_locus_mm_data(
             (locus_id,),
         ).fetchone()
         if base_row is None:
-            return {}
+            return None
         w_row = db.execute(
             "SELECT weight_blob FROM group_weights "
             "WHERE locus_id = ? AND iteration = ?",
             (locus_id, iteration),
         ).fetchone()
-    base_map = database.unpickle_blob(base_row[0])  # {(run_id, group_key): base}
-    # ``weight_blob`` is a bare float64 buffer over the locus's slots in
-    # canonical order (see ``_slot_keys``); a missing row falls back to the
-    # baseline, i.e. full weight.
-    weights = (
-        np.frombuffer(w_row[0], dtype=np.float64) if w_row is not None else None
+    return LocusSlots.from_base_map(
+        database.unpickle_blob(base_row[0]),
+        _run_index(db_path),
+        w_row[0] if w_row is not None else None,
     )
-    keys = _slot_keys(base_map, _run_index(db_path))
-
-    out: dict = defaultdict(dict)
-    for i, key in enumerate(keys):
-        run_id, gk = key
-        base = base_map[key]
-        out[run_id][gk] = (base, float(weights[i]) if weights is not None else base)
-    return dict(out)
 
 
 def load_warm_activities(
@@ -240,7 +229,7 @@ def write_locus_em_output(
     iteration: int,
     activities: dict,
     lambdas: list,
-    mm_data: dict | None = None,
+    slots: LocusSlots | None,
 ) -> None:
     """Persist a light M-step's activities and per-slot ``λ`` values.
 
@@ -258,34 +247,33 @@ def write_locus_em_output(
     lambdas : list of (run_id, group_key, lam)
         Per-slot origin rates for this locus's multimapping slots.  Slots whose
         reads were filtered out are absent and score ``λ = 0``.
-    mm_data : dict, optional
-        ``{run_id: {group_key: (base, weight)}}`` for this locus, which fixes
-        the canonical slot order λ is written in.  Required when *lambdas* is
-        non-empty.
+    slots : LocusSlots or None
+        The locus's slots, which fix the order λ is written in; ``None`` for
+        a locus without multimapping slots.
+
+    Raises
+    ------
+    FloatingPointError
+        When a λ is not finite: the E-step could not normalise it, and
+        catching it here names the locus.
     """
+    lam_vector = None
+    if slots is not None:
+        # Dense over the locus's slots, in canonical order, so the E-step can
+        # drop it straight into its per-slot vector.
+        lam_vector = slots.lambda_vector(lambdas)
+        if not np.isfinite(lam_vector).all():
+            raise FloatingPointError(
+                f"locus {locus_id}: {int((~np.isfinite(lam_vector)).sum())} "
+                f"non-finite λ at iteration {iteration}"
+            )
     with database.connect(db_path, wal_writer=True, commit=True) as db:
         cur = db.cursor()
         cur.execute(
             "INSERT OR REPLACE INTO locus_activities VALUES (?, ?, ?)",
             (iteration, locus_id, database.compress_blob(activities)),
         )
-        if lambdas:
-            if mm_data is None:
-                raise ValueError("mm_data is required to order a locus's lambdas")
-            # Dense over the locus's slots, in canonical order, so the E-step can
-            # drop it straight into its per-slot vector.
-            run_index = _run_index(db_path)
-            keys = sorted(
-                (
-                    (run_index[run_id], gk)
-                    for run_id, slots in mm_data.items()
-                    for gk in slots
-                )
-            )
-            position = {key: i for i, key in enumerate(keys)}
-            lam_vector = np.zeros(len(keys), dtype=np.float64)
-            for run_id, gk, lam in lambdas:
-                lam_vector[position[(run_index[run_id], gk)]] = lam
+        if lam_vector is not None:
             cur.execute(
                 "INSERT OR REPLACE INTO group_lambdas VALUES (?, ?, ?)",
                 (iteration, locus_id, lam_vector.tobytes()),

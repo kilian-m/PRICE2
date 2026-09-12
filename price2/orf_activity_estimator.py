@@ -439,13 +439,16 @@ def process_loc(job: LocusJob) -> LocusResult | None:
     # that the routing it builds is stored with it.
     save_prepared = job.em_light and job.em_iteration == 0
 
-    mm_data = _apply_em_state(job, loc, runs, layout.db_path)
+    slots = _apply_em_state(job, loc, runs, layout.db_path)
+    mm_data = slots.by_run() if slots is not None else None
     with perf.timed("proc_reads_2_time"):
         loc.assign_reads_to_egs(runs, mm_data)
     perf["read_count"] = sum(loc.counted_reads.values())
 
     if job.em_light:
-        _light_mstep(job, loc, runs, mm_data, save_prepared, config, layout, perf)
+        _light_mstep(
+            job, loc, runs, slots, mm_data, save_prepared, config, layout, perf
+        )
         return None
 
     _full_pass(loc, runs, config, perf, outputs)
@@ -577,12 +580,13 @@ def _prepare_locus(
 
 def _apply_em_state(
     job: LocusJob, loc: Locus, runs: list[RiboSeqRun], db_path: str
-) -> dict | None:
-    """Warm-start the activities and load the fractional read weights.
+) -> multimap.LocusSlots | None:
+    """Warm-start the activities and load the locus's slots with their weights.
 
     The RGR set is final here (all pre-deconvolution filters have run), so
     warm-start activities align by ``rgr.id`` and the weights apply per
-    multimapping slot.  ``None`` outside EM mode (classic full counting).
+    multimapping slot.  ``None`` outside EM mode (classic full counting)
+    and for a locus without multimapping slots.
     """
     if not job.em_mode:
         return None
@@ -599,6 +603,7 @@ def _light_mstep(
     job: LocusJob,
     loc: Locus,
     runs: list[RiboSeqRun],
+    slots: multimap.LocusSlots | None,
     mm_data: dict | None,
     save_prepared: bool,
     config: Config,
@@ -626,7 +631,7 @@ def _light_mstep(
         job.em_iteration,
         loc.activities_by_id(),
         loc.compute_multimap_lambdas(runs),
-        mm_data,
+        slots,
     )
 
 

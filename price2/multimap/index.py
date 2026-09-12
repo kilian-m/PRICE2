@@ -74,7 +74,7 @@ def _load_run_spill(run_spill_dir: str) -> tuple:
     return qh, li, gk
 
 
-def _index_run(args: tuple) -> tuple:
+def _index_run(run_spill_dir: str) -> tuple:
     """Collapse one run's spilled alignments into multimap groups.
 
     Fully vectorised: the per-read slot grouping and the collapse of
@@ -84,8 +84,8 @@ def _index_run(args: tuple) -> tuple:
 
     Parameters
     ----------
-    args : tuple
-        ``(run_spill_dir,)``.
+    run_spill_dir : str
+        ``<spill_dir>/<run_id>``.
 
     Returns
     -------
@@ -95,7 +95,6 @@ def _index_run(args: tuple) -> tuple:
         ``slot_li`` / ``slot_gk`` the concatenated per-MMG slots (a CSR
         layout with row lengths ``slot_k``).
     """
-    (run_spill_dir,) = args
     empty = (
         np.empty(0, np.int64), np.empty(0, np.int64),
         np.empty(0, np.uint32), np.empty(0, np.uint64),
@@ -238,7 +237,7 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         return 0
 
     locus_ids = np.load(os.path.join(root, "loci.npy")).tolist()
-    tasks = [(os.path.join(root, r),) for r in run_ids]
+    tasks = [os.path.join(root, r) for r in run_ids]
     n_proc = max(1, min(processes, len(tasks)))
 
     # Fork before opening the database: SQLite connections must not be carried

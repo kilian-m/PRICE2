@@ -56,7 +56,7 @@ The names below are the package's public API.
 from price2.multimap.em import e_step
 from price2.multimap.index import build_multimap_index, has_multimap_index
 from price2.multimap.keys import alignment_group_key, group_key, qname_hash
-from price2.multimap.linkage import linkage_path
+from price2.multimap.linkage import Linkage, LocusSlots, linkage_path
 from price2.multimap.prepared import (
     load_light_locus,
     load_locus_routing,
@@ -84,6 +84,8 @@ from price2.multimap.state import (
 )
 
 __all__ = [
+    "Linkage",
+    "LocusSlots",
     "SPILL_DIRNAME",
     "SPILL_FLUSH_ROWS",
     "alignment_group_key",

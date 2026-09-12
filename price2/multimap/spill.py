@@ -79,12 +79,29 @@ def reset_run_spill(root: str, run_id: str) -> None:
 #: worker never reaches it and spills exactly once, when the run finishes.
 SPILL_FLUSH_ROWS = 2_000_000
 
-#: ``run_spill_dir -> {"q": [...], "l": [...], "g": [...], "n": int, "seq": int}``
-#: Process-local: each collection worker accumulates only its own alignments.
-_SPILL_BUFFERS: dict[str, dict] = {}
-_SPILL_FINALIZER = None
-
 _SPILL_COLUMNS = (("q", np.uint64), ("l", np.uint32), ("g", np.uint64))
+
+
+class _SpillBuffer:
+    """One collection worker's alignments of one run not yet written out."""
+
+    __slots__ = ("columns", "n", "seq")
+
+    def __init__(self) -> None:
+        #: Per column, the arrays appended so far.
+        self.columns: dict[str, list[np.ndarray]] = {
+            key: [] for key, _ in _SPILL_COLUMNS
+        }
+        #: Rows buffered.
+        self.n = 0
+        #: Flushes done, numbering the files.
+        self.seq = 0
+
+
+#: ``run_spill_dir -> buffer``.  Process-local: each collection worker
+#: accumulates only its own alignments.
+_SPILL_BUFFERS: dict[str, _SpillBuffer] = {}
+_SPILL_FINALIZER = None
 
 
 def write_spill(
@@ -128,16 +145,15 @@ def write_spill(
 
     buf = _SPILL_BUFFERS.get(run_spill_dir)
     if buf is None:
-        buf = {"q": [], "l": [], "g": [], "n": 0, "seq": 0}
-        _SPILL_BUFFERS[run_spill_dir] = buf
+        buf = _SPILL_BUFFERS[run_spill_dir] = _SpillBuffer()
 
     for (key, dtype), values in zip(
         _SPILL_COLUMNS, (qname_hashes, locus_indices, group_keys)
     ):
-        buf[key].append(np.asarray(values, dtype=dtype))
-    buf["n"] += len(qname_hashes)
+        buf.columns[key].append(np.asarray(values, dtype=dtype))
+    buf.n += len(qname_hashes)
 
-    if buf["n"] >= SPILL_FLUSH_ROWS:
+    if buf.n >= SPILL_FLUSH_ROWS:
         flush_spill(run_spill_dir)
 
 
@@ -165,12 +181,12 @@ def flush_spill(run_spill_dir: str | None = None) -> int:
     written = 0
     for target in targets:
         buf = _SPILL_BUFFERS.get(target)
-        if buf is None or buf["n"] == 0:
+        if buf is None or buf.n == 0:
             continue
         os.makedirs(target, exist_ok=True)
-        stem = f"{os.getpid():07d}-{buf['seq']:04d}"
+        stem = f"{os.getpid():07d}-{buf.seq:04d}"
         for key, dtype in _SPILL_COLUMNS:
-            parts = buf[key]
+            parts = buf.columns[key]
             arr = (
                 np.concatenate(parts) if parts else np.empty(0, dtype=dtype)
             )
@@ -181,9 +197,9 @@ def flush_spill(run_spill_dir: str | None = None) -> int:
             np.save(tmp, arr)
             os.replace(tmp, final)
             parts.clear()
-        written += buf["n"]
-        buf["n"] = 0
-        buf["seq"] += 1
+        written += buf.n
+        buf.n = 0
+        buf.seq += 1
     return written
 
 
