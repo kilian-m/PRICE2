@@ -163,7 +163,7 @@ whole dataset panel, and only its magnitude varies per run.
 
 ## 4. The E-step — fractional reassignment of multimapping reads
 
-`multimap.py :: e_step`, one global reduce between M-step fan-outs.
+`multimap/em.py :: e_step`, one global reduce between M-step fan-outs.
 
 ```mermaid
 flowchart LR
