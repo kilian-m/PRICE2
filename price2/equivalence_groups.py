@@ -1,9 +1,10 @@
 """Equivalence group construction for Ribo-seq deconvolution.
 
-Builds a splice-aware read equivalence graph from transcript annotations and
-maps read start positions to sets of compatible ORFs (ReadGeneratingRegions).
-These equivalence groups are the core data structure consumed by the
-deconvolution optimiser.
+Enumerates, per read length, the runs of read start positions that share a
+genomic footprint across a locus's transcripts (:func:`read_start_runs`) and
+maps them, through the cleavage model, to the sets of compatible ORFs
+(ReadGeneratingRegions).  These equivalence groups are the core data
+structure consumed by the deconvolution optimiser.
 
 The equivalence-group key
 -------------------------
@@ -27,9 +28,6 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from enum import Enum, auto
-
-import HTSeq
 
 from price2.coverage_position import CoveragePosition
 from price2.genomic_features import Transcript
@@ -73,60 +71,6 @@ def unpack_cell(cell: int) -> tuple[int, int | None, CoveragePosition]:
     rgr_index, code = divmod(cell, CELL_CODES)
     frame_code, covpos = divmod(code, 3)
     return rgr_index, (None if frame_code == NO_FRAME else frame_code), CoveragePosition(covpos)
-
-
-class NodeType(Enum):
-    """Role of a node in the splice or read-equivalence graph."""
-
-    SOURCE = auto()
-    INTERNAL = auto()
-    SINK = auto()
-
-
-class Node:
-    """A node in a splice graph or read-equivalence DAG.
-
-    Attributes
-    ----------
-    iv : HTSeq.GenomicInterval
-        Genomic interval covered by this node.
-    transcripts_positions : dict[Transcript, int]
-        Maps each transcript passing through this node to the transcript-
-        coordinate position at which the node begins.
-    upstream : dict[Node, set[Transcript]]
-        Mapping from upstream neighbour nodes to the transcripts that connect
-        them to this node.
-    downstream : dict[Node, set[Transcript]]
-        Mapping from downstream neighbour nodes to the transcripts that connect
-        this node to them.
-    typ : NodeType
-        Role of this node (SOURCE, INTERNAL, or SINK).
-    """
-
-    iv: HTSeq.GenomicInterval
-    transcripts_positions: dict[Transcript, int]
-    upstream: dict[Node, set[Transcript]]
-    downstream: dict[Node, set[Transcript]]
-    typ: NodeType
-
-    def __init__(
-        self, iv: HTSeq.GenomicInterval, typ: NodeType = NodeType.INTERNAL
-    ) -> None:
-        self.iv = iv
-        self.transcripts_positions: dict[Transcript, int] = {}
-        self.upstream: dict[Node, set[Transcript]] = defaultdict(set)
-        self.downstream: dict[Node, set[Transcript]] = defaultdict(set)
-        self.typ = typ
-
-    @staticmethod
-    def source_node() -> Node:
-        """Create a sentinel source node for graph traversal."""
-        return Node(HTSeq.GenomicInterval("chr1", 0, 0, "+"), NodeType.SOURCE)
-
-    @staticmethod
-    def sink_node() -> Node:
-        """Create a sentinel sink node for graph traversal."""
-        return Node(HTSeq.GenomicInterval("chr1", 1e10, 1e10, "+"), NodeType.SINK)
 
 
 class EquivalenceGroupIntervals:
@@ -261,415 +205,143 @@ class EquivalenceGroupIntervals:
         return egs
 
 
-def make_splice_graph(transcripts: HTSeq.GenomicArrayOfSets) -> Node:
-    """Build a splice graph (DAG) from a genomic array of transcript sets.
+def _exons_in_transcription_order(
+    transcript: Transcript, minus: bool
+) -> list[tuple[int, int]]:
+    """The transcript's exons as genomic ``(start, end)`` in transcription order.
 
-    Each node in the returned DAG corresponds to a contiguous exonic block
-    (a step in *transcripts*) and stores the transcript-coordinate offset at
-    which that block begins for every transcript that passes through it.
-
-    Parameters
-    ----------
-    transcripts : HTSeq.GenomicArrayOfSets
-        Genomic array where each step maps to the set of transcripts covering
-        that interval.
-
-    Returns
-    -------
-    Node
-        The source sentinel node of the splice graph.
+    Abutting exons (one ending where the next begins) are merged: a read's
+    footprint does not see such a boundary, so neither may the runs.
     """
-    source = Node.source_node()
-    transcript_lengths = defaultdict(int)
-    prev_nodes = dict()
-
-    steps = list(transcripts.steps())
-    try:
-        strand = next(iv.strand for iv, transcript_set in steps if transcript_set)
-    except StopIteration:
-        raise ValueError("the locus has no transcript to build a splice graph from")
-
-    if strand == "-":
-        steps = steps[::-1]
-
-    for step_iv, transcript_set in steps:
-        if not transcript_set:
-            continue
-        node = Node(step_iv)
-        for transcript in transcript_set:
-            source.transcripts_positions[transcript] = 0
-            node.transcripts_positions[transcript] = transcript_lengths[transcript]
-            transcript_lengths[transcript] += step_iv.length
-            if transcript not in prev_nodes:
-                node.upstream[source].add(transcript)
-                source.downstream[node].add(transcript)
-            else:
-                node.upstream[prev_nodes[transcript]].add(transcript)
-                prev_nodes[transcript].downstream[node].add(transcript)
-            prev_nodes[transcript] = node
-
-    sink = Node.sink_node()
-    for transcript, node in prev_nodes.items():
-        node.downstream[sink].add(transcript)
-        sink.upstream[node].add(transcript)
-    return source
+    merged: list[tuple[int, int]] = []
+    for iv in transcript.exons.intervals:
+        if merged and merged[-1][1] == iv.start:
+            merged[-1] = (merged[-1][0], iv.end)
+        else:
+            merged.append((iv.start, iv.end))
+    return merged[::-1] if minus else merged
 
 
-def make_read_equivalence_node(
-    start: int,
-    length: int,
-    transcripts_positions: dict[Transcript, int],
-) -> Node:
-    """Create a read-equivalence node covering a fixed genomic range.
+def read_start_runs(
+    transcripts: list[Transcript], read_length: int, strand: str
+) -> list[tuple[dict[Transcript, int], int]]:
+    """Runs of read start positions sharing a footprint and its transcripts.
+
+    A read of length ``L`` starting at position ``p`` of transcript ``t``
+    (``0 <= p <= len(t) - L``) has a genomic footprint: the ``L`` bases of
+    ``t`` from ``p`` on, following ``t``'s splicing.  Starts on different
+    transcripts are the same read when their footprints coincide; the read
+    is then compatible with every one of those transcripts.  This function
+    returns the maximal runs of consecutive start positions whose set of
+    compatible transcripts is constant, each as ``(positions, length)``:
+    the transcript coordinate of the run's first start on every compatible
+    transcript, and the number of starts in the run.  Runs partition the
+    valid starts of every transcript, so summing anything over their
+    positions sums it over all possible reads.
+
+    Two starts share a footprint exactly when their 5' bases coincide
+    genomically and the reads cross the same junctions, so the starts are
+    grouped by the *chain* of intron boundaries a read from them crosses
+    (empty for a read within one exon).  Within a chain a transcript's
+    starts form one range of 5'-end coordinates, bounded by its first exon
+    of the chain on the 5' side and its last exon on the 3' side; a sweep
+    over those range boundaries yields the runs.
 
     Parameters
     ----------
-    start : int
-        Genomic start position of the node interval.
-    length : int
-        Length of the interval in nucleotides.
-    transcripts_positions : dict[Transcript, int]
-        Transcript-to-transcript-coordinate mapping for this node.
-
-    Returns
-    -------
-    Node
-        A new INTERNAL node with the given interval and transcript positions.
-    """
-    gi = HTSeq.GenomicInterval("chr1", start, start + length, "+")
-    node = Node(gi)
-    node.transcripts_positions = transcripts_positions
-    return node
-
-
-def recur_shift_read_end(
-    root_splice_node: Node,
-    current_splice_node: Node,
-    read_length: int,
-    cumulated_length: int,
-    intersected_transcripts_positions: dict[Transcript, int],
-) -> set[Node]:
-    """Recursively extend a read to its 3' end across splice junctions.
-
-    Walks downstream through the splice graph until *read_length* nucleotides
-    have been accumulated, then delegates to :func:`recur_shift_read_start` to
-    build the corresponding read-equivalence node.
-
-    Parameters
-    ----------
-    root_splice_node : Node
-        The splice-graph node at which the current read starts.
-    current_splice_node : Node
-        The splice-graph node currently being processed in the recursion.
+    transcripts : list[Transcript]
+        The locus's transcripts; a run lists its transcripts in this order.
     read_length : int
-        Total length of the read in nucleotides.
-    cumulated_length : int
-        Nucleotides accumulated so far while traversing downstream.
-    intersected_transcripts_positions : dict[Transcript, int]
-        Transcripts still compatible with the read and their current
-        transcript-coordinate positions.
-
-    Returns
-    -------
-    set[Node]
-        Set of read-equivalence nodes representing all valid end positions.
+        Read length ``L``.
+    strand : str
+        The locus strand (``"+"`` or ``"-"``).
     """
-    # 1. case current_node is sink
-    # return
-    if current_splice_node.typ == NodeType.SINK:
-        return set()
-    if current_splice_node.typ == NodeType.SOURCE:
-        node = Node.source_node()
-        node.transcripts_positions = intersected_transcripts_positions
-        return {node}
-
-    # 2. case read_length is reached in current_node
-    # recursion end, call recur_shift_read_start
-    elif cumulated_length + current_splice_node.iv.length >= read_length:
-        read_end_position = (
-            current_splice_node.iv.start + read_length - cumulated_length
-        )
-        return {
-            recur_shift_read_start(
-                root_splice_node,
-                root_splice_node.iv.start,
-                current_splice_node,
-                read_end_position,
-                intersected_transcripts_positions,
-            )
-        }
-
-    # 3. case read_length is not reached in current_node
-    # recurse
-    else:
-        cumulated_length += current_splice_node.iv.length
-        s = set()
-        for node, transcripts in current_splice_node.downstream.items():
-            itp = {
-                t: i
-                for t, i in intersected_transcripts_positions.items()
-                if t in transcripts
-            }
-            s |= recur_shift_read_end(
-                root_splice_node,
-                node,
-                read_length,
-                cumulated_length,
-                itp,
-            )
-        return s
-
-
-def recur_shift_read_start(
-    root_splice_node: Node,
-    read_start_position: int,
-    current_splice_node: Node,
-    read_end_position: int,
-    intersected_transcripts_positions: dict[Transcript, int],
-) -> Node:
-    """Recursively build a read-equivalence node from a fixed read end.
-
-    Starting from the splice-graph node that contains the read's 3' end,
-    walks upstream to construct a chain of read-equivalence nodes whose
-    combined length equals the read length.
-
-    Parameters
-    ----------
-    root_splice_node : Node
-        The splice-graph node at which the current read starts.
-    read_start_position : int
-        Genomic position of the read's 5' end.
-    current_splice_node : Node
-        The splice-graph node currently being processed in the recursion.
-    read_end_position : int
-        Genomic position of the read's 3' end within *current_splice_node*.
-    intersected_transcripts_positions : dict[Transcript, int]
-        Transcripts still compatible with the read and their current
-        transcript-coordinate positions.
-
-    Returns
-    -------
-    Node
-        The head read-equivalence node for this read start position.
-    """
-    # 1. case current node is sink
-    # return
-    if current_splice_node.typ == NodeType.SINK:
-        return Node.sink_node()
-
-    # 2. case read start position reaches the end of the root node
-    # recursion end
-    elif (root_splice_node.iv.end - read_start_position) < (
-        current_splice_node.iv.end - read_end_position
-    ):
-        current_node_length = root_splice_node.iv.end - read_start_position  # ?
-        new_node = make_read_equivalence_node(
-            read_start_position,
-            current_node_length,
-            {k: v for k, v in intersected_transcripts_positions.items()},
-        )
-        return new_node
-
-    # 3. case read end position reaches the end of the current node
-    # recurse
-    else:
-        current_node_length = current_splice_node.iv.end - read_end_position  # +1 # ?
-        if current_splice_node == root_splice_node:
-            current_node_length += 1
-        new_node = make_read_equivalence_node(
-            read_start_position,
-            current_node_length,
-            intersected_transcripts_positions,
-        )
-        for node, transcripts in current_splice_node.downstream.items():
-            if tr_subset := (intersected_transcripts_positions.keys() & transcripts):
-                child_node = recur_shift_read_start(
-                    root_splice_node,
-                    read_start_position
-                    + current_node_length,  # (current_splice_node.iv.end - read_end_position),
-                    node,
-                    node.iv.start,
-                    {
-                        t: intersected_transcripts_positions[t] + current_node_length
-                        for t in tr_subset
-                    },
+    minus = strand == "-"
+    rank = {transcript: i for i, transcript in enumerate(transcripts)}
+    # chain -> [(g_lo, g_hi, transcript, exon_5p_end, exon_offset)]: the range
+    # of 5'-end genomic coordinates (inclusive) of the transcript's starts in
+    # that chain, plus what maps a coordinate back to a transcript position.
+    ranges: dict[tuple, list] = {}
+    for transcript in transcripts:
+        exons = _exons_in_transcription_order(transcript, minus)
+        offset = 0
+        for i, (start_i, end_i) in enumerate(exons):
+            len_i = end_i - start_i
+            # ``u`` = bases from the 5' end of the read to the 3' end of exon
+            # ``i`` (the read's first exon), 1 <= u <= len_i.  A read within
+            # the exon needs u >= L; one crossing to exon ``j`` needs
+            # 1 <= L - u - D < = len_j, D being the exons in between.
+            chain_ranges: list[tuple[tuple, int, int]] = []
+            if len_i >= read_length:
+                chain_ranges.append(((), read_length, len_i))
+            chain: list[int] = [start_i if minus else end_i]
+            between = 0
+            for start_j, end_j in exons[i + 1:]:
+                if read_length - between - 1 < 1:
+                    break
+                chain.append(end_j if minus else start_j)
+                u_lo = max(1, read_length - between - (end_j - start_j))
+                u_hi = min(len_i, read_length - between - 1)
+                if u_lo <= u_hi:
+                    chain_ranges.append((tuple(chain), u_lo, u_hi))
+                between += end_j - start_j
+                chain.append(start_j if minus else end_j)
+            for key, u_lo, u_hi in chain_ranges:
+                if minus:
+                    g_lo, g_hi = start_i - 1 + u_lo, start_i - 1 + u_hi
+                else:
+                    g_lo, g_hi = end_i - u_hi, end_i - u_lo
+                ranges.setdefault(key, []).append(
+                    (g_lo, g_hi, transcript, end_i if minus else start_i, offset)
                 )
-                new_node.downstream[child_node] = tr_subset
-                child_node.upstream[new_node] = tr_subset
+            offset += len_i
 
-        return new_node
-
-
-def collapse_dag_chains(source_node: Node) -> None:
-    """Merge unbranched chains in a DAG into single nodes in-place.
-
-    Traverses the DAG starting from *source_node* and collapses any sequence
-    of consecutive nodes where each node has exactly one downstream and one
-    upstream neighbour into a single node with an extended interval.
-
-    Parameters
-    ----------
-    source_node : Node
-        Entry point of the DAG to collapse.
-    """
-    visited: set[Node] = set()
-    stack: list[Node] = [source_node]
-
-    while stack:
-        current_node = stack.pop()
-        if current_node in visited:
-            continue
-        visited.add(current_node)
-
-        while (
-            len(current_node.downstream) == 1
-            and (child := next(iter(current_node.downstream))).typ != NodeType.SINK
-            and len(child.upstream) == 1
-            and child.iv.start == current_node.iv.end
-        ):
-            tr = current_node.downstream[child]
-            for grandchild in child.downstream:
-                del grandchild.upstream[child]
-                grandchild.upstream[current_node] = tr
-            current_node.iv = HTSeq.GenomicInterval(
-                current_node.iv.chrom,
-                current_node.iv.start,
-                child.iv.end,
-                current_node.iv.strand,
-            )
-            current_node.downstream = child.downstream
-
-        for child in current_node.downstream:
-            if child not in visited:
-                stack.append(child)
-
-
-def get_tr_2_leaf(
-    nodes: set[Node],
-) -> dict[Transcript, tuple[Node, int]]:
-    """Return the last (leaf) node and end position for every transcript.
-
-    Performs a depth-first traversal of the subgraph rooted at each node in
-    *nodes* and records, for every transcript, the deepest node it reaches and
-    the transcript-coordinate position at that node's end.
-
-    Parameters
-    ----------
-    nodes : set[Node]
-        Root nodes from which to start the traversal.
-
-    Returns
-    -------
-    dict[Transcript, tuple[Node, int]]
-        Maps each transcript to ``(leaf_node, end_transcript_position)``.
-    """
-    tr_2_leaf: dict[Transcript, tuple[Node, int]] = {}
-
-    def dfs(node: Node) -> None:
-        for tr in node.transcripts_positions.keys():
-            tr_2_leaf[tr] = (node, node.transcripts_positions[tr] + node.iv.length)
-        for child in node.downstream:
-            dfs(child)
-
-    for node in nodes:
-        dfs(node)
-    return tr_2_leaf
-
-
-def connect(
-    tr_2_leaf: dict[Transcript, tuple[Node, int]],
-    child_node_set: set[Node],
-) -> None:
-    """Connect leaf nodes from one splice-graph block to the next block's heads.
-
-    For every node in *child_node_set*, checks whether any of its transcripts
-    end exactly where a leaf node in *tr_2_leaf* ends, and if so adds the
-    appropriate directed edges.
-
-    Parameters
-    ----------
-    tr_2_leaf : dict[Transcript, tuple[Node, int]]
-        As returned by :func:`get_tr_2_leaf` for the preceding block.
-    child_node_set : set[Node]
-        Head nodes of the next block to connect to.
-    """
-    for child in child_node_set:
-        for tr, pos in child.transcripts_positions.items():
-            if tr not in tr_2_leaf:
-                continue
-            if tr_2_leaf[tr][1] == pos:
-                tr_2_leaf[tr][0].downstream[child].add(tr)
-                child.upstream[tr_2_leaf[tr][0]].add(tr)
-
-
-def traverse_dag(splice_graph: Node, read_length: int) -> Node:
-    """Build a read-equivalence DAG for a given read length.
-
-    Traverses the splice graph and, for each splice node, constructs the set
-    of read-equivalence nodes representing all possible read placements of
-    length *read_length* that start within that node.  The resulting DAG is
-    collapsed with :func:`collapse_dag_chains`.
-
-    Parameters
-    ----------
-    splice_graph : Node
-        Source node of the splice graph (as returned by
-        :func:`make_splice_graph`).
-    read_length : int
-        Length of reads to model.
-
-    Returns
-    -------
-    Node
-        Source node of the collapsed read-equivalence DAG.
-    """
-    d: dict[Node, set[Node]] = {}
-    visited: set[Node] = set()
-
-    def dfs(splice_node: Node) -> None:
-        if splice_node in visited:
-            return
-
-        d[splice_node] = recur_shift_read_end(
-            splice_node,
-            splice_node,
-            read_length,
-            0,
-            splice_node.transcripts_positions,
-        )
-        transcript_2_leaf = get_tr_2_leaf(d[splice_node])
-
-        visited.add(splice_node)
-        for child in splice_node.downstream:
-            dfs(child)
-            connect(transcript_2_leaf, d[child])
-
-    dfs(splice_graph)
-
-    read_equivalence_graph = next(iter(d[splice_graph]))
-    collapse_dag_chains(read_equivalence_graph)
-
-    return read_equivalence_graph
+    runs: list[tuple[dict[Transcript, int], int]] = []
+    for chain_ranges in ranges.values():
+        events: list[tuple[int, int, int]] = []
+        for k, (g_lo, g_hi, _, _, _) in enumerate(chain_ranges):
+            events.append((g_lo, 1, k))
+            events.append((g_hi + 1, 0, k))
+        events.sort(key=lambda e: (e[0], e[1]))
+        active: set[int] = set()
+        prev = None
+        for pos, kind, k in events:
+            if prev is not None and pos != prev and active:
+                # The run's first start in transcription order.
+                first = prev if not minus else pos - 1
+                positions = {}
+                for k_active in sorted(active, key=lambda k: rank[chain_ranges[k][2]]):
+                    _, _, transcript, exon_5p, offset = chain_ranges[k_active]
+                    positions[transcript] = offset + (
+                        exon_5p - 1 - first if minus else first - exon_5p
+                    )
+                runs.append((positions, pos - prev))
+            if kind:
+                active.add(k)
+            else:
+                active.discard(k)
+            prev = pos
+    return runs
 
 
 def get_equivalence_groups_dict(
-    source_node: Node,
+    runs: list[tuple[dict[Transcript, int], int]],
     egis: dict[Transcript, EquivalenceGroupIntervals],
     read_length: int,
     oua: bool,
     key_cache: dict | None = None,
 ) -> dict:
-    """Aggregate equivalence groups over the full read-equivalence DAG.
+    """Aggregate equivalence groups over all read-start runs.
 
-    Walks all INTERNAL nodes in the read-equivalence DAG and collects, for
-    each node, the partial equivalence groups contributed by its transcripts'
-    coverage intervals.  Groups with matching keys are merged by summing their
-    lengths.
+    For each run (see :func:`read_start_runs`) collects the partial
+    equivalence groups contributed by its transcripts' coverage intervals
+    over the run's positions.  Groups with matching keys are merged by
+    summing their lengths.
 
     Parameters
     ----------
-    source_node : Node
-        Source node of the read-equivalence DAG.
+    runs : list
+        The read-start runs of the locus for *read_length*.
     egis : dict[Transcript, EquivalenceGroupIntervals]
         Per-transcript equivalence-group intervals for the current read length
         and oua flag.
@@ -687,31 +359,14 @@ def get_equivalence_groups_dict(
         Maps equivalence-group keys to their lengths.
     """
     egs_dict: dict = {}
-    stack: list[Node] = []
-    stack.append(source_node)
-    visited = set()
-
-    while stack:
-        current_node = stack.pop()
-        if current_node in visited:
-            continue
-        visited.add(current_node)
-        stack.extend(current_node.downstream.keys())
-        if current_node.typ == NodeType.SINK or current_node.typ == NodeType.SOURCE:
-            continue
-
-        node_eg_dict = get_sub_intervals(
-            [egis[tr] for tr in current_node.transcripts_positions.keys()],
-            [
-                current_node.transcripts_positions[tr]
-                for tr in current_node.transcripts_positions.keys()
-            ],
-            current_node.iv.length,
+    for positions, length in runs:
+        run_egs = get_sub_intervals(
+            [egis[tr] for tr in positions],
+            list(positions.values()),
+            length,
         ).get_egs_dict(read_length, oua, key_cache=key_cache)
-
-        for k, length in node_eg_dict.items():
-            egs_dict[k] = egs_dict.get(k, 0) + length
-
+        for k, run_length in run_egs.items():
+            egs_dict[k] = egs_dict.get(k, 0) + run_length
     return egs_dict
 
 
@@ -757,9 +412,9 @@ def cleavage_dist_signature(cleavage_model, read_length: int, oua: bool) -> tupl
 def make_equivalence_groups(loc, runs: list) -> dict:
     """Compute all equivalence groups for a locus across all runs.
 
-    For every run and every read length present in its cleavage model, builds
-    the read-equivalence DAG and collects equivalence groups for each
-    transcript in the locus.
+    For every run and every read length present in its cleavage model,
+    enumerates the read-start runs of the locus and collects the equivalence
+    groups over them.
 
     A shared key cache interns the ``(cells, read_length, oua)`` tuples so
     that identical keys produced for different runs reference the same
@@ -769,8 +424,8 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     Two cross-run caches avoid redundant work, which matters most when many
     runs are present:
 
-    * ``traverse_dag`` depends only on ``(splice_graph, read_length)``, not the
-      run, so the read-equivalence DAG is built once per read length.
+    * :func:`read_start_runs` depends only on the transcripts and the read
+      length, not the run, so the runs are built once per read length.
     * :func:`get_equivalence_groups_dict` depends on the run only through the
       cleavage-distance signature (see :func:`cleavage_dist_signature`), so its
       contribution is computed once per ``(read_length, oua, signature)`` and
@@ -779,8 +434,7 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     Parameters
     ----------
     loc :
-        A locus object with ``transcript_intervals`` (GenomicArrayOfSets) and
-        ``transcripts`` (list of Transcript).
+        A locus object with ``transcripts`` (list of Transcript) and ``iv``.
     runs : list
         List of RiboSeqRun objects, each providing a cleavage model.
 
@@ -791,10 +445,10 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     """
     egs: dict = {}
     key_cache: dict = {}
-    splice_graph = make_splice_graph(loc.transcript_intervals)
+    strand = loc.iv.strand
 
-    # read_length -> read-equivalence DAG (run-independent).
-    dag_cache: dict = {}
+    # read_length -> read-start runs (run-independent).
+    runs_cache: dict = {}
     # (read_length, oua, cleavage signature) -> {eg_key: length}.
     contrib_cache: dict = {}
 
@@ -803,10 +457,10 @@ def make_equivalence_groups(loc, runs: list) -> dict:
         egs[run] = run_egs
         cleavage_model = run.cleavage_model
         for read_length in cleavage_model.non_zero_lengths:
-            read_equivalence_graph = dag_cache.get(read_length)
-            if read_equivalence_graph is None:
-                read_equivalence_graph = traverse_dag(splice_graph, read_length)
-                dag_cache[read_length] = read_equivalence_graph
+            start_runs = runs_cache.get(read_length)
+            if start_runs is None:
+                start_runs = read_start_runs(loc.transcripts, read_length, strand)
+                runs_cache[read_length] = start_runs
 
             for oua in (True, False):
                 ckey = (
@@ -823,7 +477,7 @@ def make_equivalence_groups(loc, runs: list) -> dict:
                         for tr in loc.transcripts
                     }
                     contrib = get_equivalence_groups_dict(
-                        read_equivalence_graph,
+                        start_runs,
                         egis,
                         read_length,
                         oua,
