@@ -7,7 +7,7 @@ import sqlite3 as sql
 import numpy as np
 
 from price2 import database
-from price2.multimap.linkage import Linkage, _linkage
+from price2.multimap.linkage import Linkage, load_linkage
 
 
 def _slot_vector(
@@ -58,13 +58,13 @@ def e_step(db_path: str, iteration: int) -> float:
     Notes
     -----
     Everything is addressed by integer slot id against the cached static
-    linkage (see :func:`_linkage`), so the whole update is two ``bincount``
+    linkage (see :func:`load_linkage`), so the whole update is two ``bincount``
     reductions over the membership rows: one to normalise λ within each
     multimap group, one to accumulate each slot's weight across the groups
     that share it.  λ and the weights travel as bare ``float64`` buffers in
     the canonical per-locus slot order, so no key matching is needed.
     """
-    link = _linkage(db_path)
+    link = load_linkage(db_path)
     n_slots = link.n_slots
     if n_slots == 0:
         return 0.0

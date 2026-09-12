@@ -405,6 +405,8 @@ def _run_em_deconvolution(
         return
 
     database.enable_wal(db_path)
+    # Fails here, with the reason, rather than in the E-step after a fan-out.
+    multimap.load_linkage(db_path)
     checkpoint = _em_checkpoint(db_path, resume)
     # Loci with no multimap slots do not change across EM iterations, so the
     # light passes only need to touch the loci that carry slots.

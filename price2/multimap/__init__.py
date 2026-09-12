@@ -38,7 +38,7 @@ The package follows the data through the run:
 :mod:`~price2.multimap.spill`
     The alignments spilled to disk during collection.
 :mod:`~price2.multimap.index`
-    Collapsing the spill into the linkage tables, once.
+    Collapsing the spill into the linkage and the slot baselines, once.
 :mod:`~price2.multimap.linkage`
     The canonical slot order and the static linkage arrays
     (``multimap_linkage.npz``) the E-step addresses slots by.
@@ -56,7 +56,7 @@ The names below are the package's public API.
 from price2.multimap.em import e_step
 from price2.multimap.index import build_multimap_index, has_multimap_index
 from price2.multimap.keys import alignment_group_key, group_key, qname_hash
-from price2.multimap.linkage import Linkage, LocusSlots, linkage_path
+from price2.multimap.linkage import Linkage, LocusSlots, linkage_path, load_linkage
 from price2.multimap.prepared import (
     load_light_locus,
     load_locus_routing,
@@ -98,6 +98,7 @@ __all__ = [
     "has_multimap_index",
     "init_spill",
     "linkage_path",
+    "load_linkage",
     "load_light_locus",
     "load_locus_mm_data",
     "load_locus_routing",

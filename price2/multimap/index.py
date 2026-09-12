@@ -2,9 +2,10 @@
 
 Runs once after read collection: keeps the reads that touch **>= 2**
 distinct in-locus slots, collapses reads with an identical slot set into one
-multimap group (MMG) with a member count, and writes the derived tables
-(``multimap_groups``, ``multimap_group_slots``, ``multimap_slot_base``) plus
-the iteration-0 ``group_weights`` seed.
+multimap group (MMG) with a member count, and writes the static linkage
+(``multimap_linkage.npz``, see :mod:`price2.multimap.linkage`), the per-locus
+slot baselines (``multimap_slot_base``) and the iteration-0 ``group_weights``
+seed.
 """
 
 from __future__ import annotations
@@ -17,7 +18,12 @@ from collections import defaultdict
 import numpy as np
 
 from price2 import database
-from price2.multimap.linkage import _invalidate_linkage
+from price2.multimap.linkage import (
+    Linkage,
+    _invalidate_linkage,
+    linkage_path,
+    run_index_from,
+)
 from price2.multimap.spill import discard_spill, spill_dir
 from price2.multimap.state import _baseline_weight_rows
 
@@ -194,14 +200,20 @@ def _index_run(run_spill_dir: str) -> tuple:
     )
 
 
+def _concat(parts: list, dtype) -> np.ndarray:
+    """Concatenate *parts*, or an empty array of *dtype* when there are none."""
+    return np.concatenate(parts) if parts else np.empty(0, dtype)
+
+
 def build_multimap_index(db_path: str, processes: int = 1) -> int:
     """Collapse spilled alignments into multimap groups and seed weights.
 
     Reads the per-run spill files written during collection, keeps only
     reads that touch **≥2** distinct in-locus slots, collapses reads that
     share an identical slot set into one multimap group (MMG) with a
-    member count, and writes the derived tables (``multimap_groups``,
-    ``multimap_group_slots``, ``multimap_slot_base``) plus the iteration-0
+    member count, and writes the static linkage arrays
+    (``multimap_linkage.npz`` beside the database), the per-locus slot
+    baselines (``multimap_slot_base``) and the iteration-0
     ``group_weights`` seed (``weight = base`` → full counts, i.e. classic
     behaviour before any reassignment).  The spill directory is deleted on
     success.
@@ -230,18 +242,22 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         with database.connect(db_path, commit=True) as db:
             database.create_em_tables(db.cursor())
         _invalidate_linkage(db_path)
+        none = np.empty(0, np.int64)
+        Linkage.from_memberships(none, none, none, none, none, []).save(
+            linkage_path(db_path)
+        )
         logger.warning(
             "no multimapping alignments were spilled to %s; the EM linkage "
             "index is empty", root,
         )
         return 0
 
-    locus_ids = np.load(os.path.join(root, "loci.npy")).tolist()
+    spill_locus_ids = np.load(os.path.join(root, "loci.npy")).tolist()
     tasks = [os.path.join(root, r) for r in run_ids]
     n_proc = max(1, min(processes, len(tasks)))
 
     # Fork before opening the database: SQLite connections must not be carried
-    # across fork().  ``imap`` then lets the parent insert one run's rows while
+    # across fork().  ``imap`` then lets the parent merge one run's groups while
     # the remaining runs are still being collapsed.
     pool = mp.get_context("forkserver").Pool(n_proc) if n_proc > 1 else None
 
@@ -249,12 +265,18 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         cur = db.cursor()
         database.create_em_tables(cur)
         db.commit()
+        run_index = run_index_from(cur)
 
         # Merge the per-run results into the global MMG id space and accumulate
         # per-slot baselines.  Everything below is O(#slots), not O(#alignments).
         base_by_locus: dict = defaultdict(dict)
         mmg_id = 0
         n_slots = 0
+        mmg_counts: list = []
+        members_mmg: list = []
+        members_locus: list = []
+        members_run: list = []
+        members_gk: list = []
 
         try:
             results = (
@@ -267,20 +289,15 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
                 mmg_ids = np.arange(mmg_id, mmg_id + counts.size, dtype=np.int64)
                 mmg_id += counts.size
 
-                cur.executemany(
-                    "INSERT INTO multimap_groups VALUES (?, ?, ?)",
-                    zip(mmg_ids.tolist(), [run_id] * counts.size, counts.tolist()),
+                # Group keys are 63-bit, so the unsigned spill column carries
+                # over to the signed dtype the linkage stores unchanged.
+                mmg_counts.append(counts)
+                members_mmg.append(np.repeat(mmg_ids, slot_k))
+                members_locus.append(slot_li)
+                members_run.append(
+                    np.full(slot_li.size, run_index[run_id], dtype=np.int32)
                 )
-                cur.executemany(
-                    "INSERT INTO multimap_group_slots VALUES (?, ?, ?)",
-                    zip(
-                        np.repeat(mmg_ids, slot_k).tolist(),
-                        # __getitem__ hands back the interned locus string rather
-                        # than minting one per slot row (there are ~4.5e7 of them).
-                        map(locus_ids.__getitem__, slot_li.tolist()),
-                        slot_gk.tolist(),
-                    ),
-                )
+                members_gk.append(slot_gk.astype(np.int64))
 
                 # base[slot] = Σ read counts of the MMGs passing through it.
                 per_slot_count = np.repeat(counts, slot_k)
@@ -303,13 +320,37 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
                     np.concatenate(([True], u_li[1:] != u_li[:-1]))
                 )
                 for b, e in zip(bounds.tolist(), bounds[1:].tolist() + [u_li.size]):
-                    d = base_by_locus[locus_ids[u_li[b]]]
+                    d = base_by_locus[spill_locus_ids[u_li[b]]]
                     for g, t in zip(u_gk[b:e].tolist(), totals[b:e].tolist()):
                         d[(run_id, g)] = t
         finally:
             if pool is not None:
                 pool.close()
                 pool.join()
+
+        # The linkage numbers the loci that carry slots in sorted order; the
+        # spill numbered every locus of the run.
+        locus_ids = sorted(base_by_locus)
+        spill_to_linkage = np.full(len(spill_locus_ids), -1, dtype=np.int32)
+        spill_pos = {lid: i for i, lid in enumerate(spill_locus_ids)}
+        for i, lid in enumerate(locus_ids):
+            spill_to_linkage[spill_pos[lid]] = i
+        member_locus = spill_to_linkage[_concat(members_locus, np.uint32)]
+        del members_locus, spill_to_linkage, spill_pos
+        link = Linkage.from_memberships(
+            _concat(members_mmg, np.int64),
+            member_locus,
+            _concat(members_run, np.int32),
+            _concat(members_gk, np.int64),
+            _concat(mmg_counts, np.int64),
+            locus_ids,
+        )
+        del members_mmg, members_run, members_gk, member_locus, mmg_counts
+        # Written before the baselines below: an index whose file is missing
+        # is reported as unbuilt (`has_multimap_index`), never as half built.
+        _invalidate_linkage(db_path)
+        link.save(linkage_path(db_path))
+        del link
 
         base_rows = [
             (locus_id, database.pickle_blob(d))
@@ -327,17 +368,17 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
             _baseline_weight_rows(cur),
         )
 
-    _invalidate_linkage(db_path)
     discard_spill(db_path)
     logger.info("multimap index: %d groups over %d slots", mmg_id, n_slots)
     return mmg_id
 
 
 def has_multimap_index(db_path: str) -> bool:
-    """Return ``True`` if the EM linkage tables exist and are populated."""
+    """Return ``True`` if the EM linkage index exists and is populated."""
     with database.connect(db_path) as db:
         cur = db.cursor()
-        if not database.table_exists(cur, "multimap_groups"):
+        if not database.table_exists(cur, "multimap_slot_base"):
             return False
-        cur.execute("SELECT 1 FROM multimap_groups LIMIT 1")
-        return cur.fetchone() is not None
+        cur.execute("SELECT 1 FROM multimap_slot_base LIMIT 1")
+        populated = cur.fetchone() is not None
+    return populated and os.path.exists(linkage_path(db_path))

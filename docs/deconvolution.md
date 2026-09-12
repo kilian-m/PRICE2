@@ -177,7 +177,7 @@ flowchart LR
     L2 --> GL
     L3 --> GL
 
-    GL --> J["join λ onto MMG membership<br/>multimap_group_slots × multimap_groups"]
+    GL --> J["gather λ per membership row<br/>multimap_linkage.npz: member_mmg × member_slot"]
     J --> R["<b>responsibility</b><br/>f(r, ℓ) = λ(r, ℓ) / Σ_ℓ' λ(r, ℓ')<br/>uniform 1/n when Σλ = 0<br/>read fits no ORF anywhere"]
     R --> ACC["<b>accumulate per slot</b><br/>w(ℓ) = Σ_MMG count · f<br/>groupby reduction, not a Python loop"]
     ACC --> DELTA["Δ = Σ|w_new − w_old| / Σ w_new"]

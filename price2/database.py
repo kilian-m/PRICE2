@@ -33,8 +33,9 @@ DEFAULT_TIMEOUT = 120.0
 STATE_TABLE = "run_state"
 
 # Tables holding the multimapping-EM state; dropped and re-created together
-# by :func:`create_em_tables`.  ``multimap_alignments`` is a legacy table of
-# earlier releases that is only ever dropped.
+# by :func:`create_em_tables`.  ``multimap_alignments``, ``multimap_groups``
+# and ``multimap_group_slots`` are legacy tables of earlier releases that are
+# only ever dropped (the linkage lives in ``multimap_linkage.npz`` now).
 _EM_TABLES = (
     "multimap_alignments",
     "multimap_group_slots",
@@ -197,22 +198,6 @@ def create_em_tables(cur: sql.Cursor) -> None:
     for table in _EM_TABLES:
         cur.execute(f"DROP TABLE IF EXISTS {table}")
 
-    cur.execute(
-        """CREATE TABLE multimap_groups (
-               mmg_id  INTEGER PRIMARY KEY,
-               run_id  TEXT    NOT NULL,
-               count   INTEGER NOT NULL
-           )"""
-    )
-    # No index on mmg_id: the sole reader full-scans the table once, and
-    # building a 4.5e7-row index cost more than the scan it never sped up.
-    cur.execute(
-        """CREATE TABLE multimap_group_slots (
-               mmg_id    INTEGER NOT NULL,
-               locus_id  TEXT    NOT NULL,
-               group_key INTEGER NOT NULL
-           )"""
-    )
     cur.execute(
         """CREATE TABLE multimap_slot_base (
                locus_id  TEXT PRIMARY KEY,

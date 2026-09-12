@@ -25,16 +25,15 @@ import sqlite3 as sql
 import numpy as np
 
 from price2 import database
-from price2.multimap.linkage import LocusSlots, _run_index
+from price2.multimap.linkage import LocusSlots, _run_index, run_index_from
 
 
 def reset_em_state(db_path: str) -> None:
     """Clear per-iteration EM state and re-seed iteration-0 weights.
 
     Called at the start of every EM run (warm or cold).  The *linkage*
-    tables (``multimap_groups``, ``multimap_group_slots``,
-    ``multimap_slot_base``) depend only on the collected alignments and
-    are preserved; the *iteration* tables (``group_lambdas``,
+    (``multimap_linkage.npz`` and ``multimap_slot_base``) depends only on
+    the collected alignments and is preserved; the *iteration* tables (``group_lambdas``,
     ``locus_activities``, ``group_weights``) are wiped so a warm re-run
     cannot consume a previous run's stale λ/weights/activities for a slot
     that is not re-emitted this run.  Iteration-0 ``group_weights`` are
@@ -44,7 +43,7 @@ def reset_em_state(db_path: str) -> None:
     Parameters
     ----------
     db_path : str
-        Path to ``price.db`` (must already contain the linkage tables).
+        Path to ``price.db`` (must already carry the slot baselines).
     """
     with database.connect(db_path, commit=True) as db:
         cur = db.cursor()
@@ -70,8 +69,7 @@ def _baseline_weight_rows(cur: sql.Cursor) -> list:
     write transaction, where a second connection could not see the rows it just
     inserted.
     """
-    run_ids = sorted(r for (r,) in cur.execute("SELECT run_id FROM runs").fetchall())
-    run_index = {run_id: i for i, run_id in enumerate(run_ids)}
+    run_index = run_index_from(cur)
     return [
         (
             locus_id,

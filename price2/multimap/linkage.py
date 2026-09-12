@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3 as sql
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,8 +23,9 @@ logger = logging.getLogger(__name__)
 # E-step address every slot by integer.
 #
 # The linkage itself (which slots belong to which multimap group, and each
-# group's read count) depends only on the collected alignments, so it is built
-# once into ``multimap_linkage.npz`` beside the database and reloaded thereafter.
+# group's read count) depends only on the collected alignments, so
+# :func:`~price2.multimap.index.build_multimap_index` writes it once, as
+# ``multimap_linkage.npz`` beside the database, and every E-step reloads it.
 
 _RUN_INDEX_CACHE: dict = {}
 _LINKAGE_CACHE: dict[str, Linkage] = {}
@@ -141,6 +143,72 @@ class Linkage:
     locus_index: dict
 
     @classmethod
+    def from_memberships(
+        cls,
+        member_mmg: np.ndarray,
+        member_locus: np.ndarray,
+        member_run: np.ndarray,
+        member_gk: np.ndarray,
+        mmg_count: np.ndarray,
+        locus_ids: list[str],
+    ) -> Linkage:
+        """Number the slots of the membership rows in canonical order.
+
+        A slot is identified by sorting the rows into the order of
+        :class:`LocusSlots` (locus index, then run index, then group key), so
+        a slot's position within its locus is the position the locus's base
+        map gives it.
+
+        Parameters
+        ----------
+        member_mmg, member_locus, member_run, member_gk : numpy.ndarray
+            One entry per (multimap group, slot) membership: the group, and
+            the slot's locus index (into *locus_ids*), run index and group
+            key.
+        mmg_count : numpy.ndarray
+            Read count of every multimap group.
+        locus_ids : list of str
+            The loci that carry slots, sorted; ``member_locus`` indexes it.
+        """
+        n_members = member_mmg.size
+        if n_members == 0:
+            member_slot = np.empty(0, dtype=np.int32)
+            n_slots = 0
+            locus_off = np.zeros(len(locus_ids) + 1, dtype=np.int64)
+        else:
+            order = np.lexsort((member_gk, member_run, member_locus))
+            sorted_locus = member_locus[order]
+            sorted_run = member_run[order]
+            sorted_gk = member_gk[order]
+            starts = np.empty(n_members, dtype=bool)
+            starts[0] = True
+            np.not_equal(sorted_locus[1:], sorted_locus[:-1], out=starts[1:])
+            starts[1:] |= sorted_run[1:] != sorted_run[:-1]
+            starts[1:] |= sorted_gk[1:] != sorted_gk[:-1]
+            slot_of_sorted = np.cumsum(starts) - 1
+            n_slots = int(slot_of_sorted[-1]) + 1
+            if n_slots > np.iinfo(np.int32).max:
+                raise OverflowError(f"{n_slots} slots exceed the int32 slot index")
+            member_slot = np.empty(n_members, dtype=np.int32)
+            member_slot[order] = slot_of_sorted
+
+            slot_locus = sorted_locus[starts]
+            locus_off = np.searchsorted(
+                slot_locus, np.arange(len(locus_ids) + 1, dtype=np.int32)
+            ).astype(np.int64)
+
+        return cls.from_arrays(
+            {
+                "member_mmg": np.asarray(member_mmg, dtype=np.int32),
+                "member_slot": member_slot,
+                "mmg_count": np.asarray(mmg_count, dtype=np.float64),
+                "locus_off": locus_off,
+                "locus_ids": np.array(locus_ids),
+                "n_slots": np.array(n_slots),
+            }
+        )
+
+    @classmethod
     def from_arrays(cls, arrays: dict) -> Linkage:
         locus_ids = np.asarray(arrays["locus_ids"])
         return cls(
@@ -153,6 +221,22 @@ class Linkage:
             locus_index={lid: i for i, lid in enumerate(locus_ids.tolist())},
         )
 
+    @classmethod
+    def load(cls, path: str) -> Linkage:
+        with np.load(path, allow_pickle=False) as data:
+            return cls.from_arrays({k: data[k] for k in data.files})
+
+    def save(self, path: str) -> None:
+        np.savez(
+            path,
+            member_mmg=self.member_mmg,
+            member_slot=self.member_slot,
+            mmg_count=self.mmg_count,
+            locus_off=self.locus_off,
+            locus_ids=self.locus_ids,
+            n_slots=np.array(self.n_slots),
+        )
+
     def locus_slice(self, locus_index: int) -> slice:
         """The slots of one locus within a per-slot vector."""
         return slice(
@@ -160,15 +244,18 @@ class Linkage:
         )
 
 
+def run_index_from(cur: sql.Cursor) -> dict:
+    """Return ``{run_id: run index}`` — the runs of the database, sorted by id."""
+    run_ids = sorted(r for (r,) in cur.execute("SELECT run_id FROM runs").fetchall())
+    return {run_id: i for i, run_id in enumerate(run_ids)}
+
+
 def _run_index(db_path: str) -> dict:
     """Return ``{run_id: run index}``, memoised per process."""
     cached = _RUN_INDEX_CACHE.get(db_path)
     if cached is None:
         with database.connect(db_path) as db:
-            run_ids = sorted(
-                r for (r,) in db.execute("SELECT run_id FROM runs")
-            )
-        cached = {run_id: i for i, run_id in enumerate(run_ids)}
+            cached = run_index_from(db.cursor())
         _RUN_INDEX_CACHE[db_path] = cached
     return cached
 
@@ -188,104 +275,26 @@ def _invalidate_linkage(db_path: str) -> None:
     _LINKAGE_CACHE.pop(db_path, None)
 
 
-def _build_linkage(db_path: str) -> Linkage:
-    """Materialise the static linkage as integer arrays (slow path, run once).
+def load_linkage(db_path: str) -> Linkage:
+    """Return the static linkage of *db_path*'s index, memoised per process.
 
-    Reading ``multimap_group_slots`` (tens of millions of rows, with a TEXT
-    ``locus_id``) and re-deriving the slot identities dominated every E-step.
-    Here it happens once; afterwards the E-step is two ``bincount``s.
+    Raises
+    ------
+    FileNotFoundError
+        When ``multimap_linkage.npz`` is missing beside the database: the
+        index was built by a PRICE2 that kept the linkage in SQLite tables
+        instead, and only a cold re-collection can rebuild it.
     """
-    run_index = _run_index(db_path)
-    with database.connect(db_path) as db:
-        cur = db.cursor()
-
-        locus_ids = sorted(
-            lid for (lid,) in cur.execute("SELECT locus_id FROM multimap_slot_base")
-        )
-        locus_index = {lid: i for i, lid in enumerate(locus_ids)}
-
-        n_groups = cur.execute("SELECT COUNT(*) FROM multimap_groups").fetchone()[0]
-        mmg_run = np.zeros(n_groups, dtype=np.int32)
-        mmg_count = np.zeros(n_groups, dtype=np.float64)
-        cur.execute("SELECT mmg_id, run_id, count FROM multimap_groups")
-        while chunk := cur.fetchmany(1 << 20):
-            for mmg_id, run_id, count in chunk:
-                mmg_run[mmg_id] = run_index[run_id]
-                mmg_count[mmg_id] = count
-
-        n_members = cur.execute(
-            "SELECT COUNT(*) FROM multimap_group_slots"
-        ).fetchone()[0]
-        member_mmg = np.empty(n_members, dtype=np.int32)
-        member_locus = np.empty(n_members, dtype=np.int32)
-        member_gk = np.empty(n_members, dtype=np.int64)
-        cur.execute("SELECT mmg_id, locus_id, group_key FROM multimap_group_slots")
-        i = 0
-        while chunk := cur.fetchmany(1 << 20):
-            for mmg_id, locus_id, group_key in chunk:
-                member_mmg[i] = mmg_id
-                member_locus[i] = locus_index[locus_id]
-                member_gk[i] = group_key
-                i += 1
-
-    # Identify slots by sorting membership rows into the canonical order of
-    # :class:`LocusSlots` (locus, then run index, then group key); a slot's
-    # run is its group's run.
-    if n_members == 0:
-        member_slot = np.empty(0, dtype=np.int32)
-        n_slots = 0
-        locus_off = np.zeros(len(locus_ids) + 1, dtype=np.int64)
-    else:
-        member_run = mmg_run[member_mmg]
-        order = np.lexsort((member_gk, member_run, member_locus))
-        sorted_locus = member_locus[order]
-        sorted_run = member_run[order]
-        sorted_gk = member_gk[order]
-        starts = np.empty(n_members, dtype=bool)
-        starts[0] = True
-        np.not_equal(sorted_locus[1:], sorted_locus[:-1], out=starts[1:])
-        starts[1:] |= sorted_run[1:] != sorted_run[:-1]
-        starts[1:] |= sorted_gk[1:] != sorted_gk[:-1]
-        slot_of_sorted = np.cumsum(starts) - 1
-        n_slots = int(slot_of_sorted[-1]) + 1
-        if n_slots > np.iinfo(np.int32).max:
-            raise OverflowError(f"{n_slots} slots exceed the int32 slot index")
-        member_slot = np.empty(n_members, dtype=np.int32)
-        member_slot[order] = slot_of_sorted
-
-        slot_locus = sorted_locus[starts]
-        locus_off = np.searchsorted(
-            slot_locus, np.arange(len(locus_ids) + 1, dtype=np.int32)
-        ).astype(np.int64)
-
-    arrays = {
-        "member_mmg": member_mmg,
-        "member_slot": member_slot,
-        "mmg_count": mmg_count,
-        "locus_off": locus_off,
-        "locus_ids": np.array(locus_ids),
-        "n_slots": np.array(n_slots),
-    }
-    np.savez(linkage_path(db_path), **arrays)
-    logger.info(
-        "multimap linkage cached: %d slots, %d groups, %d memberships",
-        n_slots,
-        n_groups,
-        n_members,
-    )
-    return Linkage.from_arrays(arrays)
-
-
-def _linkage(db_path: str) -> Linkage:
-    """Return the static linkage, building and caching it on first use."""
     cached = _LINKAGE_CACHE.get(db_path)
     if cached is not None:
         return cached
     path = linkage_path(db_path)
-    if os.path.exists(path):
-        with np.load(path, allow_pickle=False) as data:
-            cached = Linkage.from_arrays({k: data[k] for k in data.files})
-    else:
-        cached = _build_linkage(db_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} is missing: the multimapping linkage index of {db_path} "
+            "was built by an older PRICE2. Re-collect the run with "
+            "warm_start=false to rebuild it."
+        )
+    cached = Linkage.load(path)
     _LINKAGE_CACHE[db_path] = cached
     return cached
