@@ -27,7 +27,7 @@ from price2 import likelihood
 from price2 import read_routing
 from price2 import solver
 from price2.config import Config
-from price2.equivalence_groups import EquivalenceGroup
+from price2.equivalence_groups import CELL_CODES, EquivalenceGroup
 from price2.genomic_features import ReadGeneratingRegion, Transcript
 from price2.likelihood import (
     distribution_theta,
@@ -297,8 +297,10 @@ class Locus:
         """Load this locus's reads (see :func:`price2.read_routing.load_reads`)."""
         read_routing.load_reads(self, db_path, drop_multimappers)
 
-    def get_rgr_frame_covpos(self, rsa: RiboSeqAlignment, run: RiboSeqRun):
-        """The RGRs a read is compatible with.
+    def compatible_cells(
+        self, rsa: RiboSeqAlignment, run: RiboSeqRun
+    ) -> frozenset[int] | None:
+        """The packed ``(RGR, frame, coverage position)`` cells of a read.
 
         See :func:`price2.read_routing.rgr_compatibility`.
         """
@@ -835,46 +837,45 @@ class Locus:
         self.eg_cache = None
         self._eg_y = None
 
-        # Rows of ``result`` are keyed by the *old* rgr.index, which the
-        # re-indexing below overwrites.  ``rgr_set`` iteration order is not
-        # the index order (it changes across a pickle round-trip), so the old
-        # indices have to be captured rather than re-derived by enumeration.
-        old_indices = (
-            {rgr: rgr.index for rgr in old_rgr_set}
-            if self.result is not None
-            else None
-        )
-
-        # rgr indices
+        # The equivalence-group cells and the rows of ``result`` are keyed by
+        # the *old* rgr.index, which the re-indexing below overwrites.
+        # ``rgr_set`` iteration order is not the index order (it changes
+        # across a pickle round-trip), so the old indices have to be captured
+        # rather than re-derived by enumeration.
+        old_index = {rgr: rgr.index for rgr in old_rgr_set}
+        old_to_new = [-1] * len(old_rgr_set)
         for c, rgr in enumerate(self.rgr_set):
+            old_to_new[old_index[rgr]] = c
             rgr.index = c
 
         # egs
         if self.egs is not None:
-            self.collapse_egs(runs)
+            self.collapse_egs(runs, old_to_new)
 
         # results
         if self.result is not None:
             index_array = np.zeros(len(self.rgr_set), dtype=int)
             for rgr in self.rgr_set:
-                index_array[rgr.index] = old_indices[rgr]
+                index_array[rgr.index] = old_index[rgr]
             self.result = self.result[index_array]
 
     def collapse_egs(
         self,
         runs: list[RiboSeqRun],
+        old_to_new: list[int],
     ) -> None:
         """Collapse equivalence groups after RGR removal.
 
-        Rebuilds the per-run equivalence-group dictionaries, merging
-        entries whose keys become identical after removed RGRs are
-        dropped from the key's ``rgr_frame_covpos`` frozenset.
+        The cells of a group key carry ``rgr.index`` (see
+        :mod:`price2.equivalence_groups`), so every key is remapped to the
+        survivors' new indices; the cells of removed RGRs are dropped, and
+        entries whose keys become identical are merged.
 
         Two memory optimisations:
 
-        * an ``old_to_new`` cache maps each old key to its remapped key, so
-          the new ``rgr_frame_covpos`` frozenset is materialised only once
-          per distinct old key (rather than once per (old key, run));
+        * a cache maps each old key to its remapped key, so the new cell
+          set is materialised only once per distinct old key (rather than
+          once per (old key, run));
         * per-run dicts are rebuilt one at a time and the old dict for
           that run is released immediately, bounding the doubled-allocation
           transient to a single run instead of the full ``len(runs)``.
@@ -883,25 +884,32 @@ class Locus:
         ----------
         runs : list[RiboSeqRun]
             Ribo-seq runs whose EGs should be rebuilt.
+        old_to_new : list[int]
+            The new ``rgr.index`` of every old index, ``-1`` for a removed
+            RGR.
         """
-        rgr_set = self.rgr_set
-        old_to_new: dict[tuple, tuple] = {}
+        # Old cell -> new cell (``-1`` for a removed RGR), one list lookup
+        # per cell.
+        cell_map = [
+            -1 if new < 0 else new * CELL_CODES + code
+            for new in old_to_new
+            for code in range(CELL_CODES)
+        ]
+        key_map: dict[tuple, tuple] = {}
 
         new_egs: dict = {}
         for run in runs:
             old_run_egs = self.egs.pop(run)
             new_run_egs: dict = defaultdict(EquivalenceGroup)
             for old_eg_key, old_eg in old_run_egs.items():
-                new_eg_key = old_to_new.get(old_eg_key)
+                new_eg_key = key_map.get(old_eg_key)
                 if new_eg_key is None:
-                    rgr_frame_covpos, read_length, oua = old_eg_key
-                    new_rgr_frame_covpos = frozenset(
-                        (rgr, frame, covpos)
-                        for rgr, frame, covpos in rgr_frame_covpos
-                        if rgr in rgr_set
+                    cells, read_length, oua = old_eg_key
+                    new_cells = frozenset(
+                        c for c in map(cell_map.__getitem__, cells) if c >= 0
                     )
-                    new_eg_key = (new_rgr_frame_covpos, read_length, oua)
-                    old_to_new[old_eg_key] = new_eg_key
+                    new_eg_key = (new_cells, read_length, oua)
+                    key_map[old_eg_key] = new_eg_key
 
                 new_eg = new_run_egs[new_eg_key]
                 new_eg.length += old_eg.length
@@ -973,8 +981,8 @@ class Locus:
             return 0
 
         # Removes the RGRs, re-indexes survivors, re-slices ``result`` and
-        # collapses the equivalence groups (dropping the removed RGRs from every
-        # group key).  Also clears ``eg_cache`` / ``_eg_y``.
+        # collapses the equivalence groups (remapping every group key to the
+        # new indices).  Also clears ``eg_cache`` / ``_eg_y``.
         self.remove_rgrs(rgrs_to_remove, runs=runs)
 
         # Keep the transcripts' ORF views consistent with the pruned RGR set

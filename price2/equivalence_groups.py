@@ -4,6 +4,22 @@ Builds a splice-aware read equivalence graph from transcript annotations and
 maps read start positions to sets of compatible ORFs (ReadGeneratingRegions).
 These equivalence groups are the core data structure consumed by the
 deconvolution optimiser.
+
+The equivalence-group key
+-------------------------
+Every group is keyed by ``(cells, read_length, oua)``: the set of
+``(RGR, frame, coverage position)`` combinations a read of that length, with
+or without a 5' untemplated addition, is compatible with.  A combination is
+packed into one integer *cell* (see :func:`pack_cell`)::
+
+    cell = rgr.index * CELL_CODES + frame_code * 3 + coverage_position
+
+with ``frame_code`` 0-2 for the reading frame of an ORF and 3 for a NOISE
+region, so ``cells`` is a ``frozenset[int]``.  The same integers address the
+design matrix (:func:`price2.read_routing.egs_to_sparse`) and the routing
+cache (:class:`price2.read_routing.EgRoutingCache`).  Because the cells
+carry ``rgr.index``, every key has to be remapped when RGRs are removed and
+the survivors are re-indexed (:meth:`price2.locus.Locus.collapse_egs`).
 """
 
 from __future__ import annotations
@@ -43,6 +59,44 @@ class EquivalenceGroup:
     ) -> None:
         self.length = length
         self.read_count = read_count
+
+
+#: Distinct ``frame_code * 3 + coverage_position`` values per RGR: four frame
+#: codes (0, 1, 2 and 3 for "no frame", i.e. NOISE) times three coverage
+#: positions.
+CELL_CODES = 12
+
+#: Frame code of a cell without a reading frame (a NOISE region).
+NO_FRAME = 3
+
+
+def pack_cell(
+    rgr_index: int, frame: int | None, covpos: CoveragePosition
+) -> int:
+    """Pack an ``(RGR, frame, coverage position)`` combination into one int.
+
+    Parameters
+    ----------
+    rgr_index : int
+        ``rgr.index`` of the region.
+    frame : int or None
+        Reading frame relative to the ORF start, or ``None`` for NOISE.
+    covpos : CoveragePosition
+        Which part of the coverage profile the combination belongs to.
+    """
+    frame_code = NO_FRAME if frame is None else frame
+    return rgr_index * CELL_CODES + frame_code * 3 + covpos.value
+
+
+def unpack_cell(cell: int) -> tuple[int, int | None, CoveragePosition]:
+    """Inverse of :func:`pack_cell`: ``(rgr_index, frame, covpos)``.
+
+    Hot paths use ``divmod(cell, CELL_CODES)`` directly (or ``numpy.divmod``
+    on an array of cells); this is for the callers that need the objects.
+    """
+    rgr_index, code = divmod(cell, CELL_CODES)
+    frame_code, covpos = divmod(code, 3)
+    return rgr_index, (None if frame_code == NO_FRAME else frame_code), CoveragePosition(covpos)
 
 
 class NodeType(Enum):
@@ -103,7 +157,8 @@ class EquivalenceGroupIntervals:
     """Transcript positions where reads are compatible with a set of RGRs.
 
     Stores three lists — one per reading-frame phase (0, 1, 2) — of
-    ``(start_codon, end_codon, (rgr, frame, CoveragePosition))`` intervals.
+    ``(start_codon, end_codon, cell)`` intervals, *cell* being the packed
+    ``(rgr, frame, CoveragePosition)`` of :func:`pack_cell`.
     Using interval lists instead of per-position dicts avoids O(interval_length)
     inner loops: ``add_rgr`` becomes O(1) per call, and the sweep-line in
     ``get_egs_dict`` is O(n_intervals * log(n_intervals)).
@@ -126,7 +181,8 @@ class EquivalenceGroupIntervals:
         Parameters
         ----------
         rgr :
-            The ReadGeneratingRegion to register.
+            The ReadGeneratingRegion to register (its ``index`` goes into
+            the cell).
         start : int
             First transcript position (nucleotide coordinate) of the interval.
         end : int
@@ -145,7 +201,7 @@ class EquivalenceGroupIntervals:
             phases_to_fill = [phase]
         start_phase = start % 3
         end_phase = end % 3
-        tup = (rgr, frame, covpos)
+        cell = pack_cell(rgr.index, frame, covpos)
         for ph in phases_to_fill:
             if ph >= start_phase:
                 s = start + (ph - start_phase)
@@ -158,7 +214,7 @@ class EquivalenceGroupIntervals:
             sc = s // 3
             ec = e // 3
             if sc < ec:
-                self.intervals[ph].append((sc, ec, tup))
+                self.intervals[ph].append((sc, ec, cell))
 
     def get_egs_dict(
         self,
@@ -176,16 +232,15 @@ class EquivalenceGroupIntervals:
             Whether the reads carry a 5' untemplated addition.
         key_cache : dict or None
             Optional shared cache used to intern the
-            ``(frozenset_of_rgr_frame_covpos, read_length, oua)`` key tuples
-            so that equivalent keys produced for different runs reference the
-            same Python objects.  Pass the same dict across all calls to share
-            keys.
+            ``(cells, read_length, oua)`` key tuples so that equivalent keys
+            produced for different runs reference the same Python objects.
+            Pass the same dict across all calls to share keys.
 
         Returns
         -------
         dict
-            Maps ``(frozenset_of_rgr_frame_covpos, read_length, oua)`` keys to
-            :class:`EquivalenceGroup` values.
+            Maps ``(cells, read_length, oua)`` keys (see the module
+            docstring) to :class:`EquivalenceGroup` values.
         """
         egs: dict = defaultdict(EquivalenceGroup)
         for phase in range(3):
@@ -193,38 +248,38 @@ class EquivalenceGroupIntervals:
             if not interval_list:
                 continue
 
-            # Build events: (pos, type, tup)
+            # Build events: (pos, type, cell)
             # type=0 for interval-end (deactivate), type=1 for interval-start
             # (activate).  Sorting puts ends before starts at the same position,
             # preserving half-open [sc, ec) semantics.
             events: list = []
-            for sc, ec, tup in interval_list:
-                events.append((sc, 1, tup))
-                events.append((ec, 0, tup))
+            for sc, ec, cell in interval_list:
+                events.append((sc, 1, cell))
+                events.append((ec, 0, cell))
             events.sort(key=lambda x: (x[0], x[1]))
 
-            # refcount dict: tup -> number of currently-open intervals.
-            # Needed because get_sub_intervals can emit duplicate (sc, ec, tup)
+            # refcount dict: cell -> number of currently-open intervals.
+            # Needed because get_sub_intervals can emit duplicate (sc, ec, cell)
             # entries when the same RGR appears on multiple transcripts; plain
-            # set semantics would discard the tup too early on the first end
-            # event.  A tup is "active" as long as refcount > 0.
+            # set semantics would discard the cell too early on the first end
+            # event.  A cell is "active" as long as refcount > 0.
             active: dict = {}
             prev_pos: int | None = None
 
-            for pos, typ, tup in events:
+            for pos, typ, cell in events:
                 if prev_pos is not None and pos != prev_pos and active:
                     key = (frozenset(active), read_length, oua)
                     if key_cache is not None:
                         key = key_cache.setdefault(key, key)
                     egs[key].length += pos - prev_pos
                 if typ == 0:  # end event
-                    cnt = active.get(tup, 1) - 1
+                    cnt = active.get(cell, 1) - 1
                     if cnt <= 0:
-                        active.pop(tup, None)
+                        active.pop(cell, None)
                     else:
-                        active[tup] = cnt
+                        active[cell] = cnt
                 else:  # start event
-                    active[tup] = active.get(tup, 0) + 1
+                    active[cell] = active.get(cell, 0) + 1
                 prev_pos = pos
 
         return egs
@@ -733,10 +788,9 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     the read-equivalence DAG and collects equivalence groups for each
     transcript in the locus.
 
-    A shared key cache interns the
-    ``(frozenset_of_rgr_frame_covpos, read_length, oua)`` tuples so that
-    identical keys produced for different runs reference the same Python
-    objects.  In typical multi-run loci this reduces ``loc.egs`` memory by
+    A shared key cache interns the ``(cells, read_length, oua)`` tuples so
+    that identical keys produced for different runs reference the same
+    Python objects.  In typical multi-run loci this reduces ``loc.egs`` memory by
     one to two orders of magnitude.
 
     Two cross-run caches avoid redundant work, which matters most when many
@@ -859,13 +913,13 @@ def get_sub_intervals(
             ec = e_q + 1 if e_r > i else e_q
             if sc >= ec:
                 continue
-            src = egi.intervals[i]  # list of (interval_sc, interval_ec, tup)
+            src = egi.intervals[i]  # list of (interval_sc, interval_ec, cell)
             dst = result_lists[p]
-            for interval_sc, interval_ec, tup in src:
+            for interval_sc, interval_ec, cell in src:
                 clipped_sc = max(interval_sc, sc)
                 clipped_ec = min(interval_ec, ec)
                 if clipped_sc < clipped_ec:
-                    dst.append((clipped_sc - sc, clipped_ec - sc, tup))
+                    dst.append((clipped_sc - sc, clipped_ec - sc, cell))
 
     result = EquivalenceGroupIntervals()
     result.intervals = result_lists

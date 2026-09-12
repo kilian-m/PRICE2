@@ -22,13 +22,21 @@ from scipy.sparse import csr_matrix
 
 from price2 import database, multimap
 from price2.coverage_position import CoveragePosition
-from price2.genomic_features import ReadGeneratingRegion
+from price2.equivalence_groups import CELL_CODES, NO_FRAME
 from price2.genomic_region import GenomicRegion
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 
 if TYPE_CHECKING:
     from price2.locus import Locus
+
+# The ``frame_code * 3 + coverage_position`` part of a packed cell (see
+# ``equivalence_groups.pack_cell``): a NOISE region has no frame and only a
+# middle position; an ORF's codes are ``frame * 3 + _START / _MIDDLE / _STOP``.
+_START = CoveragePosition.start.value
+_MIDDLE = CoveragePosition.middle.value
+_STOP = CoveragePosition.stop.value
+_NOISE_MIDDLE = NO_FRAME * 3 + _MIDDLE
 
 
 class EgRoutingCache:
@@ -70,12 +78,11 @@ class EgRoutingCache:
         Per run, one entry per multimapping slot: group key, read length,
         untemplated-addition flag, and number of compatible RGR cells.
     slot_rgr, slot_code : dict[str, numpy.ndarray]
-        Per run, the flattened slot cells: RGR index and packed
-        ``frame * 3 + coverage_position``.  Replaces the object-valued
-        ``mm_slots`` routing that :meth:`compute_multimap_lambdas` used.
+        Per run, the flattened slot cells split into RGR index and
+        ``frame_code * 3 + coverage_position`` (``divmod(cell, CELL_CODES)``).
     cell_rgr, cell_code : numpy.ndarray
         One entry per design-matrix cell: the RGR index, and
-        ``frame * 3 + coverage_position`` packed into a byte.
+        ``frame_code * 3 + coverage_position`` packed into a byte.
     row_nnz, row_len, row_rl, row_oua, row_run : numpy.ndarray
         Per row: cell count, EG length, read length, untemplated-addition
         flag, and run index.
@@ -198,13 +205,15 @@ def rgr_compatibility(
     rsa: RiboSeqAlignment,
     run: RiboSeqRun,
     overlap_likelihood_ratio_threshold: float = 0.2,
-) -> frozenset[tuple[ReadGeneratingRegion, int | None, CoveragePosition]] | None:
+) -> frozenset[int] | None:
     """Determine which RGRs a read alignment is compatible with.
 
     For each RGR overlapping the read, compute the reading frame and
     coverage-profile position (start / middle / stop).  Partial
     overlaps are kept only when the cleavage-model probability ratio
-    exceeds *overlap_likelihood_ratio_threshold*.
+    exceeds *overlap_likelihood_ratio_threshold*.  Each combination is
+    returned as a packed cell (``equivalence_groups.pack_cell``), so the
+    result is the first element of the read's equivalence-group key.
 
     Parameters
     ----------
@@ -218,14 +227,14 @@ def rgr_compatibility(
 
     Returns
     -------
-    frozenset[tuple[ReadGeneratingRegion, int | None, CoveragePosition]] or None
-        Set of ``(rgr, frame, coverage_position)`` tuples, or
-        ``None`` when no compatible RGR is found.
+    frozenset[int] or None
+        The packed ``(rgr, frame, coverage_position)`` cells, or ``None``
+        when no compatible RGR is found.
     """
 
     overlap_transcripts = set(loc.transcripts)
 
-    rgr_frame_covpos = set()
+    cells = set()
 
     bp_starts, bp_ends, bp_sets = loc.transcript_breakpoint_index
     for query_iv in rsa.genomic_region.intervals:
@@ -250,9 +259,6 @@ def rgr_compatibility(
     oua = rsa.untemplated_addition
     oua_i = int(oua)
     thr = overlap_likelihood_ratio_threshold
-    cov_middle = CoveragePosition.middle
-    cov_start = CoveragePosition.start
-    cov_stop = CoveragePosition.stop
     in_lut = read_length < lut_len
     noise_cl = noise_lut[read_length, oua_i] if in_lut else 0.0
 
@@ -269,7 +275,7 @@ def rgr_compatibility(
                 frame = None
                 if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
                     if noise_cl > 0:
-                        rgr_frame_covpos.add((rgr, frame, cov_middle))
+                        cells.add(rgr.index * CELL_CODES + _NOISE_MIDDLE)
                 elif (rsa_lo <= rgr_lo <= rsa_hi) or (
                     rsa_lo <= rgr_hi <= rsa_hi
                 ):
@@ -291,24 +297,19 @@ def rgr_compatibility(
                         # ol/cl > thr: same result, no scalar-divide overflow
                         # when cl is a tiny denormal.
                         if ol > thr * cl:
-                            rgr_frame_covpos.add(
-                                (
-                                    rgr,
-                                    frame,
-                                    cov_middle,
-                                )
-                            )
+                            cells.add(rgr.index * CELL_CODES + _NOISE_MIDDLE)
             elif rgr.type == "ORF":
                 orf = rgr
                 if (rgr_lo <= rsa_lo) and (rgr_hi >= rsa_hi):
                     frame = (rsa_lo - rgr_lo) % 3
                     if (cds_lut[read_length, frame, oua_i] if in_lut else 0.0) > 0:
-                        rgr_frame_covpos.add((orf, frame, cov_middle))
+                        cells.add(orf.index * CELL_CODES + frame * 3 + _MIDDLE)
                 # part overlap with orf
                 elif (rsa_lo <= rgr_lo <= rsa_hi) or (
                     rsa_lo <= rgr_hi <= rsa_hi
                 ):
                     frame = (rsa_lo - rgr_lo) % 3
+                    orf_cells = orf.index * CELL_CODES + frame * 3
                     cl = cds_lut[read_length, frame, oua_i] if in_lut else 0.0
                     cl_ok = not cl == 0
                     # consider overlap likelihood
@@ -329,13 +330,7 @@ def rgr_compatibility(
                         # when cl is a tiny denormal (cl_ok guarantees cl > 0);
                         # identical result since thr > 0.
                         if cl_ok and (ol > thr * cl):
-                            rgr_frame_covpos.add(
-                                (
-                                    orf,
-                                    frame,
-                                    cov_middle,
-                                )
-                            )
+                            cells.add(orf_cells + _MIDDLE)
                     # consider coverage profile - start
                     # compute where the orf starts relative to the read
                     start_position = (
@@ -358,9 +353,7 @@ def rgr_compatibility(
                             ol
                             > thr * cl
                         ):
-                            rgr_frame_covpos.add(
-                                (orf, frame, cov_start)
-                            )
+                            cells.add(orf_cells + _START)
 
                     # consider coverage profile - stop
                     # compute where the orf ends relative to the read
@@ -384,15 +377,11 @@ def rgr_compatibility(
                             ol
                             > thr * cl
                         ):
-                            rgr_frame_covpos.add(
-                                (orf, frame, cov_stop)
-                            )
+                            cells.add(orf_cells + _STOP)
 
-    if not rgr_frame_covpos:
-        return
-
-    rgr_frame_covpos = frozenset(rgr_frame_covpos)
-    return rgr_frame_covpos
+    if not cells:
+        return None
+    return frozenset(cells)
 
 
 def count_well_fitting_reads(loc: Locus, runs: list[RiboSeqRun]) -> None:
@@ -414,6 +403,11 @@ def count_well_fitting_reads(loc: Locus, runs: list[RiboSeqRun]) -> None:
         for rgr in loc.rgr_set:
             if rgr.type == "ORF":
                 well_fitting_rcs[run.id][rgr.id] = 0
+    # ORF id by ``rgr.index`` (``None`` for NOISE), to resolve the cells.
+    orf_id_of: list = [None] * len(loc.rgr_set)
+    for rgr in loc.rgr_set:
+        if rgr.type == "ORF":
+            orf_id_of[rgr.index] = rgr.id
     for run in runs:
         well_fitting_indices = run.cleavage_model.get_high_prob_indices()
         well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}
@@ -423,19 +417,16 @@ def count_well_fitting_reads(loc: Locus, runs: list[RiboSeqRun]) -> None:
                 int(rsa.untemplated_addition),
             ) not in well_fitting_length_oua:
                 continue
-            rgr_frame_covpos = rgr_compatibility(loc, rsa, run)
-            if not rgr_frame_covpos:
+            cells = rgr_compatibility(loc, rsa, run)
+            if not cells:
                 continue
 
             # One RGR can appear under several coverage positions for the
             # same read (a read spanning a short ORF overlaps both its
             # start- and stop-codon regions), so deduplicate before
             # counting: a read contributes its count once per RGR.
-            orf_ids = {
-                rgr.id
-                for rgr, _frame, _covpos in rgr_frame_covpos
-                if rgr.type != "NOISE"
-            }
+            orf_ids = {orf_id_of[cell // CELL_CODES] for cell in cells}
+            orf_ids.discard(None)
             for rgr_id in orf_ids:
                 well_fitting_rcs[run.id][rgr_id] += rsa.read_count
 
@@ -452,8 +443,9 @@ def assign_reads_to_egs(
 ) -> None:
     """Assign reads to their equivalence groups.
 
-    Each read is matched to its ``(rgr_frame_covpos, length, oua)``
-    key and added to the corresponding :class:`EquivalenceGroup`.
+    Each read is matched to its ``(cells, read_length, oua)`` key (see
+    :mod:`price2.equivalence_groups`) and added to the corresponding
+    :class:`EquivalenceGroup`.
     Reads whose key is absent (due to earlier filtering) are counted
     in :attr:`uncounted_reads`.
 
@@ -479,7 +471,7 @@ def assign_reads_to_egs(
         Record the weight-independent read routing and design-matrix
         geometry in :attr:`eg_cache` while assigning.  Later EM
         iterations then take :meth:`_assign_reads_from_cache`, which
-        skips the per-read :meth:`get_rgr_frame_covpos` recomputation.
+        skips the per-read :func:`rgr_compatibility` recomputation.
     """
     cache = loc.eg_cache
     if cache is not None and not build_cache:
@@ -506,7 +498,7 @@ def assign_reads_to_egs(
         mm_gk: dict = {}
         mm_base: dict = {}
 
-    # {run_id: {group_key: (rgr_frame_covpos, read_length, oua)}} —
+    # {run_id: {group_key: (cells, read_length, oua)}} —
     # the compatibility routing the E-step needs to recompute λ.
     loc.mm_slots = {run.id: {} for run in runs}
     for run in runs:
@@ -523,15 +515,15 @@ def assign_reads_to_egs(
             mb: list = []
 
         for i, rsa in enumerate(loc.rsas_dict[run_id]):
-            rgr_frame_covpos = rgr_compatibility(loc, rsa, run)
+            cells = rgr_compatibility(loc, rsa, run)
             read_count = rsa.read_count
 
             if build_cache:
                 counts_arr[i] = rsa.read_count
-                if rgr_frame_covpos:
+                if cells:
                     rows_arr[i] = run_rows.get(
                         (
-                            rgr_frame_covpos,
+                            cells,
                             len(rsa),
                             rsa.untemplated_addition,
                         ),
@@ -554,19 +546,19 @@ def assign_reads_to_egs(
                         mi.append(i)
                         mg.append(gk)
                         mb.append(base)
-                    if rgr_frame_covpos:
+                    if cells:
                         loc.mm_slots[run_id][gk] = (
-                            rgr_frame_covpos,
+                            cells,
                             len(rsa),
                             rsa.untemplated_addition,
                         )
 
-            if not rgr_frame_covpos:
+            if not cells:
                 continue
 
             try:
                 loc.egs[run][
-                    (rgr_frame_covpos, len(rsa), rsa.untemplated_addition)
+                    (cells, len(rsa), rsa.untemplated_addition)
                 ].read_count += read_count
                 run.read_count += read_count
             except KeyError:
@@ -608,14 +600,13 @@ def _make_eg_cache(
 ) -> EgRoutingCache:
     """Freeze the design-matrix geometry into a compact cell encoding.
 
-    Storing ``X`` itself would add ~1.1 MB per locus; instead the cells
-    are stored as ``(rgr index, frame*3 + coverage position)`` pairs plus
-    per-row ``(length, read length, oua, run)``, from which ``X.data``
-    is recomputed with a handful of vectorised look-ups.
+    Storing ``X`` itself would add ~1.1 MB per locus; instead the packed
+    cells of the equivalence-group keys are stored split into
+    ``(rgr index, frame_code*3 + coverage position)`` plus per-row
+    ``(length, read length, oua, run)``, from which ``X.data`` is recomputed
+    with a handful of vectorised look-ups.
 
-    The multimapping-slot routing is encoded the same way, so that the
-    cache holds no references to RGR objects and can be loaded without
-    the rest of the locus.
+    The multimapping-slot routing is encoded the same way.
     """
     cell_rgr: list = []
     cell_code: list = []
@@ -625,19 +616,18 @@ def _make_eg_cache(
     row_oua: list = []
     row_run: list = []
     for run_index, run in enumerate(runs):
-        for (rgr_frame_covpos, read_length, oua), eg in loc.egs[run].items():
-            if not rgr_frame_covpos:
+        for (cells, read_length, oua), eg in loc.egs[run].items():
+            if not cells:
                 continue
-            row_nnz.append(len(rgr_frame_covpos))
+            row_nnz.append(len(cells))
             row_len.append(eg.length)
             row_rl.append(read_length)
             row_oua.append(int(oua))
             row_run.append(run_index)
-            for rgr, frame, cov_pos in rgr_frame_covpos:
-                cell_rgr.append(rgr.index)
-                cell_code.append(
-                    (3 if frame is None else frame) * 3 + cov_pos.value
-                )
+            for cell in cells:
+                rgr_index, code = divmod(cell, CELL_CODES)
+                cell_rgr.append(rgr_index)
+                cell_code.append(code)
 
     slot_gk: dict = {}
     slot_rl: dict = {}
@@ -652,9 +642,10 @@ def _make_eg_cache(
             rls.append(read_length)
             ouas.append(int(oua))
             nnzs.append(len(rfc))
-            for rgr, frame, cov_pos in rfc:
-                srgr.append(rgr.index)
-                scode.append((3 if frame is None else frame) * 3 + cov_pos.value)
+            for cell in rfc:
+                rgr_index, code = divmod(cell, CELL_CODES)
+                srgr.append(rgr_index)
+                scode.append(code)
         slot_gk[run.id] = np.array(gks, dtype=np.int64)
         slot_rl[run.id] = np.array(rls, dtype=np.int32)
         slot_oua[run.id] = np.array(ouas, dtype=np.uint8)
@@ -828,7 +819,8 @@ def egs_to_sparse(
     ----------
     locus_egs : dict
         ``Locus.egs`` — mapping from :class:`RiboSeqRun` to a dict of
-        ``(rgr_frame_covpos, read_length, oua) -> EquivalenceGroup``.
+        ``(cells, read_length, oua) -> EquivalenceGroup`` (see
+        :mod:`price2.equivalence_groups` for the key).
     runs : list[RiboSeqRun]
         Ordered list of runs (determines run indices).
     cm_lut : np.ndarray, shape ``(num_runs, max_read_len, 4, 2)``
@@ -854,8 +846,8 @@ def egs_to_sparse(
     n_rows = 0
     nnz = 0
     for run in runs:
-        for (rgr_frame_covpos, _, _), _ in locus_egs[run].items():
-            sz = len(rgr_frame_covpos)
+        for (cells, _, _), _ in locus_egs[run].items():
+            sz = len(cells)
             if sz == 0:
                 continue
             n_rows += 1
@@ -870,20 +862,21 @@ def egs_to_sparse(
     row = 0
     cell = 0
     for run_index, run in enumerate(runs):
-        for (rgr_frame_covpos, read_length, oua), eg in locus_egs[run].items():
-            if not rgr_frame_covpos:
+        for (cells, read_length, oua), eg in locus_egs[run].items():
+            if not cells:
                 continue
             y[row] = eg.read_count
             length = eg.length
             oua_int = int(oua)
-            for rgr, frame, cov_pos in rgr_frame_covpos:
-                f = 3 if frame is None else frame
+            for packed in cells:
+                rgr_index, code = divmod(packed, CELL_CODES)
+                frame_code, cov_pos = divmod(code, 3)
                 rows_idx[cell] = row
-                cols_idx[cell] = rgr.index * num_runs + run_index
+                cols_idx[cell] = rgr_index * num_runs + run_index
                 data[cell] = (
                     length
-                    * cm_lut[run_index, read_length, f, oua_int]
-                    * coverage_params[run_index, cov_pos.value]
+                    * cm_lut[run_index, read_length, frame_code, oua_int]
+                    * coverage_params[run_index, cov_pos]
                 )
                 cell += 1
             row += 1
@@ -943,12 +936,13 @@ def multimap_lambdas(loc: Locus, runs: list[RiboSeqRun]) -> list:
         for gk, (rfc, read_length, oua) in loc.mm_slots[run.id].items():
             oua_int = int(oua)
             lam = 0.0
-            for rgr, frame, cov_pos in rfc:
-                f = 3 if frame is None else frame
+            for cell in rfc:
+                rgr_index, code = divmod(cell, CELL_CODES)
+                frame_code, cov_pos = divmod(code, 3)
                 lam += (
-                    cm_lut[run_index, read_length, f, oua_int]
-                    * coverage_params[run_index, cov_pos.value]
-                    * loc.result[rgr.index, run_index]
+                    cm_lut[run_index, read_length, frame_code, oua_int]
+                    * coverage_params[run_index, cov_pos]
+                    * loc.result[rgr_index, run_index]
                 )
             out.append((run.id, gk, float(lam)))
     return out
