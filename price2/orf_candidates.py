@@ -372,7 +372,10 @@ def build_rgrs(
         for k, v in database.decompress_blob(blob).items():
             transcript_read_counts[k] = transcript_read_counts.get(k, 0) + v
 
-    tr_ids = [t.id for t in locus.transcripts]
+    # ``locus.transcripts`` is a set; the greedy selection below keeps the
+    # first of several transcripts explaining the same reads, so its order
+    # has to be fixed for the result not to depend on the hash seed.
+    tr_ids = sorted(t.id for t in locus.transcripts)
     explaining_transcripts_reads_list = []
 
     if tr_ids and transcript_read_counts:
