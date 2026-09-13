@@ -520,24 +520,166 @@ def _slow_path_transcripts(blocks: list, locus: Locus) -> list:
     return transcripts
 
 
+#: The transcript set of a read that maps into none.
+_NO_TRANSCRIPTS: frozenset[str] = frozenset()
+
+
+class _TranscriptResolver:
+    """The transcripts of one locus that a read's reference blocks map into.
+
+    Most reads never need a :class:`~price2.ribo_seq_alignment.RiboSeqAlignment`
+    or a :meth:`~price2.genomic_region.GenomicRegion.map_to_local` call.  A
+    read that is a single block maps into exactly the transcripts common to
+    every breakpoint step it touches, provided those steps cover it without
+    a gap (a transcript's exons are separated by introns, so a gapless
+    covered stretch lies inside one exon; a locus with abutting exons loses
+    this path, see :attr:`~price2.locus.Locus.has_abutting_exons`).  A read
+    that is two blocks maps into a transcript iff its gap is one of that
+    transcript's introns and its outer ends stay within the flanking exons
+    -- a lookup in :attr:`~price2.locus.Locus.transcript_junction_index`.
+    Everything else falls back to :func:`_slow_path_transcripts`.
+
+    One resolver serves all reads of a locus: single-block reads covered by
+    the same run of steps share one memoised transcript set.
+    """
+
+    __slots__ = (
+        "locus",
+        "bp_starts",
+        "bp_ends",
+        "bp_sets",
+        "n_bp",
+        "junctions",
+        "single_block_fast",
+        "_step_memo",
+    )
+
+    def __init__(self, locus: Locus) -> None:
+        self.locus = locus
+        self.bp_starts, self.bp_ends, self.bp_sets = locus.transcript_breakpoint_index
+        self.n_bp = len(self.bp_starts)
+        self.junctions = locus.transcript_junction_index
+        self.single_block_fast = not locus.has_abutting_exons
+        self._step_memo: dict[tuple[int, int], frozenset[str]] = {}
+
+    def resolve(self, blocks: list[tuple[int, int]]) -> frozenset[str]:
+        """The ids of the transcripts *blocks* (in chromosome order) map into."""
+        if len(blocks) == 2:
+            return self._two_blocks(blocks)
+        if len(blocks) != 1 or not self.single_block_fast:
+            return frozenset(tr.id for tr in _slow_path_transcripts(blocks, self.locus))
+        # Single block, inlined: this is the path nearly every read takes.
+        start, end = blocks[0]
+        bp_starts, bp_ends, n_bp = self.bp_starts, self.bp_ends, self.n_bp
+        i0 = bisect.bisect_right(bp_ends, start)
+        if i0 >= n_bp or bp_starts[i0] > start:
+            return _NO_TRANSCRIPTS  # read starts outside any exon
+        i1 = i0
+        while i1 + 1 < n_bp and bp_starts[i1 + 1] < end:
+            if bp_starts[i1 + 1] != bp_ends[i1]:
+                break  # gap between steps
+            i1 += 1
+        if bp_ends[i1] < end:
+            return _NO_TRANSCRIPTS  # read runs past the covered stretch
+        ids = self._step_memo.get((i0, i1))
+        if ids is None:
+            bp_sets = self.bp_sets
+            candidates = (
+                bp_sets[i0] if i0 == i1 else set.intersection(*bp_sets[i0 : i1 + 1])
+            )
+            ids = self._step_memo[(i0, i1)] = frozenset(tr.id for tr in candidates)
+        return ids
+
+    def _two_blocks(self, blocks: list[tuple[int, int]]) -> frozenset[str]:
+        (a1, b1), (a2, b2) = blocks
+        spliced = self.junctions.get((b1, a2))
+        if not spliced:
+            return _NO_TRANSCRIPTS  # gap is not an annotated intron here
+        return frozenset(
+            tr.id
+            for tr, donor_start, acceptor_end in spliced
+            if a1 >= donor_start and b2 <= acceptor_end
+        )
+
+
+def _map_locus_reads(
+    alignments,
+    locus: Locus,
+    end_to_end: bool,
+    drop_multimap: bool,
+    record_multimap: bool,
+) -> tuple[dict, dict, list[tuple[int, int]]]:
+    """Tally one locus's alignments by footprint and by transcript set.
+
+    Parameters
+    ----------
+    alignments : iterable of pysam.AlignedSegment
+        The records fetched over the locus.
+    locus : Locus
+        The locus they were fetched from.
+    end_to_end : bool
+        Selects EndToEnd untemplated-addition detection
+        (:func:`price2.bam.footprint`).
+    drop_multimap : bool
+        Discard alignments with ``NH > 1`` instead of counting them in
+        every locus they align to.
+    record_multimap : bool
+        Also list the multimapping alignments for the linkage spill.
+
+    Returns
+    -------
+    tuple
+        ``(mappings, transcript_counts, multimappers)``: the collapsed
+        footprints ``{(untemplated_addition, unique, blocks): count}`` (the
+        input of :func:`_reads_frame`), the reads per compatible transcript
+        set ``{frozenset of transcript ids: count}``, and the
+        ``(query-name hash, group key)`` of every recorded multimapping
+        alignment.
+    """
+    is_minus = locus.iv.strand == "-"
+    resolver = _TranscriptResolver(locus)
+    resolve = resolver.resolve
+    qname_hash = multimap.qname_hash
+    group_key = multimap.group_key
+
+    mappings: dict = defaultdict(int)
+    transcript_counts: dict = defaultdict(int)
+    multimappers: list[tuple[int, int]] = []
+    for alignment in alignments:
+        if alignment.is_unmapped or alignment.is_reverse != is_minus:
+            continue
+        # Checked before the transcript mapping: the alignment is dropped
+        # outright, so none of that work is needed.
+        if drop_multimap and not is_unique(alignment):
+            continue
+        found = footprint(alignment, end_to_end)
+        if found is None:
+            continue
+        blocks, ua = found
+        transcript_ids = resolve(blocks)
+        if not transcript_ids:
+            continue
+        # Multimapping alignments were skipped above when dropping them.
+        unique = drop_multimap or is_unique(alignment)
+        ivs_tuple = tuple(blocks)
+        mappings[(ua, unique, ivs_tuple)] += 1
+        transcript_counts[transcript_ids] += 1
+        # Record this multimapping alignment so its read can be linked to
+        # its other in-locus slots for the EM E-step.
+        if record_multimap and not unique:
+            multimappers.append(
+                (qname_hash(alignment.query_name), group_key(ivs_tuple, ua))
+            )
+    return mappings, transcript_counts, multimappers
+
+
 def collect_mappings_chunk(data: tuple) -> tuple:
     """Map one run's reads against a contiguous chunk of loci.
 
     Designed to be called via :class:`multiprocessing.Pool`; the loci
     themselves are read from the :data:`_WORKER_LOCI` module global, which
-    forked workers inherit without pickling.
-
-    Alignments are handled as the blocks of :func:`price2.bam.footprint`;
-    most never need a :class:`~price2.ribo_seq_alignment.RiboSeqAlignment`
-    or a :meth:`~price2.genomic_region.GenomicRegion.map_to_local` call.  A
-    read that is a single block maps into exactly the transcripts common to
-    every breakpoint step it touches, provided those steps cover it without
-    a gap (a transcript's exons are separated by introns, so a gapless
-    covered stretch lies inside one exon).  A read that is two blocks maps
-    into a transcript iff its gap is one of that transcript's introns and
-    its outer ends stay within the flanking exons — a lookup in
-    :attr:`~price2.locus.Locus.transcript_junction_index`.  Everything else
-    falls back to :func:`_slow_path_transcripts`.
+    forked workers inherit without pickling.  Each locus's reads are
+    tallied by :func:`_map_locus_reads`.
 
     Parameters
     ----------
@@ -574,100 +716,29 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     mm_loci: list = []
     mm_keys: list = []
 
-    qname_hash = multimap.qname_hash
-    group_key = multimap.group_key
-    bisect_right = bisect.bisect_right
     # One handle per worker: chunks of one run land on the same worker
     # repeatedly, so the index is parsed once.
     sf = cached_alignment_file(f"{bam_dir}/{run_id}.bam", exclusive=True)
 
     for locus_idx in range(lo, hi):
         locus = _WORKER_LOCI[locus_idx]
-        transcripts_counts: dict = defaultdict(int)
-        mappings_dict: dict = defaultdict(int)
-
-        is_minus = locus.iv.strand == "-"
-        bp_starts, bp_ends, bp_sets = locus.transcript_breakpoint_index
-        n_bp = len(bp_starts)
-        junctions = locus.transcript_junction_index
-        single_block_fast = not locus.has_abutting_exons
-        # (first_step, last_step) -> frozenset of transcript ids, shared by
-        # every single-block read covered by exactly that run of steps.
-        step_memo: dict = {}
-
-        for alignment in sf.fetch(locus.iv.chrom, locus.iv.start, locus.iv.end):
-            if alignment.is_unmapped or alignment.is_reverse != is_minus:
-                continue
-
-            # Checked before the transcript mapping: the alignment is
-            # dropped outright, so none of that work is needed.
-            if drop_multimap and not is_unique(alignment):
-                continue
-
-            found = footprint(alignment, end_to_end)
-            if found is None:
-                continue
-            blocks, ua = found
-            n_blocks = len(blocks)
-
-            if n_blocks == 1 and single_block_fast:
-                start, end = blocks[0]
-                i0 = bisect_right(bp_ends, start)
-                if i0 >= n_bp or bp_starts[i0] > start:
-                    continue  # read starts outside any exon
-                i1 = i0
-                while i1 + 1 < n_bp and bp_starts[i1 + 1] < end:
-                    if bp_starts[i1 + 1] != bp_ends[i1]:
-                        break  # gap between steps
-                    i1 += 1
-                if bp_ends[i1] < end:
-                    continue  # read runs past the covered stretch
-                transcripts_ids = step_memo.get((i0, i1))
-                if transcripts_ids is None:
-                    candidates = (
-                        bp_sets[i0] if i0 == i1
-                        else set.intersection(*bp_sets[i0:i1 + 1])
-                    )
-                    transcripts_ids = frozenset(tr.id for tr in candidates)
-                    step_memo[(i0, i1)] = transcripts_ids
-            elif n_blocks == 2:
-                (a1, b1), (a2, b2) = blocks
-                spliced = junctions.get((b1, a2))
-                if not spliced:
-                    continue  # gap is not an annotated intron here
-                transcripts_ids = frozenset(
-                    tr.id
-                    for tr, donor_start, acceptor_end in spliced
-                    if a1 >= donor_start and b2 <= acceptor_end
-                )
-            else:
-                transcripts_ids = frozenset(
-                    tr.id for tr in _slow_path_transcripts(blocks, locus)
-                )
-
-            if not transcripts_ids:
-                continue
-
-            # Multimapping alignments were skipped above when dropping them.
-            unique = drop_multimap or is_unique(alignment)
-
-            ivs_tuple = tuple(blocks)
-            mappings_dict[(ua, unique, ivs_tuple)] += 1
-            transcripts_counts[transcripts_ids] += 1
-
-            # Record this multimapping alignment so its read can be linked
-            # to its other in-locus slots for the EM E-step.
-            if record_multimap and not unique:
-                mm_qnames.append(qname_hash(alignment.query_name))
-                mm_loci.append(locus_idx)
-                mm_keys.append(group_key(ivs_tuple, ua))
-
+        mappings, transcript_counts, multimappers = _map_locus_reads(
+            sf.fetch(locus.iv.chrom, locus.iv.start, locus.iv.end),
+            locus,
+            end_to_end,
+            drop_multimap,
+            record_multimap,
+        )
         reads_rows.append(
-            (locus.id, run_id, database.compress_blob(_reads_frame(mappings_dict)))
+            (locus.id, run_id, database.compress_blob(_reads_frame(mappings)))
         )
         transcript_count_rows.append(
-            (locus.id, run_id, database.compress_blob(transcripts_counts))
+            (locus.id, run_id, database.compress_blob(transcript_counts))
         )
+        for qname, key in multimappers:
+            mm_qnames.append(qname)
+            mm_loci.append(locus_idx)
+            mm_keys.append(key)
 
     if record_multimap:
         multimap.write_spill(run_spill_dir, mm_qnames, mm_loci, mm_keys)
