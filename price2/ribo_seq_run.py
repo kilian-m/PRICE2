@@ -128,9 +128,10 @@ def ribo_seq_runs_from_bams(
     processes : int, optional
         Maximum number of worker processes.  Defaults to 32.
     high_quality_only : bool, optional
-        If True, exclude runs whose cleavage model failed quality checks
-        (peak not at position 12 or peak probability < 0.3).  Defaults to
-        False.
+        If True, exclude runs that fail the quality gate of
+        :func:`_assemble_run` (an implausible cleavage or coverage model, or
+        fewer than :data:`MIN_COUNTED_ALNS` counted alignments).  Defaults
+        to False.
     end_to_end : bool, optional
         When True the BAM files were mapped with ``--alignEndsType EndToEnd``;
         the untemplated addition is recovered from the 5'-terminal mismatch

@@ -19,423 +19,278 @@ _OBSOLETE_FIELDS: frozenset[str] = frozenset(
 class Config:
     """Configuration for a PRICE2 run.
 
-    All parameters are loaded from a JSON file via :meth:`make_config`.
-    Paths that are left as empty strings are derived automatically from
-    ``base_dir`` in :meth:`__post_init__`.
-
-    The directory layout assumed by default::
+    All options are loaded from a JSON file or keyword arguments via
+    :meth:`make_config`.  Every option is documented at its field below; the
+    reasoning behind the tuned defaults is in ``docs/tuning.md``.  Path
+    options left empty are derived from ``base_dir`` in :meth:`__post_init__`::
 
         base_dir/
         ├── o_dir/      # output
-        ├── w_dir/      # working / SQLite database
-        ├── bam_dir/    # mapped Ribo-seq BAM files
-        └── logs/       # log files
+        ├── w_dir/      # working directory, holds price.db
+        └── bam_dir/    # mapped Ribo-seq BAM files
 
-    Parameters
-    ----------
-    base_dir : str
-        Root directory for the run.  All relative paths default to
-        subdirectories of this directory (required).
-    o_dir : str
-        Output directory.  Defaults to ``<base_dir>/o_dir``.
-    w_dir : str
-        Working directory (holds ``price.db`` SQLite database).
-        Defaults to ``<base_dir>/w_dir``.
-    gtf_path : str
-        Path to the reference annotation GTF file.
-    fasta_path : str
-        Path to the reference genome FASTA file.
-    bam_dir : str
-        Directory containing mapped Ribo-seq BAM files.
-        Defaults to ``<base_dir>/bam_dir``.
-    bam_ids : list[str] or None
-        Optional subset of BAM file identifiers to process.  When
-        ``None`` all BAM files found in ``bam_dir`` are used.
-    align_ends_type : str
-        How the input BAMs were mapped at their read ends, one of
-        ``"local"`` (default) or ``"endtoend"``.  With ``"local"`` the
-        reverse-transcription untemplated nucleotide (RT base) appears as a
-        1-nt 5' soft-clip (STAR ``--alignEndsType Local``) and PRICE2 reads
-        it directly.  With ``"endtoend"`` (STAR ``--alignEndsType EndToEnd``)
-        there are no soft-clips, so a mismatching RT base is instead recovered
-        from the 1-nt 5'-terminal mismatch (requires the ``MD`` tag) and that
-        base is trimmed off the footprint, reproducing the Local read
-        geometry.  Results are close but not bit-identical to a Local run: the
-        ~1-2%% of RT-carrying reads whose extra mismatch trips STAR's
-        ``outFilterMismatchNmax`` are dropped by the mapper and never reach
-        PRICE2.
-    processes : int
-        Number of parallel worker processes.
-    worker_max_tasks : int
-        Number of loci a worker process handles before being replaced
-        (``0`` means never replaced).
-    timeout : int
-        Per-locus timeout in seconds *per Ribo-seq run*: a locus is
-        abandoned after ``timeout`` × (number of runs) seconds (default
-        ``180``, so 900 s for five datasets).  One locus is solved for all
-        datasets at once, so its cost grows with how many there are and an
-        absolute budget would time out the wide runs.
-    pseudo_min : float
-        Lower bound applied to activity estimates during optimisation to
-        avoid ``log(0)`` numerical instability.
-    min_explained_reads_per_run : int
-        Minimum number of reads that must be explained by a single
-        transcript per run for that transcript to be retained.
-    coverage_filter : bool
-        Enable the coverage filter, which removes ORF candidates with
-        insufficient average well-fitting read coverage.
-    min_well_fitting_reads_per_length : float
-        Coverage-filter threshold: minimum well-fitting reads per
-        nucleotide length (taken as the maximum across all runs).
-    deconvolution_filter : bool
-        Enable the pre-deconvolution filter that removes ORF candidates
-        with low estimated activity within stop-codon groups.
-    deconvolution_filter_min_activity : float
-        Minimum activity threshold used by the deconvolution filter.
-    stop_factor_relative : float
-        Convergence criterion for the main optimisation: stop when the
-        relative change in every activity falls below this value.
-    ftol : float
-        ``ftol`` tolerance passed to ``scipy.optimize.minimize``
-        (L-BFGS-B).  Set to 0 to rely solely on ``stop_factor_relative``.
-    gtol : float
-        ``gtol`` tolerance passed to ``scipy.optimize.minimize``
-        (L-BFGS-B).  Set to 0 to rely solely on ``stop_factor_relative``.
-    maxls : int
-        Maximum number of line-search steps in all optimisations.
-    lam : float
-        Group-LASSO regularisation strength λ.
-    rgr_min_activity : float
-        Minimum activity (in at least one run) for an RGR to be retained.
-    min_activity_fraction : float
-        Minimum activity expressed as a fraction of the canonical ORF
-        activity for an ORF to be retained.
-    likelihood_ratio_filter : bool
-        Apply a likelihood-ratio test as the final filtering step.
-    likelihood_ratio_alpha : float
-        Significance threshold for the likelihood-ratio test.
-    high_quality_runs_only : bool
-        When ``True``, exclude Ribo-seq runs whose cleavage model failed
-        quality checks (peak not at position 12 or peak probability < 0.3).
-    log_level : str
-        Logging verbosity level for the ``price2`` logger.  Accepts
-        standard Python level names (``"DEBUG"``, ``"INFO"``,
-        ``"WARNING"``, ``"ERROR"``, ``"CRITICAL"``).
-    start_codons : tuple[str, ...]
-        Codons accepted as translation start sites for ORF candidate
-        generation.
-    stop_codons : tuple[str, ...]
-        Codons accepted as translation stop sites for ORF candidate
-        generation.
-    warm_start : bool
-        When ``True`` (default), continue an interrupted run instead of
-        starting over: the existing working directory (``w_dir``) and its
-        SQLite database are reused, and every stage picks up where it
-        stopped — data collection run by run and locus by locus, the
-        multimapping EM at its last checkpointed iteration, and the final
-        deconvolution at the loci not yet listed in ``processed_loci.txt``.
-        A stage whose options changed since the previous invocation starts
-        over; a change to an option that decides the *content* of the
-        database (see :mod:`price2.run_state`) stops the run instead of
-        silently discarding a collection that can take days.  When
-        ``False`` both directories are wiped and the run starts cold.
-    export_dataset_models : bool
-        Write the ``dataset_models/`` directory with cleavage and coverage
-        model summaries and plots (default ``True``).
-    export_performance_measurements : bool
-        Write ``performance_measurements.tsv`` with per-locus timing and
-        filtering statistics (default ``False``).
-    export_all_steps : bool
-        When ``True``, write output files for every filtering step.
-        When ``False`` (default) only the final results are exported.
-    export_tsv : bool
-        Write TSV output files (default ``True``).
-    export_gtf : bool
-        Write GTF output files (default ``False``).
-    export_bed : bool
-        Write BED12 output files (default ``True``).
-    export_orfs : bool
-        Include ORF entries in output files (default ``True``).
-    export_regions : bool
-        Include all regions (ORFs + NOISE) in output files (default
-        ``False``).  Produces ``*_regions.*`` files alongside
-        ``*_orfs.*``.
-    export_loci : bool
-        Include locus interval entries in GTF output (default ``False``).
-    export_transcripts : bool
-        Include transcript/NOISE entries in GTF output (default
-        ``False``).
+    Which options decide the content of ``price.db`` and which only affect
+    the deconvolution is recorded in :mod:`price2.run_state`.
     """
 
     # ------------------------------------------------------------------ #
     # Required                                                             #
     # ------------------------------------------------------------------ #
+    #: Root directory of the run; the empty path options below default to
+    #: its subdirectories.
     base_dir: str
 
     # ------------------------------------------------------------------ #
     # Paths (derived from base_dir when left empty)                       #
     # ------------------------------------------------------------------ #
+    #: Output directory (``<base_dir>/o_dir``).
     o_dir: str = ""
+    #: Working directory holding ``price.db`` (``<base_dir>/w_dir``).
     w_dir: str = ""
+    #: Reference annotation, GTF.
     gtf_path: str = ""
+    #: Reference genome, FASTA.
     fasta_path: str = ""
+    #: Directory of the coordinate-sorted, indexed BAM files
+    #: (``<base_dir>/bam_dir``).
     bam_dir: str = ""
+    #: The ``{bam_id}.bam`` files of ``bam_dir`` to use; ``None`` uses all.
     bam_ids: list[str] | None = None
 
     # ------------------------------------------------------------------ #
     # Read mapping                                                          #
     # ------------------------------------------------------------------ #
-    #: How the input BAMs were mapped at the read ends: ``"local"`` (STAR
-    #: ``--alignEndsType Local``, soft-clipped RT nucleotide) or ``"endtoend"``
-    #: (``--alignEndsType EndToEnd``, RT nucleotide recovered from the
-    #: 5'-terminal mismatch).  See the class docstring.
+    #: How STAR aligned the read ends.  ``"local"`` (``--alignEndsType
+    #: Local``) leaves the reverse-transcription untemplated nucleotide as a
+    #: 1-nt 5' soft-clip that PRICE2 reads directly.  ``"endtoend"`` has no
+    #: soft-clips: the nucleotide is recovered from a 5'-terminal mismatch
+    #: (needs the ``MD`` tag) and trimmed off the footprint, reproducing the
+    #: Local geometry.  The two are close but not bit-identical, as the
+    #: ~1-2 % of such reads whose extra mismatch trips STAR's
+    #: ``outFilterMismatchNmax`` never reach PRICE2 under EndToEnd.
     align_ends_type: str = "local"
 
     # ------------------------------------------------------------------ #
     # Parallelism & runtime                                                #
     # ------------------------------------------------------------------ #
+    #: Worker processes.  A fixed default, not the host's core count.
     processes: int = 80
-    #: Per-locus wall-clock budget in seconds *per Ribo-seq run*; the effective
-    #: limit is ``timeout * len(runs)`` (see ``ORFActivityEstimator``).
+    #: Per-locus wall-clock budget in seconds *per Ribo-seq run*: a locus is
+    #: abandoned after ``timeout * len(runs)`` seconds, since one locus is
+    #: solved for all runs at once.
     timeout: int = 180
+    #: Floor on the activities during optimisation, guarding ``log(0)`` in
+    #: the likelihood.  Do not lower it.
     pseudo_min: float = 1e-14
-    #: Loci a worker handles before it is replaced (``0`` = never replaced).
-    #: A fresh process costs ~2 CPU-seconds before it does any useful work:
-    #: numba cache load, imports, and a cold interpreter/allocator on its first
-    #: locus.  At ``1`` that was charged to every one of the ~39K loci in every
-    #: EM iteration.  Reuse amortises it (measured ``0.70 + 1.97/worker_max_tasks``
-    #: CPU-seconds per locus) while still recycling processes often enough to
-    #: bound RSS growth from the occasional very large locus.
-    #:
-    #: Retuned 50 -> 1000: that ``0.70`` per-locus figure predates the
-    #: routing-based EM light M-step, which reduced the per-locus work of an EM
-    #: iteration to a few milliseconds (a cached bincount + a small MU solve).
-    #: Against that, recycling every 50 loci means a worker spends far more time
-    #: respawning than computing: at ~13K slot loci per light iteration that is
-    #: ~260 respawns (~2 CPU-s each) ≈ ~13 s of wall per iteration. Measured on
-    #: the Yewdell-scale 3-BAM set (playground/pruning): dropping the recycling
-    #: cut whole-deconvolution wall 964 s -> 454 s (2.1x, identical call set).
-    #: 1000 still recycles ~13x/light-iteration and ~48x in the final full pass
-    #: — enough to bound RSS from heavy loci — while making the respawn cost
-    #: negligible against the tiny light-pass work.
+    #: Loci a worker handles before it is replaced (``0``: never).  Recycling
+    #: bounds the memory growth from the occasional huge locus; a respawn
+    #: costs ~2 CPU-seconds (see ``docs/tuning.md``).
     worker_max_tasks: int = 1000
 
     # ------------------------------------------------------------------ #
     # Transcript pre-filtering                                             #
     # ------------------------------------------------------------------ #
+    #: A transcript is kept only if it explains at least this many reads per
+    #: run (``min_explained_reads_per_run * len(runs)`` in total).
     min_explained_reads_per_run: int = 5
 
     # ------------------------------------------------------------------ #
     # Coverage filter                                                      #
     # ------------------------------------------------------------------ #
+    #: Remove ORF candidates with too few well-fitting reads per nucleotide.
     coverage_filter: bool = True
+    #: Its threshold on well-fitting reads per nucleotide, taken as the
+    #: maximum over the runs.
     min_well_fitting_reads_per_length: float = 0.01
 
     # ------------------------------------------------------------------ #
     # Deconvolution filter                                                 #
     # ------------------------------------------------------------------ #
+    #: Before the main deconvolution, remove ORF candidates whose activity
+    #: within their stop-codon group is negligible.
     deconvolution_filter: bool = True
+    #: The activity below which that filter drops a candidate; also what
+    #: counts as "active" in the IRLS-Huber stopping rule.
     deconvolution_filter_min_activity: float = 0.01
 
     # ------------------------------------------------------------------ #
     # Main optimisation                                                    #
     # ------------------------------------------------------------------ #
+    #: Convergence of the main optimisation: stop once no active activity
+    #: changed by more than this relative amount.
     stop_factor_relative: float = 0.01
+    #: ``ftol`` / ``gtol`` / ``maxls`` of ``scipy.optimize.minimize`` on the
+    #: legacy L-BFGS-B path (``inner_solver="lbfgs"``); zero tolerances leave
+    #: ``stop_factor_relative`` in charge.  Ignored by the multiplicative
+    #: updates.
     ftol: float = 0
     gtol: float = 0
     maxls: int = 200
-    #: Group-LASSO penalty λ. Recalibrated from 100 -> 10 after the switch to
-    #: ``inner_solver="mu"``: the tighter solver applies the penalty cleanly, and
-    #: an AIC/BIC scan (playground/lambda_aic) shows λ=100 over-penalises
-    #: (ΔAIC≈5e3 on tiny chr22; BIC-optimal λ=10, AIC-optimal λ=3). λ=10 is the
-    #: conservative (BIC) choice; confirm on a production-scale dataset.
+    #: Group-LASSO penalty λ, calibrated for ``inner_solver="mu"`` by an
+    #: AIC/BIC scan (``docs/tuning.md``).
     lam: float = 10
 
     # ------------------------------------------------------------------ #
     # RGR activity thresholds                                              #
     # ------------------------------------------------------------------ #
+    #: An RGR must reach this activity in at least one run to be retained.
     rgr_min_activity: float = 0.01
+    #: An ORF must reach this fraction of its locus's canonical ORF activity
+    #: to be retained.
     min_activity_fraction: float = 0.1
 
     # ------------------------------------------------------------------ #
     # IRLS-Huber                                                           #
     # ------------------------------------------------------------------ #
-    irls_huber_c: float = (
-        3.0  # low values -> more robust | high values -> more like MLE
-    )
+    #: Huber constant of the robust reweighting: low is more robust, high
+    #: approaches the plain maximum-likelihood fit.
+    irls_huber_c: float = 3.0
+    #: Cap on the IRLS-Huber outer iterations.
     irls_huber_max_outer: int = 10
+    #: Stop the outer loop once the relative L2 change of the weights falls
+    #: below this.
     irls_huber_tol: float = 1e-4
-    #: Experimental alternative stopping rule for the IRLS-Huber outer loop.
-    #: The default ``irls_huber_tol`` measures the L2 change of the whole
-    #: weight vector, which shrinks only geometrically (group-LASSO drags many
-    #: coordinates slowly toward ``pseudo_min``) and so rarely fires before
-    #: ``irls_huber_max_outer`` on read-dense loci. When ``True`` the loop
-    #: instead stops once the set of ORFs above
-    #: ``deconvolution_filter_min_activity`` (i.e. the ones that survive
-    #: filtering) is unchanged for ``irls_active_patience`` consecutive outer
-    #: iterations — the reported call set converges far earlier than the raw
-    #: parameter norm.
+    #: Also stop once the set of RGRs above
+    #: ``deconvolution_filter_min_activity`` has not changed for
+    #: ``irls_active_patience`` outer iterations: the call set converges long
+    #: before the weight norm does (``docs/tuning.md``).
     irls_stop_on_active_set: bool = True
     irls_active_patience: int = 3
 
     # ------------------------------------------------------------------ #
     # Count distribution for the deconvolution likelihood                  #
     # ------------------------------------------------------------------ #
-    #: Count model assumed for the read counts in every deconvolution solve.
-    #: ``"poisson"`` (default) is the classic PRICE2 model (variance = mean).
-    #: ``"nb"`` uses a negative-binomial likelihood (variance = μ + μ²/θ) to
-    #: absorb the overdispersion typical of Ribo-seq counts; ``θ`` is the fixed
-    #: global dispersion set by ``nb_dispersion``. As ``θ → ∞`` the NB model
-    #: collapses back to the Poisson, so ``"nb"`` with a large ``nb_dispersion``
-    #: reproduces the Poisson results. The choice threads through every solve
-    #: site (deconvolution filter, group-LASSO IRLS-Huber deconvolution, the
-    #: weighted likelihood-ratio filter and final activity estimation) and both
-    #: the CPU and GPU multiplicative-update paths.
+    #: Count model of every deconvolution solve: ``"poisson"`` (variance =
+    #: mean) or ``"nb"``, a negative binomial with variance ``μ + μ²/θ`` for
+    #: overdispersed counts; ``θ → ∞`` recovers the Poisson.
     distribution: str = "poisson"
-    #: Negative-binomial dispersion ``θ`` (a.k.a. the "size"/``r`` parameter),
-    #: used only when ``distribution == "nb"``. Smaller values mean stronger
-    #: overdispersion; larger values approach the Poisson limit. Ignored for the
-    #: Poisson model.
+    #: Negative-binomial dispersion ``θ`` (the "size"); smaller means more
+    #: overdispersion.  Ignored for ``"poisson"``.
     nb_dispersion: float = 10.0
 
     # ------------------------------------------------------------------ #
-    # Inner solver for the group-LASSO Poisson deconvolution              #
+    # Inner solver for the group-LASSO deconvolution                       #
     # ------------------------------------------------------------------ #
-    #: ``"mu"`` (default) uses multiplicative (weighted Richardson-Lucy +
-    #: group-LASSO) updates at every solve site; they converge to the true
-    #: optimum that scipy L-BFGS-B stalls short of. ``"lbfgs"`` selects the legacy
-    #: L-BFGS-B path. Two consequences of the default:
-    #:  (1) it CHANGES the call set vs the legacy loose L-BFGS-B — the converged
-    #:      solve is sparser (~19% fewer ORFs on Yewdell). ``lam`` was
-    #:      recalibrated for it (100 -> 10) via an AIC/BIC scan; see
-    #:      playground/lambda_aic.
-    #:  (2) on CPU it is slower than L-BFGS-B (tight convergence costs iterations).
-    #: See playground/deconvolution_performance.
+    #: ``"mu"``: multiplicative (weighted Richardson-Lucy + group-LASSO)
+    #: updates at every solve site, converging to the optimum that L-BFGS-B
+    #: stalls short of and hence to a sparser call set; ``"lbfgs"``: the
+    #: legacy scipy L-BFGS-B path.  See ``docs/tuning.md``.
     inner_solver: str = "mu"
-    #
-    # GPU offload of the multiplicative updates (``mu_gpu`` / ``mu_broker``)
-    # -------------------------------------------------------------------
-    # BOTH ARE OFF BY DEFAULT: in the tests run so far the GPU did not speed the
-    # pipeline up meaningfully. The individual deconvolution solves are small
-    # (sparse mat-vecs over a few 10k rows), so kernel-launch and host<->device
-    # transfer overhead eats most of the per-solve gain, and the CPU worker pool
-    # already parallelises across loci — the end-to-end wall time barely moves,
-    # while the GPU paths add CUDA contexts, VRAM pressure and (for the broker)
-    # a shared-memory IPC layer. Turn them on only if you have re-measured on
-    # your own data and see a real win.
-    #
-    # Requirements when you DO enable them: an NVIDIA GPU + driver and PyTorch
-    # built against CUDA (developed/tested with torch 2.5.1+cu121). torch is NOT
-    # a declared dependency — it is absent from pyproject.toml and price2.yml,
-    # so install it separately, e.g.
-    #     pip install torch --index-url https://download.pytorch.org/whl/cu121
-    # Both paths degrade gracefully: if torch or CUDA is unavailable the solves
-    # silently fall back to the NumPy CPU multiplicative updates.
-    #
-    #: Use the GPU (PyTorch + CUDA) multiplicative-update path when available
-    #: and the system is at least ``mu_gpu_min_rows`` rows; else run on CPU.
-    #: Gives each worker process its own CUDA context (VRAM scales with
-    #: ``processes``); see ``mu_broker`` for the shared-context variant.
+
+    # GPU offload of the multiplicative updates.  Off by default: the solves
+    # are too small for the GPU to pay off end to end (``docs/tuning.md``).
+    # Both paths need PyTorch built against CUDA, which is not a declared
+    # dependency, and fall back to the CPU updates when it is missing.
+    #: Run the multiplicative updates on the GPU when available and the
+    #: system has at least ``mu_gpu_min_rows`` rows; every worker gets its
+    #: own CUDA context, so VRAM scales with ``processes``.
     mu_gpu: bool = False
-    #: Only offload to the GPU above this row count (transfer overhead makes
-    #: small systems faster on the CPU).
+    #: Below this row count the CPU is faster than the transfer.
     mu_gpu_min_rows: int = 50_000
-    #: GPU dtype for the multiplicative updates (``"float32"`` or ``"float64"``).
+    #: GPU dtype of the updates, ``"float32"`` or ``"float64"``.
     mu_dtype: str = "float32"
-    #: Multiplicative-update inner-loop cap and relative-change tolerance.
+    #: Iteration cap and relative-change tolerance of the multiplicative
+    #: inner loop (CPU and GPU).
     mu_inner_max_iter: int = 3000
     mu_inner_tol: float = 1e-5
-    #: Route GPU deconvolution through a single-context broker process instead of
-    #: giving each worker its own CUDA context. Requires ``inner_solver="mu"``.
-    #: One broker holds one context and serves the whole worker pool over shared
-    #: memory, so device VRAM does not scale with ``processes`` (see
-    #: playground/deconvolution_performance/gpu_broker). Falls back to the
-    #: configured per-worker path (CPU MU, or per-worker GPU when ``mu_gpu``)
-    #: if the broker cannot start (no PyTorch/CUDA).
-    #: OFF by default — see the GPU-offload note above ``mu_gpu``: no meaningful
-    #: end-to-end speedup in the small tests, and it needs a CUDA PyTorch.
+    #: Serve the GPU updates from broker processes holding one CUDA context
+    #: each, shared by the worker pool over shared memory, so VRAM does not
+    #: scale with ``processes``.  Requires ``inner_solver="mu"``; falls back
+    #: to the per-worker path when the broker cannot start.
     mu_broker: bool = False
-    #: Number of broker PROCESSES (independent CUDA contexts / GILs). A single
-    #: process is GIL-bound and cannot saturate the GPU or feed a large worker
-    #: pool; a few processes fix that while keeping the context count bounded.
+    #: Broker processes (independent CUDA contexts and GILs).
     mu_broker_procs: int = 4
-    #: CUDA stream-threads per broker process (intra-process overlap; limited by
-    #: that process's GIL, so scale mu_broker_procs first).
+    #: CUDA stream threads per broker process; GIL-bound, so scale
+    #: ``mu_broker_procs`` first.
     mu_broker_streams: int = 2
-    #: Runtime only: the request queue of a running GPU broker, set on the copy
-    #: of the configuration handed to the worker processes (see
-    #: ``ORFActivityEstimator``).  Never read from a configuration file.
+    #: Runtime only: the request queue of a running broker, set on the copy
+    #: of the configuration handed to the workers.  Never read from a file.
     mu_broker_req_q: object = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #
     # ------------------------------------------------------------------ #
+    #: Apply a likelihood-ratio test as the final filtering step.
     likelihood_ratio_filter: bool = True
+    #: Significance level of that test.
     likelihood_ratio_alpha: float = 1e-10
+
+    # ------------------------------------------------------------------ #
+    # Run selection & logging                                              #
+    # ------------------------------------------------------------------ #
+    #: Exclude the Ribo-seq runs that fail the model quality gate: an
+    #: implausible cleavage or coverage model, or too few counted alignments
+    #: (see ``ribo_seq_run._assemble_run``).
     high_quality_runs_only: bool = False
+    #: Level of the ``price2`` logger (``"DEBUG"``, ``"INFO"``, ...).
     log_level: str = "INFO"
 
     # ------------------------------------------------------------------ #
     # ORF candidate generation                                             #
     # ------------------------------------------------------------------ #
+    #: Codons accepted as translation starts and stops when generating the
+    #: ORF candidates.
     start_codons: tuple[str, ...] = ("ATG", "CTG", "GTG", "TTG")
     stop_codons: tuple[str, ...] = ("TAA", "TAG", "TGA")
 
     # ------------------------------------------------------------------ #
     # Multimapping EM                                                       #
     # ------------------------------------------------------------------ #
-    # When ``True`` (default) the deconvolution runs inside an EM outer loop
-    # that fractionally re-assigns each multimapping read across the loci it
-    # maps to (E-step), with the existing per-locus optimisation as the
-    # M-step.  When ``False`` multimapping alignments (``NH`` > 1) are
-    # discarded outright -- at collection, and again when reads are loaded, so
-    # that a price.db collected with the EM enabled behaves the same way.
-    # (Classic PRICE2 instead counted every such read at full weight in every
-    # locus it overlaps, which multi-counts it.)  Note: enabling this makes
-    # read collection record per-alignment multimap linkage (extra time/disk)
-    # and adds the EM outer iterations below.
+    #: Run the deconvolution inside an EM outer loop that fractionally
+    #: re-assigns each multimapping read across the loci it maps to
+    #: (E-step), with the per-locus optimisation as the M-step; collection
+    #: then also records the per-alignment linkage.  When ``False``,
+    #: alignments with ``NH > 1`` are discarded, at collection and again
+    #: when reads are loaded, so a database collected with the EM behaves
+    #: the same.  (Classic PRICE2 counted such reads at full weight in every
+    #: locus they overlap.)
     multimap_em: bool = True
-    #: Safety cap on EM outer iterations (light M-step + global E-step). The
-    #: EM converges only *linearly* (the L1 read-mass reassigned per E-step
-    #: shrinks by a roughly constant factor ~0.8 each iteration), so reaching
-    #: ``em_tol`` takes ~18-20 iterations on tested data. The loop is meant to
-    #: stop on ``em_tol``; this cap is a backstop, not the normal exit — set it
-    #: high enough that the tolerance governs. (A cap of 10 truncated the loop
-    #: at ~5x em_tol, i.e. before it converged; see
-    #: playground/em_stopping_criterion.)
+    #: Backstop cap on the EM outer iterations; ``em_tol`` is meant to end
+    #: the loop, which converges linearly in ~18-20 iterations on tested
+    #: data (``docs/tuning.md``).
     em_max_iter: int = 30
-    #: Convergence tolerance on the L1 fraction of read mass reassigned between
-    #: successive E-steps; the loop stops once below this. This — not
-    #: ``em_max_iter`` — should be what ends the loop in a normal run.
+    #: The loop stops once the L1 fraction of read mass reassigned between
+    #: successive E-steps falls below this.
     em_tol: float = 1e-3
-    #: Number of interleaved IRLS-Huber reweight steps per light M-step.
-    #: One keeps Huber and EM in a single shared loop (as intended); the
-    #: robust weights refine together with the fractional assignments.
+    #: IRLS-Huber reweight steps per light M-step; one keeps Huber and the
+    #: EM in a single shared loop.
     em_huber_steps: int = 1
-    #: Prune ORF candidates that the first EM light M-step finds inactive
-    #: (activity below ``rgr_min_activity`` in *every* run) so that all later
-    #: EM iterations and the final full pass work on the smaller design matrix.
-    #: A runtime heuristic: such ORFs seldom revive in later M-steps. When it
-    #: fires the locus's read routing is rebuilt before the prepared state is
-    #: persisted. This CHANGES the call
-    #: set slightly versus carrying every candidate through the EM (a pruned
-    #: ORF cannot come back), so it is kept separable for A/B testing.
+    #: Drop the ORF candidates the first light M-step finds inactive (below
+    #: ``rgr_min_activity`` in every run) from all later EM iterations.  A
+    #: pruned ORF cannot come back, which changes the call set slightly;
+    #: kept switchable for A/B tests.
     em_prune_after_first_mstep: bool = True
 
     # ------------------------------------------------------------------ #
-    # Export options                                                        #
+    # Resuming                                                             #
     # ------------------------------------------------------------------ #
+    #: Continue an interrupted run: reuse ``w_dir`` and its database and let
+    #: every stage pick up where it stopped (collection run by run and locus
+    #: by locus, the EM at its last checkpoint, the final deconvolution at
+    #: the loci not in ``processed_loci.txt``).  A stage whose options
+    #: changed starts over; a changed option that decides the database's
+    #: content stops the run instead (:mod:`price2.run_state`).  ``False``
+    #: wipes both directories first.
     warm_start: bool = True
 
     # ------------------------------------------------------------------ #
     # Export options                                                        #
     # ------------------------------------------------------------------ #
+    #: Write ``dataset_models/`` with the cleavage and coverage model tables
+    #: and plots.
     export_dataset_models: bool = True
+    #: Write ``performance_measurements.tsv`` with per-locus timing and
+    #: filtering statistics.
     export_performance_measurements: bool = False
+    #: Write the tables after every filtering step, not only the final one.
     export_all_steps: bool = False
+    #: Output formats.
     export_tsv: bool = True
     export_gtf: bool = False
     export_bed: bool = True
+    #: Table contents: the ORFs; all regions (ORFs and NOISE, as
+    #: ``*_regions`` files beside ``*_orfs``); and, in the GTF, the locus
+    #: intervals and the transcript/NOISE entries.
     export_orfs: bool = True
     export_regions: bool = False
     export_loci: bool = False

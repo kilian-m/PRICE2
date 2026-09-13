@@ -69,8 +69,7 @@ The required parameters are:
         base_dir/
         ├── o_dir/      # output
         ├── w_dir/      # working / SQLite database
-        ├── bam_dir/    # mapped Ribo-seq BAM files
-        └── logs/       # log files
+        └── bam_dir/    # mapped Ribo-seq BAM files
 - `gtf_path`: path to the reference annotation in GTF format
 - `fasta_path`: path to the reference genome in FASTA format
 
@@ -80,6 +79,8 @@ other frequently used parameters are:
 - `processes`: the number of worker processes used for parallelization (default `80`). This is a fixed default, not the machine's core count, so set it explicitly to match the host you are running on.
 - `timeout`: the wall-clock budget for one locus, in seconds **per Ribo-seq run** (default `180`). A locus is abandoned after `timeout` × (number of runs) seconds — 900 s for five datasets — and listed in `o_dir/regions_activities/failed_loci.txt`. It scales with the sample count because a locus is solved for all datasets at once.
 - `warm_start`: continue an interrupted run instead of starting over (default `true`, see [Resuming an interrupted run](#resuming-an-interrupted-run)). Set it to `false` to force a clean run, which wipes `w_dir` and `o_dir` first.
+
+Every option is documented at its field in `price2/config.py`; the measurements behind the tuned defaults are in [`docs/tuning.md`](docs/tuning.md).
 
 ### Resuming an interrupted run
 A run that is cut short — by a wall-clock limit, a node failure or a `Ctrl-C` — is picked up where it stopped when you simply start it again with the same config. That is what `warm_start` does, and it is on by default. Each stage resumes at its own granularity:
