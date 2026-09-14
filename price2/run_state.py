@@ -25,7 +25,16 @@ the configuration:
     deconvolution: its outputs, its per-locus progress and the EM
     checkpoint are dropped and it starts over.
 
-Path options are fingerprinted by their *basename*, so relocating an
+Which options belong to which fingerprint is declared on the options
+themselves: every :class:`~price2.config.Config` field carries a *scope*
+(:func:`price2.config.option`) — ``COLLECTION`` for the options above,
+``RUNTIME`` for those that only say *where* things are or *how fast* to go
+and so cannot change a result, and ``DECONVOLUTION``, the default, for
+everything else.  A new option is therefore fingerprinted unless it is
+declared not to matter; forgetting the declaration costs a restart of the
+deconvolution, never a stale result.
+
+Input path options are fingerprinted by their *basename*, so relocating an
 analysis directory (staging it on a compute node's local disk, say) does not
 invalidate anything, while pointing the run at a different annotation does.
 """
@@ -39,47 +48,25 @@ import os
 import re
 
 from price2 import database
-from price2.config import Config
+from price2.config import COLLECTION, RUNTIME, Config, is_path_option, option_scope
 
 logger = logging.getLogger(__name__)
 
-#: Options that only say *where* things are or *how fast* to go.  They cannot
-#: change a result, so they are excluded from both fingerprints.
-_IGNORED_FIELDS: frozenset[str] = frozenset(
-    {
-        "base_dir",
-        "o_dir",
-        "w_dir",
-        "log_level",
-        "processes",
-        "timeout",
-        "worker_max_tasks",
-        "warm_start",
-        "mu_gpu",
-        "mu_gpu_min_rows",
-        "mu_broker",
-        "mu_broker_procs",
-        "mu_broker_streams",
-        "mu_broker_req_q",
-    }
+#: Options that decide the content of ``price.db``, in declaration order.
+_COLLECTION_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(Config) if option_scope(f) == COLLECTION
 )
 
-#: Options that decide the content of ``price.db``.  Everything the data
-#: collection reads: the inputs themselves, the read-end mode, the run
-#: quality gate, and ``multimap_em`` (which decides whether multimapping
-#: reads are stored at all and whether the linkage index is built).
-_COLLECTION_FIELDS: tuple[str, ...] = (
-    "gtf_path",
-    "fasta_path",
-    "bam_dir",
-    "bam_ids",
-    "align_ends_type",
-    "high_quality_runs_only",
-    "multimap_em",
+#: Options that can change a result: the collection options and everything
+#: that is not runtime-only.
+_RESULT_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(Config) if option_scope(f) != RUNTIME
 )
 
 #: Options fingerprinted by basename rather than by full path.
-_PATH_FIELDS: frozenset[str] = frozenset({"gtf_path", "fasta_path", "bam_dir"})
+_PATH_FIELDS: frozenset[str] = frozenset(
+    f.name for f in fields(Config) if is_path_option(f)
+)
 
 _TABLE = database.STATE_TABLE
 
@@ -187,9 +174,7 @@ def deconvolution_fingerprint(config: Config) -> str:
         32-character hex digest.
     """
     items = [
-        (f.name, _normalise(f.name, getattr(config, f.name)))
-        for f in fields(config)
-        if f.name not in _IGNORED_FIELDS
+        (name, _normalise(name, getattr(config, name))) for name in _RESULT_FIELDS
     ]
     items.append(("price2_version", _price2_version()))
     items.append(("prepared_loci_format", database.PREPARED_LOCI_FORMAT))

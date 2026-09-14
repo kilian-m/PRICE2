@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, Field, dataclass, field
 import json
 import logging
 
@@ -13,6 +13,52 @@ logger = logging.getLogger(__name__)
 _OBSOLETE_FIELDS: frozenset[str] = frozenset(
     {"l_file", "memory_limit_gb", "save_memory", "multimap_background"}
 )
+
+# The scope of an option says what a change of it invalidates when a run is
+# resumed (:mod:`price2.run_state` fingerprints the options by scope).  It is
+# recorded on the field, next to the option, with :func:`option`.
+#: The option decides the content of ``price.db``.
+COLLECTION = "collection"
+#: The option changes a result but not the database (the default scope).
+DECONVOLUTION = "deconvolution"
+#: The option only says where things are or how fast to go.
+RUNTIME = "runtime"
+
+
+def option(
+    default: object = MISSING,
+    *,
+    scope: str = DECONVOLUTION,
+    path: bool = False,
+    **kwargs: object,
+) -> object:
+    """Declare a configuration field with its scope.
+
+    Parameters
+    ----------
+    default : object
+        The default value; omitted for a required option.
+    scope : str
+        One of :data:`COLLECTION`, :data:`DECONVOLUTION`, :data:`RUNTIME`.
+    path : bool
+        The value is a path to an input, to be fingerprinted by its
+        basename so that a relocated analysis stays resumable.
+    **kwargs : object
+        Passed on to :func:`dataclasses.field`.
+    """
+    if scope not in (COLLECTION, DECONVOLUTION, RUNTIME):
+        raise ValueError(f"unknown option scope {scope!r}")
+    return field(default=default, metadata={"scope": scope, "path": path}, **kwargs)
+
+
+def option_scope(f: Field) -> str:
+    """The scope of a :class:`Config` field (:data:`DECONVOLUTION` unless declared)."""
+    return f.metadata.get("scope", DECONVOLUTION)
+
+
+def is_path_option(f: Field) -> bool:
+    """Whether a :class:`Config` field is an input path (see :func:`option`)."""
+    return bool(f.metadata.get("path", False))
 
 
 @dataclass
@@ -29,8 +75,9 @@ class Config:
         ├── w_dir/      # working directory, holds price.db
         └── bam_dir/    # mapped Ribo-seq BAM files
 
-    Which options decide the content of ``price.db`` and which only affect
-    the deconvolution is recorded in :mod:`price2.run_state`.
+    Every option carries a scope (:func:`option`) that says what a change of
+    it invalidates in a resumed run: the collected database, only the
+    deconvolution (the default), or nothing (:mod:`price2.run_state`).
     """
 
     # ------------------------------------------------------------------ #
@@ -38,24 +85,24 @@ class Config:
     # ------------------------------------------------------------------ #
     #: Root directory of the run; the empty path options below default to
     #: its subdirectories.
-    base_dir: str
+    base_dir: str = option(scope=RUNTIME)
 
     # ------------------------------------------------------------------ #
     # Paths (derived from base_dir when left empty)                       #
     # ------------------------------------------------------------------ #
     #: Output directory (``<base_dir>/o_dir``).
-    o_dir: str = ""
+    o_dir: str = option("", scope=RUNTIME)
     #: Working directory holding ``price.db`` (``<base_dir>/w_dir``).
-    w_dir: str = ""
+    w_dir: str = option("", scope=RUNTIME)
     #: Reference annotation, GTF.
-    gtf_path: str = ""
+    gtf_path: str = option("", scope=COLLECTION, path=True)
     #: Reference genome, FASTA.
-    fasta_path: str = ""
+    fasta_path: str = option("", scope=COLLECTION, path=True)
     #: Directory of the coordinate-sorted, indexed BAM files
     #: (``<base_dir>/bam_dir``).
-    bam_dir: str = ""
+    bam_dir: str = option("", scope=COLLECTION, path=True)
     #: The ``{bam_id}.bam`` files of ``bam_dir`` to use; ``None`` uses all.
-    bam_ids: list[str] | None = None
+    bam_ids: list[str] | None = option(None, scope=COLLECTION)
 
     # ------------------------------------------------------------------ #
     # Read mapping                                                          #
@@ -68,24 +115,24 @@ class Config:
     #: Local geometry.  The two are close but not bit-identical, as the
     #: ~1-2 % of such reads whose extra mismatch trips STAR's
     #: ``outFilterMismatchNmax`` never reach PRICE2 under EndToEnd.
-    align_ends_type: str = "local"
+    align_ends_type: str = option("local", scope=COLLECTION)
 
     # ------------------------------------------------------------------ #
     # Parallelism & runtime                                                #
     # ------------------------------------------------------------------ #
     #: Worker processes.  A fixed default, not the host's core count.
-    processes: int = 80
+    processes: int = option(80, scope=RUNTIME)
     #: Per-locus wall-clock budget in seconds *per Ribo-seq run*: a locus is
     #: abandoned after ``timeout * len(runs)`` seconds, since one locus is
     #: solved for all runs at once.
-    timeout: int = 180
+    timeout: int = option(180, scope=RUNTIME)
     #: Floor on the activities during optimisation, guarding ``log(0)`` in
     #: the likelihood.  Do not lower it.
     pseudo_min: float = 1e-14
     #: Loci a worker handles before it is replaced (``0``: never).  Recycling
     #: bounds the memory growth from the occasional huge locus; a respawn
     #: costs ~2 CPU-seconds (see ``docs/tuning.md``).
-    worker_max_tasks: int = 1000
+    worker_max_tasks: int = option(1000, scope=RUNTIME)
 
     # ------------------------------------------------------------------ #
     # Transcript pre-filtering                                             #
@@ -184,9 +231,9 @@ class Config:
     #: Run the multiplicative updates on the GPU when available and the
     #: system has at least ``mu_gpu_min_rows`` rows; every worker gets its
     #: own CUDA context, so VRAM scales with ``processes``.
-    mu_gpu: bool = False
+    mu_gpu: bool = option(False, scope=RUNTIME)
     #: Below this row count the CPU is faster than the transfer.
-    mu_gpu_min_rows: int = 50_000
+    mu_gpu_min_rows: int = option(50_000, scope=RUNTIME)
     #: GPU dtype of the updates, ``"float32"`` or ``"float64"``.
     mu_dtype: str = "float32"
     #: Iteration cap and relative-change tolerance of the multiplicative
@@ -197,15 +244,15 @@ class Config:
     #: each, shared by the worker pool over shared memory, so VRAM does not
     #: scale with ``processes``.  Requires ``inner_solver="mu"``; falls back
     #: to the per-worker path when the broker cannot start.
-    mu_broker: bool = False
+    mu_broker: bool = option(False, scope=RUNTIME)
     #: Broker processes (independent CUDA contexts and GILs).
-    mu_broker_procs: int = 4
+    mu_broker_procs: int = option(4, scope=RUNTIME)
     #: CUDA stream threads per broker process; GIL-bound, so scale
     #: ``mu_broker_procs`` first.
-    mu_broker_streams: int = 2
+    mu_broker_streams: int = option(2, scope=RUNTIME)
     #: Runtime only: the request queue of a running broker, set on the copy
     #: of the configuration handed to the workers.  Never read from a file.
-    mu_broker_req_q: object = field(default=None, repr=False, compare=False)
+    mu_broker_req_q: object = option(None, scope=RUNTIME, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #
@@ -221,9 +268,9 @@ class Config:
     #: Exclude the Ribo-seq runs that fail the model quality gate: an
     #: implausible cleavage or coverage model, or too few counted alignments
     #: (see ``ribo_seq_run._assemble_run``).
-    high_quality_runs_only: bool = False
+    high_quality_runs_only: bool = option(False, scope=COLLECTION)
     #: Level of the ``price2`` logger (``"DEBUG"``, ``"INFO"``, ...).
-    log_level: str = "INFO"
+    log_level: str = option("INFO", scope=RUNTIME)
 
     # ------------------------------------------------------------------ #
     # ORF candidate generation                                             #
@@ -244,7 +291,7 @@ class Config:
     #: when reads are loaded, so a database collected with the EM behaves
     #: the same.  (Classic PRICE2 counted such reads at full weight in every
     #: locus they overlap.)
-    multimap_em: bool = True
+    multimap_em: bool = option(True, scope=COLLECTION)
     #: Backstop cap on the EM outer iterations; ``em_tol`` is meant to end
     #: the loop, which converges linearly in ~18-20 iterations on tested
     #: data (``docs/tuning.md``).
@@ -271,7 +318,7 @@ class Config:
     #: changed starts over; a changed option that decides the database's
     #: content stops the run instead (:mod:`price2.run_state`).  ``False``
     #: wipes both directories first.
-    warm_start: bool = True
+    warm_start: bool = option(True, scope=RUNTIME)
 
     # ------------------------------------------------------------------ #
     # Export options                                                        #
