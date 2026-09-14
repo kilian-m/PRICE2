@@ -139,7 +139,6 @@ class Locus:
         # its rendering, the IRLS-Huber iteration count for the perf log.
         self.result: np.ndarray | None = None
         self.result_df: pd.DataFrame | None = None
-        self.irls_huber_weights: np.ndarray | None = None
         self.irls_outer_iterations: int = 0
 
     @classmethod
@@ -701,13 +700,6 @@ class Locus:
         result_matrix = fit.w.reshape(num_rgrs, num_runs)
         result_matrix[result_matrix <= config.pseudo_min] = 0
         self.result = result_matrix
-
-        # Huber weights at the clamped solution, for the weighted LRT.
-        theta = distribution_theta(config)
-        delta = np.asarray(X @ result_matrix.ravel()).ravel()
-        self.irls_huber_weights = huber_weights(
-            y, delta, config.irls_huber_c, theta
-        )
 
         # ── Post-optimisation RGR removal (same as deconvolve) ───────────
         if prune:
