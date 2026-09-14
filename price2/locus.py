@@ -18,8 +18,6 @@ import time
 
 import HTSeq
 import numpy as np
-
-logger = logging.getLogger(__name__)
 import pandas as pd
 from scipy.sparse import csr_matrix
 
@@ -37,6 +35,8 @@ from price2.likelihood import (
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 
+logger = logging.getLogger(__name__)
+
 # Re-exported for callers (and tests) that import the objectives from here.
 _huber_weights = huber_weights
 _distribution_theta = distribution_theta
@@ -48,11 +48,11 @@ class Locus:
     """A genomic locus containing overlapping transcripts and ORF candidates.
 
     A locus aggregates one or more transcripts whose exons overlap on the
-    same strand into a single unit of analysis.  It generates candidate
-    :class:`ReadGeneratingRegion` objects (ORFs and noise regions),
-    constructs equivalence groups from mapped Ribo-seq reads, and runs
-    group-LASSO penalised Poisson-likelihood optimisation to identify
-    actively translated ORFs.
+    same strand into a single unit of analysis.  The collector builds it as
+    a skeleton (the attributes below); a deconvolution worker then fills in
+    the ORF candidates, the reads, their routing to the design-matrix rows
+    and the activities — every one of those attributes is declared, with
+    what fills it, in :meth:`_init_state`.
 
     Attributes
     ----------
@@ -65,33 +65,15 @@ class Locus:
     transcript_intervals : HTSeq.GenomicArrayOfSets
         Stranded genomic array mapping positions to overlapping
         transcripts.
-    rgrs : list[ReadGeneratingRegion]
-        The current ORF and noise RGR candidates, in ``rgr.index`` order:
-        an RGR's position in this list is its index, which addresses its
-        design-matrix column block and its row of :attr:`result`.
-    routing : read_routing.ReadRouting | None
-        The reads routed to the rows of the design matrix, once
-        :meth:`assign_reads_to_egs` has run; the sole representation of the
-        equivalence groups from then on.
-    eg_read_counts : np.ndarray | None
-        The response ``y`` under the current read weights, one entry per
-        row of :attr:`routing`.
     exon_length : int
         Total exonic length (bp) covered by the locus.
-    result : np.ndarray | None
-        Activity matrix of shape ``(n_rgrs, n_runs)`` after
-        deconvolution, or ``None`` before estimation.
     """
 
     iv: HTSeq.GenomicInterval
     id: str
     transcripts: set[Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
-    rgrs: list[ReadGeneratingRegion]
-    routing: read_routing.ReadRouting | None
-    eg_read_counts: np.ndarray | None
     exon_length: int
-    result: np.ndarray | None
 
     def __init__(
         self,
@@ -132,8 +114,11 @@ class Locus:
 
     def _init_state(self) -> None:
         """Reset everything a worker fills in after the skeleton is built."""
-        # ORF candidates (``make_rgrs`` / ``build_rgrs``).
-        self.rgrs: list[ReadGeneratingRegion] = []
+        # ORF candidates (``make_rgrs`` / ``build_rgrs``): the current ORF
+        # and noise RGRs in ``rgr.index`` order — an RGR's position here is
+        # its index, which addresses its design-matrix column block and its
+        # row of ``result``; ``None`` on a light locus (``Locus.light``).
+        self.rgrs: list[ReadGeneratingRegion] | None = []
         self.gene_ids_complete: set[str] = set()
         self.transcripts_number: int = 0
         # Reads (``get_reads_from_db``) and their counts per RGR
@@ -143,12 +128,15 @@ class Locus:
         self.wfr_df: pd.DataFrame | None = None
         # Equivalence groups: the geometry from ``make_equivalence_groups``
         # (``{run: {key: length}}``, consumed by ``assign_reads_to_egs``), then
-        # the routing of the reads to the design-matrix rows and the response.
+        # the routing of the reads to the design-matrix rows — the sole
+        # representation of the equivalence groups from then on — and the
+        # response ``y`` under the current read weights, one entry per row.
         self.egs: dict[RiboSeqRun, dict] | None = None
         self.routing: read_routing.ReadRouting | None = None
         self.eg_read_counts: np.ndarray | None = None
         self.counted_reads: dict[str, float] = {}
-        # Deconvolution results.
+        # Deconvolution results: the activity matrix ``(n_rgrs, n_runs)`` and
+        # its rendering, the IRLS-Huber iteration count for the perf log.
         self.result: np.ndarray | None = None
         self.result_df: pd.DataFrame | None = None
         self.irls_huber_weights: np.ndarray | None = None
