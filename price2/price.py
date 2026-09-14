@@ -94,7 +94,7 @@ def setup_directories(config: Config) -> run_state.ResumePlan:
     directory is picked up where the previous invocation stopped: the data
     collection resumes run by run and locus by locus, the multimapping EM
     resumes at its last checkpointed iteration, and the final
-    deconvolution resumes at the loci not yet in ``processed_loci.txt``.
+    deconvolution resumes at the loci not yet recorded as finished.
     What may be reused is decided by :func:`price2.run_state.plan_resume`
     from the configuration fingerprints stored in the database; a stage
     whose options changed starts over.
@@ -134,13 +134,11 @@ def setup_directories(config: Config) -> run_state.ResumePlan:
             reason="cold start",
         )
 
+    run_state.migrate_legacy_progress(db_path, config.w_dir)
     plan = run_state.plan_resume(config, db_path)
     os.makedirs(config.o_dir, exist_ok=True)
-    processed_loci_path = config.layout.processed_loci_path
 
-    if plan.reuse_deconvolution and not _outputs_resumable(
-        config, processed_loci_path
-    ):
+    if plan.reuse_deconvolution and not _outputs_resumable(config):
         plan = run_state.ResumePlan(
             skip_collection=plan.skip_collection,
             reuse_deconvolution=False,
@@ -151,22 +149,21 @@ def setup_directories(config: Config) -> run_state.ResumePlan:
         if os.path.exists(config.o_dir):
             shutil.rmtree(config.o_dir)
         os.makedirs(config.o_dir, exist_ok=True)
-        if os.path.exists(processed_loci_path):
-            os.remove(processed_loci_path)
+        run_state.clear_progress(
+            db_path, run_state.DECONVOLUTION_STAGE, run_state.EM_STAGE
+        )
 
     run_state.record_configuration(config, db_path)
     return plan
 
 
-def _outputs_resumable(config: Config, processed_loci_path: str) -> bool:
-    """Reconcile an existing output directory with the finished-locus list.
+def _outputs_resumable(config: Config) -> bool:
+    """Reconcile an existing output directory with the finished loci.
 
     Parameters
     ----------
     config : Config
         Fully populated configuration object.
-    processed_loci_path : str
-        Path to ``processed_loci.txt`` in the working directory.
 
     Returns
     -------
@@ -175,24 +172,27 @@ def _outputs_resumable(config: Config, processed_loci_path: str) -> bool:
         loci may be skipped; ``False`` when the deconvolution has to start
         over.
     """
+    db_path = config.layout.db_path
+    done = set(run_state.read_progress(db_path, run_state.DECONVOLUTION_STAGE))
     ra_dir = config.layout.regions_activities_dir
-    if os.path.exists(processed_loci_path) and not os.path.isdir(ra_dir):
+    if done and not os.path.isdir(ra_dir):
         # The results those loci produced are gone; skipping them now would
         # silently drop them from the output.
         logger.warning(
-            "%s lists finished loci but %s no longer exists; the "
+            "%s records %d finished loci but %s no longer exists; the "
             "deconvolution starts over.",
-            processed_loci_path,
+            db_path,
+            len(done),
             ra_dir,
         )
         return False
 
-    if not run_state.repair_outputs(config.o_dir, processed_loci_path):
+    if not run_state.repair_outputs(config.o_dir, done):
         logger.warning(
-            "the outputs in %s cannot be reconciled with %s; the "
-            "deconvolution starts over.",
+            "the outputs in %s cannot be reconciled with the finished loci "
+            "recorded in %s; the deconvolution starts over.",
             config.o_dir,
-            processed_loci_path,
+            db_path,
         )
         return False
 
@@ -238,7 +238,9 @@ def run_pipeline(config: Config) -> None:
 
     if not plan.skip_collection:
         run_stages(_collection_stages(config))
-        run_state.write_state(db_path, collection_complete="1")
+        run_state.write_progress(
+            db_path, run_state.COLLECTION_STAGE, [run_state.COMPLETE]
+        )
 
     run_stages(_deconvolution_stages(config, plan))
 

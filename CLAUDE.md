@@ -42,7 +42,7 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 
 **Numerical stability:** Use `pseudo_min = 1e-14` to guard against `log(0)` in the Poisson likelihood. Do not remove or reduce this.
 
-**Output files:** Workers never write to `o_dir`; they hand their rendered rows back and the parent process (`ORFActivityEstimator._record`) is the only writer of the output tables, `performance_measurements.tsv` and `processed_loci.txt`. Workers do write their own EM state to SQLite through `price2.database.connect` (WAL mode, busy timeout).
+**Output files:** Workers never write to `o_dir`; they hand their rendered rows back and the parent process (`ORFActivityEstimator._record`) is the only writer of the output tables, `performance_measurements.tsv` and the per-locus progress (the `progress` table of `price.db`, via `run_state.ProgressRecorder`). Workers do write their own EM state to SQLite through `price2.database.connect` (WAL mode, busy timeout).
 
 **Performance-sensitive code:** `locus.py` deconvolution uses `scipy.sparse` CSR matrices and BLAS-backed operations. Keep numerical code vectorized (numpy/scipy); avoid Python loops over reads or positions.
 

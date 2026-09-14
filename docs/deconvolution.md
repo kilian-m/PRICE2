@@ -53,8 +53,9 @@ M-step's inputs: `group_weights[k]` and the `locus_activities[k-1]` that warm-st
 A warm start reads that back through `multimap.em_resume_point` — `k` is the iteration
 to run next, and the loci that already wrote `locus_activities[k]` are the ones that
 M-step had finished — so an interrupted run re-enters at `k` with only the missing loci,
-rather than at iteration 0. `run_state`'s `em_final_iteration` records that the loop has
-ended, letting a run interrupted during the final pass skip straight back to it.
+rather than at iteration 0. The `progress` table's `multimap_em / final_iteration` row
+records that the loop has ended, letting a run interrupted during the final pass skip
+straight back to it.
 
 ---
 
@@ -94,7 +95,7 @@ flowchart TD
     LIGHT -->|"true — classic or final pass"| DF["<b>deconvolve</b> (see §3)<br/>full IRLS-Huber group-LASSO<br/>+ post-solve pruning"]
     DF --> LRT["<b>likelihood_ratio_filtering</b> (see §5)"]
     LRT --> EST["<b>estimate_activities</b><br/>unregularised Poisson MLE,<br/>iteratively drop ORFs below<br/>rgr_min_activity until stable"]
-    EST --> EXP["export TSV / GTF / BED<br/>+ processed_loci.txt bookkeeping"]
+    EST --> EXP["export TSV / GTF / BED<br/>+ the parent records the locus as finished"]
     EXP --> OUT(["return"])
 
     classDef filt fill:#f3f0ff,stroke:#7a5cc4

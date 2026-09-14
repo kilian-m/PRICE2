@@ -314,7 +314,7 @@ class Config:
     #: Continue an interrupted run: reuse ``w_dir`` and its database and let
     #: every stage pick up where it stopped (collection run by run and locus
     #: by locus, the EM at its last checkpoint, the final deconvolution at
-    #: the loci not in ``processed_loci.txt``).  A stage whose options
+    #: the loci not yet recorded as finished).  A stage whose options
     #: changed starts over; a changed option that decides the database's
     #: content stops the run instead (:mod:`price2.run_state`).  ``False``
     #: wipes both directories first.

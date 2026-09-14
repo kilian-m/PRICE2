@@ -204,12 +204,14 @@ def _em_checkpoint(db_path: str, resume: bool) -> EmCheckpoint:
         # Clear any per-iteration state from a previous run so a warm re-run
         # cannot consume stale λ / weights / activities.
         multimap.reset_em_state(db_path)
-        run_state.write_state(db_path, em_final_iteration="")
+        run_state.clear_progress(db_path, run_state.EM_STAGE)
         return EmCheckpoint(0, set(), False)
     start_iteration, finished = point
     # The loop has already ended if its last run recorded the iteration the
     # final pass consumes and the checkpoint still sits there.
-    stored_final = run_state.read_state(db_path).get("em_final_iteration")
+    stored_final = run_state.read_progress(db_path, run_state.EM_STAGE).get(
+        run_state.FINAL_ITERATION
+    )
     return EmCheckpoint(start_iteration, finished, stored_final == str(start_iteration))
 
 
@@ -415,8 +417,10 @@ class ORFActivityEstimator:
             if not checkpoint.final_only:
                 final_iteration = self._em_loop(checkpoint, slot_loci)
                 # From here a resume can skip straight to the final pass.
-                run_state.write_state(
-                    db_path, em_final_iteration=str(final_iteration)
+                run_state.write_progress(
+                    db_path,
+                    run_state.EM_STAGE,
+                    {run_state.FINAL_ITERATION: str(final_iteration)},
                 )
             run_stage(
                 "EM final full M-step",
@@ -471,7 +475,7 @@ class ORFActivityEstimator:
         """Run the per-locus ORF deconvolution over the loci of the run.
 
         Dispatches each locus to a worker process.  On a full pass the loci
-        listed in ``<w_dir>/processed_loci.txt`` are skipped, so that an
+        recorded as finished in ``price.db`` are skipped, so that an
         interrupted run resumes where it stopped.  The workers hand their
         rows back and this process, the only writer, appends them to
         ``<o_dir>/regions_activities/`` and records the locus as done;
@@ -486,8 +490,8 @@ class ORFActivityEstimator:
             Multimapping-EM iteration index.  ``None`` (default) runs the
             classic single-pass pipeline.
         em_final : bool, optional
-            See :class:`LocusJob`.  Intermediate passes do not touch
-            ``processed_loci.txt``.
+            See :class:`LocusJob`.  Intermediate passes neither skip nor
+            record finished loci.
         loci_subset : set, optional
             Restrict the fan-out to these locus ids.  Light EM passes pass
             the loci that carry multimap slots; the others cannot change
@@ -510,14 +514,18 @@ class ORFActivityEstimator:
             loci_ids &= loci_subset
         # Resume-skip bookkeeping only applies to full passes; light EM
         # passes intentionally re-run every locus each iteration.
-        if em_final and os.path.exists(layout.processed_loci_path):
-            with open(layout.processed_loci_path) as fh:
-                loci_ids -= {line.strip() for line in fh if line.strip()}
+        if em_final:
+            loci_ids -= set(
+                run_state.read_progress(self.db_path, run_state.DECONVOLUTION_STAGE)
+            )
 
         price2_logger = logging.getLogger("price2")
         log_level = logging.getLevelName(self.config.log_level)
         pbar = tqdm(total=len(loci_ids), disable=log_level > logging.INFO)
         writer = export.OutputWriter(layout.regions_activities_dir)
+        progress = run_state.ProgressRecorder(
+            self.db_path, run_state.DECONVOLUTION_STAGE
+        )
         futures = {
             self._pool.schedule(
                 process_loc,
@@ -526,7 +534,7 @@ class ORFActivityEstimator:
             ): locus_id
             for locus_id in loci_ids
         }
-        with logging_redirect_tqdm(loggers=[price2_logger]):
+        with logging_redirect_tqdm(loggers=[price2_logger]), progress:
             for future in as_completed(futures):
                 locus_id = futures[future]
                 try:
@@ -537,23 +545,28 @@ class ORFActivityEstimator:
                         fh.write(f"{locus_id}\n{exc}\n{traceback.format_exc()}\n\n")
                 else:
                     if result is not None:
-                        self._record(result, writer)
+                        self._record(result, writer, progress)
                 finally:
                     pbar.update(1)
         pbar.close()
 
-    def _record(self, result: LocusResult, writer: export.OutputWriter) -> None:
+    def _record(
+        self,
+        result: LocusResult,
+        writer: export.OutputWriter,
+        progress: run_state.ProgressRecorder,
+    ) -> None:
         """Write a finished locus's rows, then mark it done.
 
-        The order matters for resuming: a locus is only listed in
-        ``processed_loci.txt`` once its rows are on disk, and
-        :func:`price2.run_state.repair_outputs` drops rows of unlisted loci.
+        The order matters for resuming: a locus is only recorded as
+        finished once its rows are on disk, and
+        :func:`price2.run_state.repair_outputs` drops rows of unrecorded loci.
         """
         layout = self.config.layout
         writer.write(result.outputs)
         if result.perf is not None and self.config.export_performance_measurements:
             _append_performance(layout.performance_path, result.perf)
-        export.append_line(layout.processed_loci_path, result.locus_id)
+        progress.mark(result.locus_id)
 
 
 # --------------------------------------------------------------------------- #

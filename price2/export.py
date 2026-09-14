@@ -99,12 +99,6 @@ class OutputWriter:
                 fh.write(text.body)
 
 
-def append_line(path: str, line: str) -> None:
-    """Append one line to *path*, creating it if needed."""
-    with open(path, "a") as fh:
-        fh.write(line + "\n")
-
-
 # --------------------------------------------------------------------------- #
 # One region
 # --------------------------------------------------------------------------- #

@@ -87,9 +87,9 @@ A run that is cut short — by a wall-clock limit, a node failure or a `Ctrl-C` 
 
 - **data collection**: per Ribo-seq run for the models and the read mappings, per locus for the locus skeletons;
 - **multimapping EM**: at the last checkpointed iteration, re-running only the loci of that iteration that had not finished, and skipping straight to the final pass when the EM had already converged;
-- **final deconvolution**: at the loci not yet listed in `w_dir/processed_loci.txt`.
+- **final deconvolution**: at the loci not yet recorded as finished in `price.db`.
 
-Before anything is written, the output files are reconciled with that list: a half-written trailing line is dropped, and so is every row belonging to a locus that is re-run, so no result is duplicated or lost. A resumed run reproduces the output of an uninterrupted one.
+Before anything is written, the output files are reconciled with that record: a half-written trailing line is dropped, and so is every row belonging to a locus that is re-run, so no result is duplicated or lost. A resumed run reproduces the output of an uninterrupted one.
 
 PRICE 2 records a fingerprint of your configuration in `price.db` to decide what may be reused:
 

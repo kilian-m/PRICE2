@@ -31,6 +31,7 @@ from pickle import dumps, loads
 DEFAULT_TIMEOUT = 120.0
 
 STATE_TABLE = "run_state"
+PROGRESS_TABLE = "progress"
 
 # Tables holding the multimapping-EM state; dropped and re-created together
 # by :func:`create_em_tables`.  ``multimap_alignments``, ``multimap_groups``
@@ -177,6 +178,15 @@ def create_state_table(cur: sql.Cursor) -> None:
     cur.execute(
         f"CREATE TABLE IF NOT EXISTS {STATE_TABLE} "
         "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+
+
+def create_progress_table(cur: sql.Cursor) -> None:
+    """Create the table of finished ``(stage, key)`` pairs (:mod:`price2.run_state`)."""
+    cur.execute(
+        f"CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} ("
+        "stage TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL DEFAULT '', "
+        "PRIMARY KEY (stage, key))"
     )
 
 

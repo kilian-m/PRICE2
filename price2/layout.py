@@ -1,9 +1,9 @@
 """Where a run keeps its files.
 
 A PRICE2 run owns two directories, the working directory (``w_dir``) with
-the database and the per-locus progress list, and the output directory
-(``o_dir``) with the result tables.  :class:`RunLayout` derives every path
-inside them from those two roots, so no other module spells a file name.
+the database, and the output directory (``o_dir``) with the result tables.
+:class:`RunLayout` derives every path inside them from those two roots, so
+no other module spells a file name.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import os
 from dataclasses import dataclass
 
 DB_FILENAME = "price.db"
-PROCESSED_LOCI_FILENAME = "processed_loci.txt"
 REGIONS_ACTIVITIES_DIRNAME = "regions_activities"
 DATASET_MODELS_DIRNAME = "dataset_models"
 PERFORMANCE_FILENAME = "performance_measurements.tsv"
@@ -38,11 +37,6 @@ class RunLayout:
     def db_path(self) -> str:
         """The SQLite database every stage persists into."""
         return os.path.join(self.w_dir, DB_FILENAME)
-
-    @property
-    def processed_loci_path(self) -> str:
-        """One finished locus id per line; what a resumed deconvolution skips."""
-        return os.path.join(self.w_dir, PROCESSED_LOCI_FILENAME)
 
     @property
     def regions_activities_dir(self) -> str:

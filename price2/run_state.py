@@ -2,14 +2,16 @@
 
 A run is expensive enough that an interruption — a wall-clock limit, a node
 failure, a manual ``Ctrl-C`` — should not throw away the work already done.
-Every stage already persists its results (``price.db`` for collection,
-``processed_loci.txt`` plus the appended output files for deconvolution, the
-per-iteration EM tables for the multimapping EM), so resuming is mostly a
-matter of knowing *what may still be trusted*.
+Every stage already persists its results (``price.db`` for collection, the
+appended output files for deconvolution, the per-iteration EM tables for the
+multimapping EM), so resuming is mostly a matter of knowing *what may still
+be trusted* and *how far it got*.
 
-That is what this module records.  Beside the collected data in ``price.db``
-it keeps a small ``run_state`` key/value table holding two fingerprints of
-the configuration:
+That is what this module records, in two small tables of ``price.db``.
+``progress`` holds what has been finished, as ``(stage, key)`` rows: the
+collection's completion, the EM's final iteration, and one row per locus the
+deconvolution has written (see *Progress* below).  ``run_state`` says which
+configuration the database belongs to, as two fingerprints:
 
 ``collection_fingerprint``
     Over the options that decide what ends up *in* ``price.db``: the
@@ -46,6 +48,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 
 from price2 import database
 from price2.config import COLLECTION, RUNTIME, Config, is_path_option, option_scope
@@ -82,10 +85,10 @@ class ResumePlan:
         deconvolution.  When ``False`` the collection stages run, each
         skipping the runs and loci it already stored.
     reuse_deconvolution : bool
-        Per-locus progress (``processed_loci.txt``), the already written
-        output files and the multimapping-EM checkpoint are valid and are
-        picked up where they stopped.  When ``False`` the deconvolution
-        starts over with a cleared output directory.
+        The per-locus progress, the already written output files and the
+        multimapping-EM checkpoint are valid and are picked up where they
+        stopped.  When ``False`` the deconvolution starts over with a
+        cleared output directory.
     reason : str
         Human-readable explanation, logged by the caller.
     """
@@ -292,7 +295,7 @@ def plan_resume(config: Config, db_path: str) -> ResumePlan:
             version,
         )
 
-    skip_collection = state.get("collection_complete") == "1"
+    skip_collection = COMPLETE in read_progress(db_path, COLLECTION_STAGE)
     stored_deconvolution = state.get("deconvolution_fingerprint")
     deconvolution = deconvolution_fingerprint(config)
     reuse_deconvolution = (
@@ -335,17 +338,191 @@ def record_configuration(config: Config, db_path: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Progress                                                                      #
+# --------------------------------------------------------------------------- #
+#
+# What a run has finished, as ``(stage, key, value)`` rows of the ``progress``
+# table.  The collection records ``complete`` once every stage of it ran, the
+# multimapping EM records the iteration its final pass consumes once the loop
+# has ended, and the deconvolution records one key per locus whose rows are on
+# disk.  A stage that starts over clears its rows.
+
+#: Stage names of the ``progress`` table.
+COLLECTION_STAGE = "collection"
+EM_STAGE = "multimap_em"
+DECONVOLUTION_STAGE = "deconvolution"
+#: The key the collection records when it is complete.
+COMPLETE = "complete"
+#: The EM's key; its value is the iteration the final full pass consumes.
+FINAL_ITERATION = "final_iteration"
+
+_PROGRESS = database.PROGRESS_TABLE
+
+
+def read_progress(db_path: str, stage: str) -> dict[str, str]:
+    """Return the finished keys of *stage* with their values; empty when none.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to ``price.db``.
+    stage : str
+        One of the ``*_STAGE`` names.
+    """
+    if not os.path.exists(db_path):
+        return {}
+    with database.connect(db_path) as db:
+        cur = db.cursor()
+        if not database.table_exists(cur, _PROGRESS):
+            return {}
+        rows = cur.execute(
+            f"SELECT key, value FROM {_PROGRESS} WHERE stage = ?", (stage,)
+        ).fetchall()
+    return dict(rows)
+
+
+def write_progress(db_path: str, stage: str, entries) -> None:
+    """Record *entries* of *stage* as finished, in one transaction.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to ``price.db``.  Created if it does not exist.
+    stage : str
+        One of the ``*_STAGE`` names.
+    entries : Mapping[str, str] or Iterable[str]
+        Keys with their values, or bare keys (value ``""``).
+    """
+    items = entries.items() if hasattr(entries, "items") else ((k, "") for k in entries)
+    with database.connect(db_path, commit=True) as db:
+        cur = db.cursor()
+        database.create_progress_table(cur)
+        cur.executemany(
+            f"INSERT OR REPLACE INTO {_PROGRESS} VALUES (?, ?, ?)",
+            [(stage, key, str(value)) for key, value in items],
+        )
+
+
+def clear_progress(db_path: str, *stages: str) -> None:
+    """Forget the progress of *stages*: they start over.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to ``price.db``.
+    *stages : str
+        ``*_STAGE`` names.
+    """
+    with database.connect(db_path, commit=True) as db:
+        cur = db.cursor()
+        database.create_progress_table(cur)
+        cur.executemany(
+            f"DELETE FROM {_PROGRESS} WHERE stage = ?", [(s,) for s in stages]
+        )
+
+
+class ProgressRecorder:
+    """Record the finished keys of one stage, committing in batches.
+
+    The deconvolution finishes loci by the thousand; a commit per locus would
+    cost an ``fsync`` each.  Marks are flushed every *interval* seconds and
+    when the block exits, also on an exception.  A crash loses at most the
+    marks still pending, whose loci are re-run on resume: their rows are
+    dropped by :func:`repair_outputs` first, so nothing is duplicated.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to ``price.db``.
+    stage : str
+        One of the ``*_STAGE`` names.
+    interval : float
+        Seconds between commits.
+    """
+
+    def __init__(self, db_path: str, stage: str, interval: float = 1.0) -> None:
+        self.db_path = db_path
+        self.stage = stage
+        self.interval = interval
+        self._pending: list[str] = []
+        self._last_flush = time.monotonic()
+
+    def __enter__(self) -> ProgressRecorder:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.flush()
+
+    def mark(self, key: str) -> None:
+        """Record *key* as finished; written at the next flush."""
+        self._pending.append(key)
+        if time.monotonic() - self._last_flush >= self.interval:
+            self.flush()
+
+    def flush(self) -> None:
+        """Commit the pending marks."""
+        if self._pending:
+            write_progress(self.db_path, self.stage, self._pending)
+            self._pending.clear()
+        self._last_flush = time.monotonic()
+
+
+#: Where PRICE2 releases before the ``progress`` table kept the finished loci.
+_LEGACY_PROCESSED_LOCI = "processed_loci.txt"
+
+
+def migrate_legacy_progress(db_path: str, w_dir: str) -> None:
+    """Move the progress an older PRICE2 recorded elsewhere into ``progress``.
+
+    Earlier releases kept the collection's completion and the EM's final
+    iteration as ``run_state`` keys and the finished loci in
+    ``processed_loci.txt`` beside the database.  A working directory they
+    left behind is adopted on its first warm start; the legacy records are
+    removed once copied.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to an existing ``price.db``.
+    w_dir : str
+        The working directory holding it.
+    """
+    state = read_state(db_path)
+    legacy_keys = [k for k in ("collection_complete", "em_final_iteration") if k in state]
+    legacy_file = os.path.join(w_dir, _LEGACY_PROCESSED_LOCI)
+    if not legacy_keys and not os.path.exists(legacy_file):
+        return
+
+    if state.get("collection_complete") == "1":
+        write_progress(db_path, COLLECTION_STAGE, [COMPLETE])
+    if state.get("em_final_iteration"):
+        write_progress(
+            db_path, EM_STAGE, {FINAL_ITERATION: state["em_final_iteration"]}
+        )
+    if os.path.exists(legacy_file):
+        with open(legacy_file) as fh:
+            finished = [line.strip() for line in fh if line.strip()]
+        write_progress(db_path, DECONVOLUTION_STAGE, finished)
+        os.remove(legacy_file)
+    if legacy_keys:
+        with database.connect(db_path, commit=True) as db:
+            db.executemany(
+                f"DELETE FROM {_TABLE} WHERE key = ?", [(k,) for k in legacy_keys]
+            )
+    logger.info("adopted the progress records of an older PRICE2 in %s", w_dir)
+
+
+# --------------------------------------------------------------------------- #
 # Repairing appended output files                                               #
 # --------------------------------------------------------------------------- #
 #
-# A worker appends a locus's rows to the shared output files and only then
-# records the locus in ``processed_loci.txt``.  Nothing makes those two writes
-# atomic, so an interrupted run leaves two kinds of damage behind: a half
-# written final line, and complete rows belonging to loci that never got
-# marked done — which a resume re-runs, appending their rows a second time.
-# Both are repaired here, before the resumed run writes anything: partial
-# lines are truncated, and every row whose locus is not recorded as finished
-# is dropped.
+# The parent appends a locus's rows to the output files and only then records
+# the locus as finished.  Nothing makes those two writes atomic, so an
+# interrupted run leaves two kinds of damage behind: a half written final
+# line, and complete rows belonging to loci that never got marked done — which
+# a resume re-runs, appending their rows a second time.  Both are repaired
+# here, before the resumed run writes anything: partial lines are truncated,
+# and every row whose locus is not recorded as finished is dropped.
 #
 # Rows carry their locus in ``locus_id``/``loc_id`` (the TSVs, by column) or
 # in the ``loc_id``/``locus_id`` GTF attribute.  BED12 records carry no locus,
@@ -406,10 +583,10 @@ def _truncate_to_last_newline(path: str) -> bool:
 def repair_partial_lines(*paths: str) -> None:
     """Trim trailing partial lines from appended outputs before a resume.
 
-    A worker appends a locus's rows under a lock and marks the locus done
-    only afterwards, so an interrupted run can leave a half-written final
-    line.  The locus itself is re-run on resume — but its truncated line
-    would survive and corrupt the file, so drop it here.
+    The parent appends a locus's rows and marks the locus done only
+    afterwards, so an interrupted run can leave a half-written final line.
+    The locus itself is re-run on resume — but its truncated line would
+    survive and corrupt the file, so drop it here.
 
     Parameters
     ----------
@@ -537,19 +714,20 @@ def _filter_bed(path: str, kept_ids: set[str]) -> None:
     _rewrite(path, keep)
 
 
-def repair_outputs(o_dir: str, processed_loci_path: str) -> bool:
-    """Make the output directory consistent with the finished-locus list.
+def repair_outputs(o_dir: str, done: set[str]) -> bool:
+    """Make the output directory consistent with the finished loci.
 
     Truncates partial trailing lines and drops every row written by a locus
-    that is not recorded in ``processed_loci.txt``: the resumed run re-runs
-    those loci, and their rows would otherwise appear twice.
+    not in *done*: the resumed run re-runs those loci, and their rows would
+    otherwise appear twice.
 
     Parameters
     ----------
     o_dir : str
         The run's output directory.
-    processed_loci_path : str
-        Path to ``processed_loci.txt`` in the working directory.
+    done : set of str
+        The loci recorded as finished (``read_progress(db_path,
+        DECONVOLUTION_STAGE)``).
 
     Returns
     -------
@@ -559,12 +737,7 @@ def repair_outputs(o_dir: str, processed_loci_path: str) -> bool:
         must then discard the output directory and deconvolve every locus
         again, since duplicate BED records cannot be ruled out.
     """
-    repair_partial_lines(o_dir, processed_loci_path)
-
-    done: set[str] = set()
-    if os.path.exists(processed_loci_path):
-        with open(processed_loci_path) as fh:
-            done = {line.strip() for line in fh if line.strip()}
+    repair_partial_lines(o_dir)
 
     tsv_files: list[str] = []
     gtf_files: list[str] = []
