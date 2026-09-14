@@ -44,13 +44,13 @@ class DataCollector:
 
     Attributes
     ----------
-    loci_set : set[Locus]
-        Full set of loci constructed from the reference annotation.
+    loci : list[Locus]
+        The loci built from the reference annotation (:func:`build_loci`).
     chr_order : list[str] or None
         Chromosome names in BAM header order; ``None`` if no BAM found.
     """
 
-    loci_set: set[Locus]
+    loci: list[Locus]
     chr_order: list[str] | None
 
     def __init__(
@@ -76,7 +76,7 @@ class DataCollector:
         self.bam_dir = config.bam_dir
         self.db_path = config.layout.db_path
         self.get_chromosome_order()
-        self.make_loci(self.reference_annotation)
+        self.loci = build_loci(self.reference_annotation)
 
     def collect_runs(self) -> None:
         """Collect and persist Ribo-seq run statistics.
@@ -173,7 +173,7 @@ class DataCollector:
         if not pending:
             logger.info("Read mappings already collected for all runs.")
             return
-        if not self.loci_set:
+        if not self.loci:
             logger.warning("No loci to map reads against.")
             return
 
@@ -192,7 +192,7 @@ class DataCollector:
         # sweep a contiguous slab of the file instead of seeking randomly.
         chr_rank = {c: i for i, c in enumerate(self.chr_order or [])}
         loci = sorted(
-            self.loci_set,
+            self.loci,
             key=lambda loc: (
                 chr_rank.get(loc.iv.chrom, len(chr_rank)),
                 loc.iv.start,
@@ -262,7 +262,7 @@ class DataCollector:
                     )
                     for chunk_idx, (lo, hi) in enumerate(bounds)
                 ]
-                self._collect_run(run.id, tasks, n_proc)
+                self._map_run_reads(run.id, tasks, n_proc)
         finally:
             _WORKER_LOCI = []
 
@@ -271,7 +271,7 @@ class DataCollector:
 
         logger.info("Read mappings collected.")
 
-    def _collect_run(self, run_id: str, tasks: list, n_proc: int) -> None:
+    def _map_run_reads(self, run_id: str, tasks: list, n_proc: int) -> None:
         """Map one run's BAM against every locus chunk and store the result.
 
         Parameters
@@ -354,79 +354,6 @@ class DataCollector:
                     self.chr_order = [sq["SN"] for sq in _bam.header["SQ"]]
                 return
 
-    def make_loci(
-        self,
-        reference_annotation: ReferenceAnnotation,
-        distance: int = 50,
-    ) -> None:
-        """Build loci by merging nearby transcript intervals.
-
-        Iterates over transcripts in ``reference_annotation``, marks their
-        genomic intervals in a binary step-array, and then merges
-        consecutive occupied intervals on the same strand that are at most
-        ``distance`` bases apart into a single :class:`~price2.locus.Locus`.
-        Populates ``self.loci_set``.
-
-        Parameters
-        ----------
-        reference_annotation : ReferenceAnnotation
-            Parsed annotation whose transcripts define the locus boundaries.
-        distance : int, optional
-            Maximum gap (in bases) between two transcript intervals that are
-            still merged into the same locus.  Default is 50.
-        """
-        loci_intervals_binary = HTSeq.GenomicArray(
-            "auto", stranded=True, storage="step", typecode="b"
-        )
-        for transcript in reference_annotation.transcripts.values():
-            loci_intervals_binary[transcript.iv] = True
-        self.loci_set = set()
-
-        connected_loci = {"+": [], "-": []}
-        loci_counter = 0
-        for iv, step in loci_intervals_binary.steps():
-            if step:
-                if not connected_loci[iv.strand]:
-                    connected_loci[iv.strand].append(iv)
-                    continue
-                if (
-                    connected_loci[iv.strand][-1].chrom == iv.chrom
-                    and connected_loci[iv.strand][-1].end + distance > iv.start
-                ):
-                    connected_loci[iv.strand].append(iv)
-                else:
-                    connected_iv = HTSeq.GenomicInterval(
-                        connected_loci[iv.strand][0].chrom,
-                        connected_loci[iv.strand][0].start,
-                        connected_loci[iv.strand][-1].end,
-                        iv.strand,
-                    )
-                    locus = Locus(
-                        connected_iv,
-                        reference_annotation.transcript_intervals,
-                        loci_counter,
-                    )
-                    loci_counter += 1
-                    self.loci_set.add(locus)
-                    connected_loci[iv.strand] = [iv]
-        for strand in ["+", "-"]:
-            try:
-                connected_iv = HTSeq.GenomicInterval(
-                    connected_loci[strand][0].chrom,
-                    connected_loci[strand][0].start,
-                    connected_loci[strand][-1].end,
-                    strand,
-                )
-                locus = Locus(
-                    connected_iv,
-                    reference_annotation.transcript_intervals,
-                    loci_counter,
-                )
-                loci_counter += 1
-                self.loci_set.add(locus)
-            except IndexError:
-                pass
-
     def collect_loci(self) -> None:
         """Persist pre-RGR locus skeletons to the ``loci`` table.
 
@@ -441,21 +368,70 @@ class DataCollector:
         with database.connect(self.db_path, commit=True) as db:
             cur = db.cursor()
             database.create_collection_tables(cur)
-            processed_loci_ids = {
+            stored = {
                 loc_id for loc_id, in cur.execute("SELECT locus_id FROM loci")
             }
-            loci_ids_to_process = {
-                loc.id for loc in self.loci_set
-            } - processed_loci_ids
-            loc_dict = {loc.id: loc for loc in self.loci_set}
+            new_loci = [loc for loc in self.loci if loc.id not in stored]
             cur.executemany(
                 "INSERT INTO loci VALUES (?, ?)",
-                [
-                    (loc_id, database.pickle_blob(loc_dict[loc_id]))
-                    for loc_id in loci_ids_to_process
-                ],
+                [(loc.id, database.pickle_blob(loc)) for loc in new_loci],
             )
-        logger.info("Saved %d locus skeletons.", len(loci_ids_to_process))
+        logger.info("Saved %d locus skeletons.", len(new_loci))
+
+
+def build_loci(
+    reference_annotation: ReferenceAnnotation, distance: int = 50
+) -> list[Locus]:
+    """Build the loci of an annotation by merging nearby transcripts.
+
+    Marks every transcript's span in a stranded step array and merges
+    consecutive occupied stretches on the same strand and chromosome that
+    are less than *distance* bases apart into one
+    :class:`~price2.locus.Locus`.  The loci are numbered in the order they
+    are closed, which is the order of the step array.
+
+    Parameters
+    ----------
+    reference_annotation : ReferenceAnnotation
+        Parsed annotation whose transcripts define the locus boundaries.
+    distance : int, optional
+        Two stretches closer than this are merged.
+
+    Returns
+    -------
+    list[Locus]
+        The loci, ``loc_0``, ``loc_1``, ... in that order.
+    """
+    occupied = HTSeq.GenomicArray("auto", stranded=True, storage="step", typecode="b")
+    for transcript in reference_annotation.transcripts.values():
+        occupied[transcript.iv] = True
+
+    loci: list[Locus] = []
+    pending: dict[str, list[HTSeq.GenomicInterval]] = {"+": [], "-": []}
+
+    def close(strand: str) -> None:
+        stretch = pending[strand]
+        if stretch:
+            iv = HTSeq.GenomicInterval(
+                stretch[0].chrom, stretch[0].start, stretch[-1].end, strand
+            )
+            loci.append(
+                Locus(iv, reference_annotation.transcript_intervals, len(loci))
+            )
+            pending[strand] = []
+
+    for iv, step in occupied.steps():
+        if not step:
+            continue
+        stretch = pending[iv.strand]
+        if stretch and not (
+            stretch[-1].chrom == iv.chrom and stretch[-1].end + distance > iv.start
+        ):
+            close(iv.strand)
+        pending[iv.strand].append(iv)
+    for strand in ("+", "-"):
+        close(strand)
+    return loci
 
 
 #: Loci to map against, shared with the collection workers by fork.  Set by
