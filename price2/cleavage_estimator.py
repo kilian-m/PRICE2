@@ -10,6 +10,8 @@ by EM with random restarts (the numba kernels below).
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from collections.abc import Iterable
 from typing import Optional
 
 import numpy as np
@@ -23,6 +25,7 @@ from price2.cleavage_model import (
     PLAUSIBLE_P_SITE_OFFSETS,
     CleavageModel,
 )
+from price2.genomic_features import Transcript
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
@@ -30,6 +33,56 @@ logger = logging.getLogger(__name__)
 
 #: Minimum number of counted alignments for a reliable cleavage model.
 MIN_COUNTED_ALNS: int = 100_000
+
+
+def project_onto_cds(
+    aln: RiboSeqAlignment,
+    transcripts: Iterable[Transcript],
+    min_dist_to_start: int,
+    min_dist_to_end: int,
+) -> tuple[Optional[int], Optional[int], bool]:
+    """Where a read sits in the CDS of the coding transcripts it fits into.
+
+    Parameters
+    ----------
+    aln : RiboSeqAlignment
+        The read.
+    transcripts : iterable of Transcript
+        Candidate transcripts; those without an annotated CDS are skipped.
+    min_dist_to_start, min_dist_to_end : int
+        A read counts for the reading frame only when it lies more than
+        this far inside the CDS at both ends, where the frame is unambiguous.
+
+    Returns
+    -------
+    frame : int or None
+        The reading frame of the read start relative to the CDS start,
+        when every transcript the read fits into and lies inside agrees on
+        it; ``None`` when none does, or when they disagree.
+    dist_to_start : int or None
+        The read start's distance from the CDS start, when every
+        transcript the read fits into agrees on it (no interior condition);
+        ``None`` otherwise.
+    ambiguous_frame : bool
+        Whether the transcripts disagreed on the frame.
+    """
+    frames: set[int] = set()
+    dists: set[int] = set()
+    for tr in transcripts:
+        if tr.annotated_cds_iv is None:
+            continue
+        span = tr.exons.try_map_to_local(aln.genomic_region)
+        if span is None:
+            continue
+        cds_start = tr.annotated_cds_iv[0]
+        start, end = span[0] - cds_start, span[1] - cds_start
+        dists.add(start)
+        if start > min_dist_to_start and tr.coding_length - end > min_dist_to_end:
+            frames.add(start % 3)
+    ambiguous = len(frames) > 1
+    frame = frames.pop() if len(frames) == 1 else None
+    dist = dists.pop() if len(dists) == 1 else None
+    return frame, dist, ambiguous
 
 
 class CleavageEstimator:
@@ -68,14 +121,21 @@ class CleavageEstimator:
         delta_cutoff: float = 1e-8,
         seed: int = 42,
     ) -> None:
-        self.table = np.zeros(shape=(100, 3, 2, 1), dtype=np.int32)
         self.obs_min_len = 15
         self.obs_max_len = 40
         self.seed = seed
         self.repeats = repeats
-        self.c = 0
         self.maxiter = maxiter
         self.delta_cutoff = delta_cutoff
+        #: Counts by ``(length, frame, untemplated addition)``; see :meth:`tally`.
+        self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2), dtype=np.int32)
+        #: Read starts by distance to the CDS start, centred on
+        #: ``DIST_STARTS_CENTRE``.
+        self.dist_starts = np.zeros(shape=(2 * DIST_STARTS_CENTRE,), dtype=np.int32)
+        #: Alignments tallied into :attr:`table`.
+        self.counted_alns = 0
+        #: Alignments left out of :attr:`table`, by reason.
+        self.skipped: Counter[str] = Counter()
 
     def collect_data(
         self,
@@ -88,15 +148,12 @@ class CleavageEstimator:
         min_counted_alns: int = MIN_COUNTED_ALNS,
         end_to_end: bool = False,
     ) -> None:
-        """Collect read-length / frame / UTA counts from a BAM file.
+        """Tally the mapped reads of a BAM file (see :meth:`tally`).
 
-        Iterates over *every* uniquely-mapped read that falls within a CDS
-        region and tallies its length, reading frame and untemplated-addition
-        status into ``self.table``, plus its read-start-to-CDS-start distance
-        into ``self.dist_starts``.  The whole file is scanned to convergence on
-        the true distributions: sampling only a genomic prefix of a
-        coordinate-sorted BAM would bias the counts towards the reads at the
-        start of the file, so any downsampling must happen before this call.
+        The whole file is scanned to converge on the true distributions:
+        sampling only a genomic prefix of a coordinate-sorted BAM would bias
+        the counts towards the reads at the start of the file, so any
+        downsampling must happen before this call.
 
         Parameters
         ----------
@@ -104,14 +161,11 @@ class CleavageEstimator:
             Parsed reference annotation.
         sample_bam_path : str
             Path to the BAM file.
-        min_considered_length : int, optional
-            Minimum read length to consider.
-        max_considered_length : int, optional
-            Maximum read length to consider.
-        min_dist_to_start : int, optional
-            Minimum distance from CDS start to count a read.
-        min_dist_to_end : int, optional
-            Minimum distance from CDS end to count a read.
+        min_considered_length, max_considered_length : int, optional
+            Read lengths considered, ``[min, max)``.
+        min_dist_to_start, min_dist_to_end : int, optional
+            Minimum distance of the read from the CDS start and end for its
+            frame to be counted.
         min_counted_alns : int, optional
             Warn when fewer than this many alignments are tallied into
             ``table``; below it the dataset is too small for a reliable fit.
@@ -120,115 +174,86 @@ class CleavageEstimator:
             the untemplated addition is recovered from the 5'-terminal mismatch
             instead of a soft-clip (see :func:`price2.bam.footprint`).
         """
-        self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2, 1), dtype=np.int32)
-        self.dist_starts = np.zeros(shape=(2 * DIST_STARTS_CENTRE,), dtype=np.int32)
-        self.outside_cds = 0
-        self.not_unique = 0
-        self.not_countable = 0
-        self.bad_length = 0
-        self.counted_alns = 0
         with pysam.AlignmentFile(sample_bam_path, "rb") as bam:
-            for raw_aln in iter_mapped(bam):
-                aln = RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end)
-                if aln is None:
-                    continue
-                if not aln.unique:
-                    self.not_unique += 1
-                    continue
-                if not min_considered_length <= len(aln) < max_considered_length:
-                    self.bad_length += 1
-                    continue
-                transcript_candidates = reference_annotation.collect_coding_transcripts(
-                    aln.genomic_region
-                )
-                if len(transcript_candidates) == 0:
-                    self.outside_cds += 1
-                    continue
-                frame = None
-                dist_to_start = None
-
-                # get frame
-                for tr in transcript_candidates:
-                    if tr.annotated_cds_iv is None:
-                        continue
-                    iv_on_tr = tr.exons.try_map_to_local(aln.genomic_region)
-                    if iv_on_tr is None:
-                        continue
-                    iv_on_cds = (
-                        iv_on_tr[0] - tr.annotated_cds_iv[0],
-                        iv_on_tr[1] - tr.annotated_cds_iv[0],
-                    )
-
-                    if (
-                        iv_on_cds[0] > min_dist_to_start
-                        and tr.coding_length - iv_on_cds[1] > min_dist_to_end
-                    ):
-                        new_frame = iv_on_cds[0] % 3
-
-                        if frame is None:
-                            frame = new_frame
-                        elif frame != new_frame:
-                            self.not_countable += 1
-                            break
-
-                else:
-                    if frame is not None:
-                        self.table[
-                            len(aln),
-                            frame,
-                            int(aln.untemplated_addition),
-                            0,
-                        ] += 1
-                        self.counted_alns += 1
-
-                # get dist_to_start
-                for tr in transcript_candidates:
-                    if not tr.annotated_cds_iv:
-                        continue
-                    iv_on_tr = tr.exons.try_map_to_local(aln.genomic_region)
-                    new_dist_to_start = (
-                        None
-                        if iv_on_tr is None
-                        else iv_on_tr[0] - tr.annotated_cds_iv[0]
-                    )
-
-                    if isinstance(new_dist_to_start, int):
-                        if dist_to_start is None:
-                            dist_to_start = new_dist_to_start
-                        elif dist_to_start != new_dist_to_start:
-                            break
-                else:
-                    if isinstance(dist_to_start, int) and abs(dist_to_start) < DIST_STARTS_CENTRE:
-                        self.dist_starts[DIST_STARTS_CENTRE + dist_to_start] += 1
-
+            alignments = (
+                RiboSeqAlignment.from_pysam(raw, end_to_end=end_to_end)
+                for raw in iter_mapped(bam)
+            )
+            self.tally(
+                (aln for aln in alignments if aln is not None),
+                reference_annotation,
+                min_considered_length,
+                max_considered_length,
+                min_dist_to_start,
+                min_dist_to_end,
+            )
         if self.counted_alns < min_counted_alns:
             logger.warning(
-                "Not enough alignments counted: %d < %d for %s\n"
-                "  not_unique: %d\n"
-                "  not_countable: %d\n"
-                "  outside_cds: %d\n"
-                "  bad_length: %d",
+                "Not enough alignments counted: %d < %d for %s (skipped: %s)",
                 self.counted_alns,
                 min_counted_alns,
                 sample_bam_path,
-                self.not_unique,
-                self.not_countable,
-                self.outside_cds,
-                self.bad_length,
+                ", ".join(f"{k} {v}" for k, v in sorted(self.skipped.items())),
             )
+
+    def tally(
+        self,
+        alignments: Iterable[RiboSeqAlignment],
+        reference_annotation: ReferenceAnnotation,
+        min_considered_length: int = 15,
+        max_considered_length: int = 40,
+        min_dist_to_start: int = 30,
+        min_dist_to_end: int = 30,
+    ) -> None:
+        """Count the reads that map uniquely into annotated CDSs.
+
+        Every read whose length is in range, that maps uniquely, and whose
+        coding transcripts agree on its reading frame (:func:`project_onto_cds`)
+        adds one to ``table[length, frame, untemplated_addition]``; every
+        read whose coding transcripts agree on its distance to the CDS start
+        adds one to :attr:`dist_starts`.  The rejections are counted in
+        :attr:`skipped`.  Pure over its input: any iterable of alignments and
+        any object with ``collect_coding_transcripts`` will do.
+
+        Parameters
+        ----------
+        alignments : iterable of RiboSeqAlignment
+            The reads.
+        reference_annotation : ReferenceAnnotation
+            Where the coding transcripts come from.
+        min_considered_length, max_considered_length : int, optional
+            Read lengths considered, ``[min, max)``.
+        min_dist_to_start, min_dist_to_end : int, optional
+            See :func:`project_onto_cds`.
+        """
+        table, dist_starts, skipped = self.table, self.dist_starts, self.skipped
+        for aln in alignments:
+            if not aln.unique:
+                skipped["not_unique"] += 1
+                continue
+            if not min_considered_length <= len(aln) < max_considered_length:
+                skipped["bad_length"] += 1
+                continue
+            transcripts = reference_annotation.collect_coding_transcripts(
+                aln.genomic_region
+            )
+            if not transcripts:
+                skipped["outside_cds"] += 1
+                continue
+            frame, dist_to_start, ambiguous = project_onto_cds(
+                aln, transcripts, min_dist_to_start, min_dist_to_end
+            )
+            if frame is not None:
+                table[len(aln), frame, int(aln.untemplated_addition)] += 1
+                self.counted_alns += 1
+            elif ambiguous:
+                skipped["ambiguous_frame"] += 1
+            if dist_to_start is not None and abs(dist_to_start) < DIST_STARTS_CENTRE:
+                dist_starts[DIST_STARTS_CENTRE + dist_to_start] += 1
 
     def correct_table(self) -> None:
         """Swap frame-1 and frame-2 columns in the count table."""
-        temp_table = self.table.copy()
-        (
-            self.table[:, 0, :, :],
-            self.table[:, 1, :, :],
-            self.table[:, 2, :, :],
-        ) = (
-            temp_table[:, 0, :, :],
-            temp_table[:, 2, :, :],
-            temp_table[:, 1, :, :],
-        )
+        self.table = np.ascontiguousarray(self.table[:, [0, 2, 1]])
 
     def run(self, regularize: bool = True) -> CleavageModel:
         """Run EM estimation and return the fitted cleavage model.
@@ -249,7 +274,6 @@ class CleavageEstimator:
             self.obs_min_len,
             self.table,
             self.maxiter,
-            self.c,
             self.delta_cutoff,
             self.seed,
             self.init_peak(),
@@ -467,22 +491,19 @@ def compute_ll(
     pl: np.ndarray,
     pr: np.ndarray,
     u: float,
-    c: int,
 ) -> float:
     """Compute the log-likelihood of the observed count table.
 
     Parameters
     ----------
     table : np.ndarray
-        Observed counts, shape ``(max_len, 3 (frame), 2 (untemplated_addition), n_conditions)``.
+        Observed counts, shape ``(max_len, 3 (frame), 2 (untemplated_addition))``.
     obs_min_len, obs_max_len : int
         Range of observed read lengths.
     pl, pr : np.ndarray
         Left / right cleavage distributions.
     u : float
         Untemplated-addition probability.
-    c : int
-        Condition index into the table's last axis.
 
     Returns
     -------
@@ -495,7 +516,7 @@ def compute_ll(
             frame1 = (frame - 1) % 3
 
             untemplated_addition = 1
-            n = table[length, frame, untemplated_addition, c]
+            n = table[length, frame, untemplated_addition]
 
             if n > 0:
                 # Visible soft-clip UTA -> plain footprint geometry (see repeat()).
@@ -505,7 +526,7 @@ def compute_ll(
                 ll += n * np.log(p)
 
             untemplated_addition = 0
-            n = table[length, frame, untemplated_addition, c]
+            n = table[length, frame, untemplated_addition]
 
             if n > 0:
                 # Either an UTA that matches the reference (prob u * 1/4, the
@@ -555,7 +576,6 @@ def _em_restart(
     obs_min_len: int,
     table: np.ndarray,
     maxiter: int,
-    c: int,
     delta_cutoff: float,
     total: int,
     pl: np.ndarray,
@@ -571,10 +591,10 @@ def _em_restart(
     tuple[float, float]
         ``(log_likelihood, u)`` of the fitted model.
     """
-    N = table[obs_min_len : obs_max_len + 1, :, 1, c].sum()
+    N = table[obs_min_len : obs_max_len + 1, :, 1].sum()
     u = N * 4 / 3
 
-    N += table[obs_min_len : obs_max_len + 1, :, 0, c].sum()
+    N += table[obs_min_len : obs_max_len + 1, :, 0].sum()
     u /= N
 
     for it in range(maxiter):
@@ -591,7 +611,7 @@ def _em_restart(
             for frame in range(3):
                 untemplated_addition = 1
 
-                n = table[length, frame, untemplated_addition, c]
+                n = table[length, frame, untemplated_addition]
 
                 frame1 = (frame - 1) % 3
                 # left indexes the footprint left cleavage: it may reach
@@ -610,7 +630,7 @@ def _em_restart(
 
                 untemplated_addition = 0
 
-                n = table[length, frame, untemplated_addition, c]
+                n = table[length, frame, untemplated_addition]
 
                 sum0 = eps
                 sum1 = eps
@@ -640,14 +660,14 @@ def _em_restart(
             pl[i] = (ql1[i] + ql0[i]) / total
             pr[i] = (qr1[i] + qr0[i]) / total
 
-        N = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
+        N = table[obs_min_len : obs_max_len + 1, :, :].sum()
         u = qu / N
 
         model_change = np.absolute(old_pl - pl).sum() + np.absolute(old_pr - pr).sum()
         if model_change < delta_cutoff:
             break
 
-    return compute_ll(table, obs_min_len, obs_max_len, pl, pr, u, c), u
+    return compute_ll(table, obs_min_len, obs_max_len, pl, pr, u), u
 
 
 @njit(parallel=True, cache=True)
@@ -656,7 +676,6 @@ def _em_restarts(
     obs_min_len: int,
     table: np.ndarray,
     maxiter: int,
-    c: int,
     delta_cutoff: float,
     total: int,
     pls: np.ndarray,
@@ -680,7 +699,6 @@ def _em_restarts(
             obs_min_len,
             table,
             maxiter,
-            c,
             delta_cutoff,
             total,
             pls[rep],
@@ -695,7 +713,6 @@ def repeat(
     obs_min_len: int,
     table: np.ndarray,
     maxiter: int,
-    c: int,
     delta_cutoff: float,
     seed: int = 42,
     init_peak: int = 12,
@@ -719,11 +736,9 @@ def repeat(
     obs_max_len, obs_min_len : int
         Observed read length range.
     table : np.ndarray
-        Count table.
+        Count table, shape ``(max_len, 3, 2)``.
     maxiter : int
         Maximum iterations per restart.
-    c : int
-        Condition index.
     delta_cutoff : float
         Convergence threshold.
     seed : int, optional
@@ -738,12 +753,12 @@ def repeat(
     tuple
         ``(best_ll, best_u, best_pl, best_pr)``.
     """
-    total = table[obs_min_len : obs_max_len + 1, :, :, c].sum()
+    total = table[obs_min_len : obs_max_len + 1, :, :].sum()
     peak = min(max(init_peak, 1), obs_max_len - 1)
 
     pls, prs = _init_restarts(max(repeats, 1), obs_max_len, peak, seed)
     lls, us = _em_restarts(
-        obs_max_len, obs_min_len, table, maxiter, c, delta_cutoff, total, pls, prs
+        obs_max_len, obs_min_len, table, maxiter, delta_cutoff, total, pls, prs
     )
 
     best = int(np.argmax(lls))

@@ -231,7 +231,7 @@ def plot_cleavage_full(
     lo, hi = 20, min(40, model.table.shape[0])
     x = np.arange(lo, hi)
     bar_w = 0.25
-    counts = model.table[lo:hi, :, :, 0].sum(axis=2)  # (n_lengths, 3) by column
+    counts = model.table[lo:hi, :, :].sum(axis=2)  # (n_lengths, 3) by column
     ax0.bar(x - bar_w, counts[:, 0], bar_w, label="frame 0")
     ax0.bar(x, counts[:, 2], bar_w, label="frame 1")
     ax0.bar(x + bar_w, counts[:, 1], bar_w, label="frame 2")

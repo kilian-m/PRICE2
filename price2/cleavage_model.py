@@ -70,6 +70,20 @@ UNBOUNDED: int = 10**10
 #: start; the histogram has ``2 * DIST_STARTS_CENTRE`` bins.
 DIST_STARTS_CENTRE: int = 100
 
+
+def _count_table(table: np.ndarray) -> np.ndarray:
+    """The estimator's count table as ``(length, frame, untemplated addition)``.
+
+    Earlier releases carried a fourth "condition" axis of size one; tables
+    they pickled or exported are squeezed to the three-axis layout.
+    """
+    table = np.asarray(table)
+    if table.ndim == 4 and table.shape[3] == 1:
+        return np.ascontiguousarray(table[:, :, :, 0])
+    if table.ndim != 3:
+        raise ValueError(f"a cleavage count table has 3 axes, got shape {table.shape}")
+    return table
+
 #: Names that moved to :mod:`price2.cleavage_estimator`, resolved lazily for
 #: older imports.
 _MOVED = {
@@ -120,7 +134,7 @@ class CleavageModel:
         if dist_starts is not None:
             self.dist_starts = dist_starts
         if table is not None:
-            self.table = table
+            self.table = _count_table(table)
         # Axis 0 size is len(pl) + len(pr) + 4 so the longest physically
         # possible read (len(pl) + len(pr) + 2 bases of cleavage + 1
         # untemplated addition) has a valid LUT entry.
@@ -373,6 +387,12 @@ class CleavageModel:
         state.pop("_p_site_table_cache", None)
         return state
 
+    def __setstate__(self, state: dict) -> None:
+        """Restore a pickle; earlier releases stored a 4-D count table."""
+        self.__dict__.update(state)
+        if "table" in state:
+            self.table = _count_table(state["table"])
+
     def is_plausible(self) -> bool:
         """Whether the upstream cleavage peak looks like a healthy library's.
 
@@ -477,7 +497,7 @@ class CleavageModel:
                 if key_ds in data:
                     model.dist_starts = data[key_ds]
                 if key_t in data:
-                    model.table = data[key_t]
+                    model.table = _count_table(data[key_t])
 
         return models
 
