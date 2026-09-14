@@ -625,7 +625,7 @@ def process_loc(job: LocusJob) -> LocusResult | None:
 
     slots = _apply_em_state(job, loc, runs, layout.db_path)
     mm_data = slots.by_run() if slots is not None else None
-    with perf.timed("proc_reads_2_time"):
+    with perf.timed("route_reads_time"):
         loc.assign_reads_to_egs(runs, mm_data)
     perf["read_count"] = sum(loc.counted_reads.values())
 
@@ -695,11 +695,11 @@ def _load_locus(
         perf.update(
             build_rgrs_time=0.0,
             unfiltered_rgr_count=n_rgrs,
-            assign_reads_time=0.0,
+            well_fitting_reads_time=0.0,
             filtered_coverage_rgr_count=n_rgrs,
             coverage_filter_time=0.0,
             filtered_deconvolution_rgr_count=n_rgrs,
-            filter_2_time=0.0,
+            deconvolution_filter_time=0.0,
             eg_time=0.0,
             eg_count=loc.routing.n_rows,
         )
@@ -737,7 +737,7 @@ def _prepare_locus(
         loc.get_reads_from_db(db_path, drop_multimappers=not config.multimap_em)
 
     perf["unfiltered_rgr_count"] = len(loc.rgrs)
-    with perf.timed("assign_reads_time"):
+    with perf.timed("well_fitting_reads_time"):
         if config.coverage_filter or config.deconvolution_filter:
             loc.make_well_fitting_reads(runs)
 
@@ -748,7 +748,7 @@ def _prepare_locus(
             outputs.update(export.step_outputs(loc, config, "coverage_filtered"))
         perf["filtered_coverage_rgr_count"] = len(loc.rgrs)
 
-    with perf.timed("filter_2_time"):
+    with perf.timed("deconvolution_filter_time"):
         if config.deconvolution_filter:
             loc.deconvolution_filter_rgrs(config)
         perf["filtered_deconvolution_rgr_count"] = len(loc.rgrs)

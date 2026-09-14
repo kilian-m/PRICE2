@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import time
 from dataclasses import dataclass
 
 import HTSeq
@@ -425,7 +424,7 @@ class Locus:
 
         rgr_ids_to_remove = set()
         for opt_group in optimization_groups:
-            rgr_ids_to_remove |= self.deconvolute_opt_group(opt_group, config)
+            rgr_ids_to_remove |= self._filter_stop_group(opt_group, config)
 
         rgrs_to_remove = {
             rgr
@@ -506,16 +505,15 @@ class Locus:
 
         return optimization_groups
 
-    def deconvolute_opt_group(
+    def _filter_stop_group(
         self,
         opt_group: set[ReadGeneratingRegion],
         config: Config,
     ) -> set[str]:
-        """Deconvolve a single optimisation group and return ORF ids to remove.
+        """Solve one optimisation group of the deconvolution filter.
 
         Each run is optimised on its own (see :func:`price2.solver.solve`).
-        An ORF is
-        kept if its estimated activity exceeds
+        An ORF is kept if its estimated activity exceeds
         ``config.deconvolution_filter_min_activity`` in at least one run.
 
         Parameters
@@ -646,7 +644,7 @@ class Locus:
         runs: list[RiboSeqRun],
         max_outer: int | None = None,
         prune: bool = True,
-    ) -> tuple[float, float]:
+    ) -> None:
         """IRLS deconvolution with Huber weights on Pearson residuals.
 
         At each outer iteration:
@@ -679,20 +677,8 @@ class Locus:
             the solve.  The EM light M-step passes ``False`` to keep the
             ORF set — and hence the E-step targets and warm-start layout —
             fixed across iterations.
-
-        Returns
-        -------
-        tuple[float, float]
-            ``(opt_time, data_time)`` — wall-clock seconds spent in
-            optimisation vs. data preparation.
         """
-        # ── Build sparse system ──────────────────────────────────────────
-        s1 = time.time()
         system = self.sparse_system(runs)
-        data_time = time.time() - s1
-
-        # ── Solve ────────────────────────────────────────────────────────
-        s1 = time.time()
         fit = solver.irls_huber(
             system.X,
             system.y,
@@ -702,7 +688,6 @@ class Locus:
             system.num_runs,
             max_outer=max_outer,
         )
-        opt_time = time.time() - s1
         self.irls_outer_iterations = fit.outer_iterations
         logger.debug(
             "IRLS-Huber: converged in %d outer iterations (c=%.1f)",
@@ -710,12 +695,13 @@ class Locus:
             config.irls_huber_c,
         )
 
-        # ── Store result ─────────────────────────────────────────────────
         result_matrix = fit.w.reshape(system.num_rgrs, system.num_runs)
         result_matrix[result_matrix <= config.pseudo_min] = 0
         self.result = result_matrix
 
-        # ── Post-optimisation RGR removal (same as deconvolve) ───────────
+        # Drop the ORFs that are inactive in every run: below the configured
+        # fraction of their run's most active ORF (by activity × length)
+        # and below the absolute floor.
         if prune:
             x = self.result
             x_t = x.T
@@ -728,8 +714,6 @@ class Locus:
             self.remove_rgrs(
                 self._orfs_at(np.flatnonzero(np.all(x < min_activities, axis=1)))
             )
-
-        return opt_time, data_time
 
     def activities_by_id(self) -> dict:
         """Return the current activity matrix keyed by stable ``rgr.id``.

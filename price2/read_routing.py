@@ -556,8 +556,6 @@ def load_reads(
         ).fetchall()
     loc.run_read_count = {}
     loc.rsas_dict = {}
-    chrom = loc.iv.chrom
-    strand = loc.iv.strand
     # Memoize GenomicRegion objects by their interval-coordinate signature.
     # Reads are exact-deduplicated within a run at collection time, but the
     # same coordinates recur across runs (typically 40-80% of reads); sharing
@@ -565,54 +563,87 @@ def load_reads(
     # and hash.  Scoped per locus, so it is freed when the locus is done.
     region_cache: dict[tuple, GenomicRegion] = {}
     for run_id, blob in rows:
-        reads_df = database.decompress_blob(blob)
-
-        # Vectorized: pull columns into numpy arrays and locate per-read
-        # boundaries from is_first_iv, avoiding groupby / iterrows / per-row
-        # Series construction (the dominant cost of read loading).
-        is_first = reads_df["is_first_iv"].to_numpy()
-        starts = reads_df["start"].to_numpy()
-        ends = reads_df["end"].to_numpy()
-        uas = reads_df["untemplated_addition"].to_numpy()
-        uniques = reads_df["unique"].to_numpy()
-        counts = reads_df["count"].to_numpy()
-
-        boundaries = np.flatnonzero(is_first)
-        read_ends = np.append(boundaries[1:], len(is_first))
-        if drop_multimappers:
-            keep = uniques[boundaries].astype(bool)
-            boundaries = boundaries[keep]
-            read_ends = read_ends[keep]
-
-        rsas_run = []
-        for b, e in zip(boundaries.tolist(), read_ends.tolist()):
-            if e - b == 1:
-                sig = (int(starts[b]), int(ends[b]))
-            else:
-                sig = tuple(
-                    (int(starts[j]), int(ends[j])) for j in range(b, e)
-                )
-            gr = region_cache.get(sig)
-            if gr is None:
-                gr = GenomicRegion(
-                    [(int(starts[j]), int(ends[j])) for j in range(b, e)],
-                    chrom=chrom,
-                    strand=strand,
-                )
-                region_cache[sig] = gr
-            rsas_run.append(
-                RiboSeqAlignment(
-                    gr,
-                    untemplated_addition=bool(uas[b]),
-                    unique=bool(uniques[b]),
-                    read_count=int(counts[b]),
-                )
-            )
-        loc.rsas_dict[run_id] = rsas_run
-
-        loc.run_read_count[run_id] = int(
-            counts[boundaries].astype(np.int64).sum()
+        loc.rsas_dict[run_id], loc.run_read_count[run_id] = decode_reads_blob(
+            blob, loc.iv.chrom, loc.iv.strand, drop_multimappers, region_cache
         )
+
+
+def decode_reads_blob(
+    blob: bytes,
+    chrom: str,
+    strand: str,
+    drop_multimappers: bool = False,
+    region_cache: dict[tuple, GenomicRegion] | None = None,
+) -> tuple[list[RiboSeqAlignment], int]:
+    """The reads of one ``reads`` row, as stored by the collector.
+
+    The inverse of :func:`price2.data_collector._reads_frame`: the blob holds
+    one row per exonic interval with ``is_first_iv`` marking each read's
+    first interval.
+
+    Parameters
+    ----------
+    blob : bytes
+        The compressed ``reads_blob`` column.
+    chrom, strand : str
+        The locus the reads were fetched from.
+    drop_multimappers : bool, optional
+        Discard the reads that align to more than one genomic locus.
+    region_cache : dict, optional
+        Memo of :class:`GenomicRegion` objects by interval signature, shared
+        across the runs of a locus.
+
+    Returns
+    -------
+    reads : list[RiboSeqAlignment]
+        The (collapsed) reads with their counts.
+    read_count : int
+        Their summed counts.
+    """
+    if region_cache is None:
+        region_cache = {}
+    reads_df = database.decompress_blob(blob)
+
+    # Vectorized: pull columns into numpy arrays and locate per-read
+    # boundaries from is_first_iv, avoiding groupby / iterrows / per-row
+    # Series construction (the dominant cost of read loading).
+    is_first = reads_df["is_first_iv"].to_numpy()
+    starts = reads_df["start"].to_numpy()
+    ends = reads_df["end"].to_numpy()
+    uas = reads_df["untemplated_addition"].to_numpy()
+    uniques = reads_df["unique"].to_numpy()
+    counts = reads_df["count"].to_numpy()
+
+    boundaries = np.flatnonzero(is_first)
+    read_ends = np.append(boundaries[1:], len(is_first))
+    if drop_multimappers:
+        keep = uniques[boundaries].astype(bool)
+        boundaries = boundaries[keep]
+        read_ends = read_ends[keep]
+
+    reads = []
+    for b, e in zip(boundaries.tolist(), read_ends.tolist()):
+        if e - b == 1:
+            sig = (int(starts[b]), int(ends[b]))
+        else:
+            sig = tuple((int(starts[j]), int(ends[j])) for j in range(b, e))
+        gr = region_cache.get(sig)
+        if gr is None:
+            gr = GenomicRegion(
+                [(int(starts[j]), int(ends[j])) for j in range(b, e)],
+                chrom=chrom,
+                strand=strand,
+            )
+            region_cache[sig] = gr
+        reads.append(
+            RiboSeqAlignment(
+                gr,
+                untemplated_addition=bool(uas[b]),
+                unique=bool(uniques[b]),
+                read_count=int(counts[b]),
+            )
+        )
+    return reads, int(counts[boundaries].astype(np.int64).sum())
 
 
 def rgr_compatibility(
