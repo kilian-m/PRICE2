@@ -35,9 +35,12 @@ class RGRType(str, enum.Enum):
 class Transcript:
     """An annotated transcript built from a GTF feature.
 
-    Stores transcript metadata and accumulates exonic intervals, UTR
-    and CDS sub-regions, and associated :class:`ReadGeneratingRegion`
-    objects.
+    Stores transcript metadata, the exon and CDS regions collected from the
+    GTF features, and the associated :class:`ReadGeneratingRegion` objects.
+    The GTF parser adds the exon and CDS features one by one
+    (:meth:`add_exon`, :meth:`add_cds_region`) and then calls
+    :meth:`finalize`, which builds the two regions; :attr:`exons` and
+    :attr:`cds` are ``None`` until then.
 
     Attributes
     ----------
@@ -54,7 +57,10 @@ class Transcript:
     iv : HTSeq.GenomicInterval
         Genomic interval of the whole transcript locus.
     exons : GenomicRegion
-        Multi-exonic region built from individual exon features.
+        Multi-exonic region built from the exon features.
+    cds : GenomicRegion | None
+        The annotated CDS, or ``None`` when there is none (or its length
+        is not a multiple of three).
     exon_length : int
         Total spliced length (bp).
     coding_length : int
@@ -81,9 +87,8 @@ class Transcript:
         self.id: str = feature.attr["transcript_id"]
         self.gene_id: str = feature.attr["gene_id"]
         self.iv: HTSeq.GenomicInterval = feature.iv
-        self.exons: GenomicRegion = GenomicRegion(
-            [], chrom=feature.iv.chrom, strand=feature.iv.strand
-        )
+        self.exons: GenomicRegion | None = None
+        self.cds: GenomicRegion | None = None
         self.coding_length: int = 0
         self.exon_length: int = 0
         self.orf_set: set[ReadGeneratingRegion] = set()
@@ -93,6 +98,9 @@ class Transcript:
             feature.attr.get("transcript_type", "unknown"),
         )
         self.annotated_cds_iv: tuple[int, int] | None = None
+        # The GTF features, until ``finalize`` builds the regions.
+        self._exon_ivs: list[HTSeq.GenomicInterval] = []
+        self._cds_ivs: list[HTSeq.GenomicInterval] = []
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -109,51 +117,48 @@ class Transcript:
         return f"Transcript({self.id!r})"
 
     def add_exon(self, exon: HTSeq.features.GenomicFeature) -> None:
-        """Add an exon interval to this transcript.
+        """Add an exon feature to this transcript.
 
         Parameters
         ----------
         exon : HTSeq.features.GenomicFeature
             An exon-level GTF feature as parsed by HTSeq.
         """
-        self.exons.add_interval(exon.iv)
+        self._exon_ivs.append(exon.iv)
         self.exon_length += exon.iv.length
 
     def add_cds_region(self, region: HTSeq.features.GenomicFeature) -> None:
-        """Add a CDS sub-region to this transcript.
-
-        Accumulates intervals for ``CDS`` features.
+        """Add a CDS feature to this transcript.
 
         Parameters
         ----------
         region : HTSeq.features.GenomicFeature
-            A sub-transcript GTF feature (``CDS``) as parsed by HTSeq.
-            or ``three_prime_utr``) as parsed by HTSeq.
+            A ``CDS`` GTF feature as parsed by HTSeq.
         """
-
-        if not hasattr(self, "_cds"):
-            self._cds: GenomicRegion = GenomicRegion(
-                [], chrom=region.iv.chrom, strand=region.iv.strand
-            )
-        self._cds.add_interval(region.iv)
+        self._cds_ivs.append(region.iv)
         self.coding_length += region.iv.length
 
-    def cds_regions_to_cds_intervals(self) -> None:
-        """Compute annotated CDS position in transcript coordinates.
+    def finalize(self) -> None:
+        """Build :attr:`exons` and :attr:`cds` once every feature has been added.
 
-        Populates :attr:`annotated_cds_iv` with a ``(start, end)``
-        tuple in spliced transcript coordinates, or ``None`` if no CDS
-        has been added to this transcript.
+        The features are sorted into chromosome order (a ``-`` strand GTF
+        lists them in translation order).  A CDS whose length is not a
+        multiple of three is discarded as unannotated; otherwise
+        :attr:`annotated_cds_iv` receives its position in spliced transcript
+        coordinates.
         """
-        try:
-            if len(self._cds) % 3 != 0:
-                del self._cds
-                self.coding_length = 0
-                self.annotated_cds_iv = None
-            else:
-                self.annotated_cds_iv = self.exons.map_to_local(self._cds)
-        except AttributeError:
+        chrom, strand = self.iv.chrom, self.iv.strand
+        by_start = sorted(self._exon_ivs, key=lambda iv: iv.start)
+        self.exons = GenomicRegion(by_start, chrom=chrom, strand=strand)
+        if self._cds_ivs and self.coding_length % 3 == 0:
+            by_start = sorted(self._cds_ivs, key=lambda iv: iv.start)
+            self.cds = GenomicRegion(by_start, chrom=chrom, strand=strand)
+            self.annotated_cds_iv = self.exons.map_to_local(self.cds)
+        else:
+            self.cds = None
+            self.coding_length = 0
             self.annotated_cds_iv = None
+        del self._exon_ivs, self._cds_ivs
 
     def add_orf(self, orf: ReadGeneratingRegion) -> None:
         """Register an ORF-type RGR with this transcript.

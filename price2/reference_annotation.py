@@ -83,9 +83,9 @@ class ReferenceAnnotation:
                 self.transcripts[feature.attr["transcript_id"]].add_cds_region(feature)
 
         for transcript in self.transcripts.values():
-            transcript.cds_regions_to_cds_intervals()
-            if transcript.annotated_cds_iv is not None:
-                for interval in transcript._cds.intervals:
+            transcript.finalize()
+            if transcript.cds is not None:
+                for interval in transcript.cds.intervals:
                     self.cds_intervals[interval] += transcript
 
         logger.info("Loaded %d transcripts from %s", len(self.transcripts), gtf_path)

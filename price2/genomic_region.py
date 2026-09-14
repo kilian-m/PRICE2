@@ -28,7 +28,9 @@ class GenomicRegion:
     """A possibly multi-exonic genomic region on a single chromosome.
 
     Intervals are stored in chromosome order (ascending start position).
-    All coordinates are 0-based, half-open.
+    All coordinates are 0-based, half-open.  A region is immutable once
+    built: its intervals are a tuple and its hash is fixed at construction,
+    so it can serve as a dictionary key or set member from the start.
 
     Attributes
     ----------
@@ -36,7 +38,7 @@ class GenomicRegion:
         Chromosome / reference sequence name.
     strand : Strand
         ``'+'`` or ``'-'``.
-    intervals : list[GenomicInterval]
+    intervals : tuple[GenomicInterval, ...]
         Exonic intervals in chromosome order.
     length : int
         Total spliced length (sum of exon lengths).
@@ -44,12 +46,12 @@ class GenomicRegion:
 
     chrom: str
     strand: Strand
-    intervals: list[GenomicInterval]
+    intervals: tuple[GenomicInterval, ...]
     length: int
 
     def __init__(
         self,
-        intervals: list[GenomicInterval],
+        intervals: list[GenomicInterval] | tuple[GenomicInterval, ...],
         chrom: str | None = None,
         strand: Strand | None = None,
     ) -> None:
@@ -57,16 +59,21 @@ class GenomicRegion:
 
         Parameters
         ----------
-        intervals : list[GenomicInterval]
+        intervals : sequence of GenomicInterval
             Pre-built HTSeq ``GenomicInterval`` objects in chromosome order.
         chrom : str | None
             Chromosome name (inferred from *intervals* if omitted).
         strand : Strand | None
             Strand (inferred from *intervals* if omitted).
+
+        Raises
+        ------
+        ValueError
+            If the intervals overlap or are out of chromosome order.
         """
         self.chrom = chrom if chrom else intervals[0].chrom
         self.strand = strand if strand else intervals[0].strand
-        self.intervals = intervals
+        self.intervals = tuple(intervals)
 
         for i in range(1, len(self.intervals)):
             if self.intervals[i - 1].end > self.intervals[i].start:
@@ -75,7 +82,17 @@ class GenomicRegion:
                 )
 
         self.length = sum(iv.end - iv.start for iv in self.intervals)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
+        self.hash = hash((self.strand, self.chrom, self.intervals))
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore a pickle; regions pickled by earlier releases held a list.
+
+        The hash is recomputed rather than restored: it involves string
+        hashes, which differ between interpreter processes.
+        """
+        self.__dict__.update(state)
+        self.intervals = tuple(self.intervals)
+        self.hash = hash((self.strand, self.chrom, self.intervals))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, GenomicRegion):
@@ -87,7 +104,6 @@ class GenomicRegion:
         )
 
     def __hash__(self) -> int:
-        # NOTE: hash changes when intervals are added via add_interval.
         return self.hash
 
     def __str__(self) -> str:
@@ -98,34 +114,7 @@ class GenomicRegion:
         return str(self)
 
     def __len__(self) -> int:
-        if self.length == 0:
-            self.length = sum(iv.end - iv.start for iv in self.intervals)
         return self.length
-
-    def add_interval(self, interval: HTSeq.GenomicInterval) -> None:
-        """Add an exon interval and recompute the hash.
-
-        Intervals are kept in chromosome order: on the ``+`` strand exons
-        arrive in that order and are appended, on the ``-`` strand they
-        arrive in translation order and are prepended.
-
-        Parameters
-        ----------
-        interval : HTSeq.GenomicInterval
-            Interval to add.
-
-        Notes
-        -----
-        The region must not be used as a dictionary key or set member
-        before every interval has been added: the hash changes with each
-        call.
-        """
-        self.length += interval.end - interval.start
-        if self.strand == "+":
-            self.intervals.append(interval)
-        else:
-            self.intervals.insert(0, interval)
-        self.hash = hash((self.strand, self.chrom, tuple(self.intervals)))
 
     def map_to_local(self, other: GenomicRegion) -> tuple[int, int]:
         """Map *other* into the local spliced coordinate system of *self*.
