@@ -10,7 +10,6 @@ enrichment factors.
 
 from __future__ import annotations
 
-from typing import Optional
 
 import numpy as np
 import pysam
@@ -37,7 +36,7 @@ def _try_assign_p_site(
     aln: RiboSeqAlignment,
     ra: ReferenceAnnotation,
     cm: CleavageModel,
-) -> Optional[tuple[object, tuple[int, int], int]]:
+) -> tuple[object, tuple[int, int], int] | None:
     """Attempt to assign *aln* to a unique P-site on a coding transcript.
 
     Parameters
@@ -98,7 +97,7 @@ def build_histograms(
     ra: ReferenceAnnotation,
     bam: pysam.AlignmentFile,
     cm: CleavageModel,
-    region: Optional[tuple[str, int, int]] = None,
+    region: tuple[str, int, int] | None = None,
     end_to_end: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Accumulate P-site counts around the CDS start and stop codons.

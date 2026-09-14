@@ -6,7 +6,7 @@ evaluate the models, never import matplotlib.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 def plot_coverage(
     model: CoverageModel,
-    axes: Optional[tuple] = None,
+    axes: tuple | None = None,
 ) -> plt.Figure:
     """Plot the start- and stop-codon P-site histograms.
 
@@ -126,7 +126,7 @@ def _p_site_panel(
     )
 
 
-def plot_cleavage(model: CleavageModel, ax: Optional[plt.Axes] = None) -> None:
+def plot_cleavage(model: CleavageModel, ax: plt.Axes | None = None) -> None:
     """Plot the cleavage model.
 
     Shows left/right cleavage distributions as bar charts and
@@ -175,7 +175,7 @@ def plot_cleavage(model: CleavageModel, ax: Optional[plt.Axes] = None) -> None:
 
 
 def plot_cleavage_full(
-    model: CleavageModel, fig: Optional[plt.Figure] = None
+    model: CleavageModel, fig: plt.Figure | None = None
 ) -> plt.Figure:
     """Plot a 3-panel diagnostic figure for the cleavage model.
 

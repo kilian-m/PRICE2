@@ -14,6 +14,7 @@ import logging
 import multiprocessing as mp
 import os
 from collections import defaultdict
+from typing import NamedTuple
 
 import numpy as np
 
@@ -41,7 +42,31 @@ def _npy_row_count(path: str) -> int:
     return shape[0]
 
 
-def _load_run_spill(run_spill_dir: str) -> tuple:
+class RunSpill(NamedTuple):
+    """A run's spilled alignments as three flat columns (one row each)."""
+
+    #: Read (query name) hashes.
+    qh: np.ndarray
+    #: Locus indices into the spill's locus list.
+    li: np.ndarray
+    #: Slot group keys.
+    gk: np.ndarray
+
+
+class RunGroups(NamedTuple):
+    """A run's multimap groups (MMGs), in a CSR layout over their slots."""
+
+    #: Reads per MMG.
+    counts: np.ndarray
+    #: Slots per MMG (the CSR row lengths).
+    slot_k: np.ndarray
+    #: Locus index of every slot, MMG by MMG.
+    slot_li: np.ndarray
+    #: Group key of every slot, MMG by MMG.
+    slot_gk: np.ndarray
+
+
+def _load_run_spill(run_spill_dir: str) -> RunSpill:
     """Concatenate a run's spilled chunk arrays into three flat columns.
 
     Sizes are taken from the ``.npy`` headers so the destination can be
@@ -54,7 +79,7 @@ def _load_run_spill(run_spill_dir: str) -> tuple:
         f[:-6] for f in os.listdir(run_spill_dir) if f.endswith(".q.npy")
     )
     if not chunks:
-        return (
+        return RunSpill(
             np.empty(0, dtype=np.uint64),
             np.empty(0, dtype=np.uint32),
             np.empty(0, dtype=np.uint64),
@@ -77,10 +102,10 @@ def _load_run_spill(run_spill_dir: str) -> tuple:
         li[off:off + n] = np.load(l_path)
         gk[off:off + n] = np.load(g_path)
         off += n
-    return qh, li, gk
+    return RunSpill(qh, li, gk)
 
 
-def _index_run(run_spill_dir: str) -> tuple:
+def _index_run(run_spill_dir: str) -> RunGroups:
     """Collapse one run's spilled alignments into multimap groups.
 
     Fully vectorised: the per-read slot grouping and the collapse of
@@ -95,13 +120,10 @@ def _index_run(run_spill_dir: str) -> tuple:
 
     Returns
     -------
-    tuple
-        ``(counts, slot_k, slot_li, slot_gk)`` where ``counts[i]`` is the
-        number of reads in MMG ``i``, ``slot_k[i]`` its slot count, and
-        ``slot_li`` / ``slot_gk`` the concatenated per-MMG slots (a CSR
-        layout with row lengths ``slot_k``).
+    RunGroups
+        The run's MMGs with their slots.
     """
-    empty = (
+    empty = RunGroups(
         np.empty(0, np.int64), np.empty(0, np.int64),
         np.empty(0, np.uint32), np.empty(0, np.uint64),
     )
@@ -192,7 +214,7 @@ def _index_run(run_spill_dir: str) -> tuple:
         g_li.append(uniq[:, 0::2].reshape(-1).astype(np.uint32))
         g_gk.append(uniq[:, 1::2].reshape(-1))
 
-    return (
+    return RunGroups(
         np.concatenate(g_counts),
         np.concatenate(g_k),
         np.concatenate(g_li),

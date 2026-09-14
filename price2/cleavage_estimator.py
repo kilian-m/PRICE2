@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Iterable
-from typing import Optional
 
 import numpy as np
 import pysam
@@ -40,7 +39,7 @@ def project_onto_cds(
     transcripts: Iterable[Transcript],
     min_dist_to_start: int,
     min_dist_to_end: int,
-) -> tuple[Optional[int], Optional[int], bool]:
+) -> tuple[int | None, int | None, bool]:
     """Where a read sits in the CDS of the coding transcripts it fits into.
 
     Parameters
@@ -373,7 +372,7 @@ class CleavageEstimator:
 
     def _onset_offset(
         self,
-        frame: Optional[int] = None,
+        frame: int | None = None,
         min_offset: int = 6,
         max_offset: int = 25,
         default: int = 12,

@@ -6,9 +6,10 @@ coverage.  The resulting scale factors are used to weight the expected
 coverage profile when deconvolving overlapping ORFs.
 """
 
+from __future__ import annotations
+
 import importlib
 import logging
-from typing import Optional
 
 import numpy as np
 from scipy.stats import trim_mean
@@ -83,8 +84,8 @@ class CoverageModel:
         self,
         start_factor: float,
         stop_factor: float,
-        start_hist: Optional[np.ndarray] = None,
-        stop_hist: Optional[np.ndarray] = None,
+        start_hist: np.ndarray | None = None,
+        stop_hist: np.ndarray | None = None,
     ) -> None:
         self.start_factor = start_factor
         self.stop_factor = stop_factor
@@ -161,7 +162,7 @@ class CoverageModel:
         self,
         dataset_id: str,
         tsv_fh,
-        npz_data: Optional[dict[str, np.ndarray]] = None,
+        npz_data: dict[str, np.ndarray] | None = None,
     ) -> None:
         """Write the model to open file handles.
 
@@ -188,7 +189,7 @@ class CoverageModel:
 
     @classmethod
     def from_files(
-        cls, tsv_path: str, npz_path: Optional[str] = None
+        cls, tsv_path: str, npz_path: str | None = None
     ) -> "dict[str, CoverageModel]":
         """Load models from a TSV file and optionally an NPZ file.
 
@@ -284,7 +285,7 @@ class CoverageModel:
             and self.stop_hist[STOP_BODY_SLICE].sum() >= MIN_READS
         )
 
-    def plot(self, axes: Optional[tuple] = None):
+    def plot(self, axes: tuple | None = None):
         """Plot the start- and stop-codon P-site histograms.
 
         See :func:`price2.plotting.plot_coverage`.

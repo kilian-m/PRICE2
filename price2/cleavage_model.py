@@ -39,9 +39,10 @@ start: index ``DIST_STARTS_CENTRE + d`` counts the read starts ``d`` nt
 downstream of the CDS start (``d < 0`` upstream), ``|d| < DIST_STARTS_CENTRE``.
 """
 
+from __future__ import annotations
+
 import importlib
 import logging
-from typing import Optional
 
 import numpy as np
 from numba import njit
@@ -125,8 +126,8 @@ class CleavageModel:
         pl: np.ndarray,
         pr: np.ndarray,
         pu: float,
-        dist_starts: Optional[np.ndarray] = None,
-        table: Optional[np.ndarray] = None,
+        dist_starts: np.ndarray | None = None,
+        table: np.ndarray | None = None,
     ) -> None:
         self.pl = pl
         self.pr = pr
@@ -174,7 +175,7 @@ class CleavageModel:
         self,
         length: int,
         oua: bool,
-        frame: Optional[int] = None,
+        frame: int | None = None,
         region_start: int = 0,
         region_end: int = UNBOUNDED,
     ) -> float:
@@ -264,7 +265,7 @@ class CleavageModel:
 
     def _dist_to_orf_bound(
         self, end: bool, overlap_likelihood_ratio_thresh: float = 0.2
-    ) -> dict[tuple[int, bool, Optional[int]], int]:
+    ) -> dict[tuple[int, bool, int | None], int]:
         """Distances from the read start to the ORF start or end (*Conventions*).
 
         For every ``(read_length, oua, frame)`` with a non-zero unbounded
@@ -281,7 +282,7 @@ class CleavageModel:
             ``(read_length, oua, frame) -> -offset``; a combination without
             any qualifying offset is absent.
         """
-        dist: dict[tuple[int, bool, Optional[int]], int] = {}
+        dist: dict[tuple[int, bool, int | None], int] = {}
         for read_length in self.non_zero_lengths:
             for oua in (True, False):
                 for frame in (None, 0, 1, 2):
@@ -307,14 +308,14 @@ class CleavageModel:
         return dist
 
     def get_dist_to_orf_start(
-        self, read_length: int, oua: bool, frame: Optional[int]
+        self, read_length: int, oua: bool, frame: int | None
     ) -> int:
         """Offset (``<= 0``) of the most upstream plausible read start relative
         to an ORF start; ``KeyError`` when none exists (*Conventions*)."""
         return self.dist_to_orf_start[(read_length, oua, frame)]
 
     def get_dist_to_orf_end(
-        self, read_length: int, oua: bool, frame: Optional[int]
+        self, read_length: int, oua: bool, frame: int | None
     ) -> int:
         """Offset (``<= 0``) of the most downstream plausible read start
         relative to the start of an ORF's last base (noise) or last codon (in
@@ -323,7 +324,7 @@ class CleavageModel:
 
     def p_site_codon(
         self, length: int, frame: int, untemplated_addition: bool
-    ) -> Optional[int]:
+    ) -> int | None:
         """Index of the codon a read of this shape places its P-site on.
 
         The per-codon likelihood vector of a read depends only on its
@@ -430,7 +431,7 @@ class CleavageModel:
         self,
         dataset_id: str,
         tsv_fh,
-        npz_data: Optional[dict[str, np.ndarray]] = None,
+        npz_data: dict[str, np.ndarray] | None = None,
     ) -> None:
         """Write the model to open file handles.
 
@@ -459,7 +460,7 @@ class CleavageModel:
 
     @classmethod
     def from_files(
-        cls, tsv_path: str, npz_path: Optional[str] = None
+        cls, tsv_path: str, npz_path: str | None = None
     ) -> "dict[str, CleavageModel]":
         """Load models from a TSV file and optionally an NPZ file.
 
