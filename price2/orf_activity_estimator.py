@@ -517,19 +517,22 @@ class ORFActivityEstimator:
         layout = self.config.layout
         os.makedirs(layout.regions_activities_dir, exist_ok=True)
 
-        loci_ids = set(self.loci_ids)
+        # Dispatched in database order, so the fan-out (and with it the
+        # performance log and the first locus to time out) is the same from
+        # run to run.
+        excluded: set[str] = set()
         if loci_subset is not None:
-            loci_ids &= loci_subset
+            excluded |= set(self.loci_ids) - loci_subset
         # Resume-skip bookkeeping only applies to full passes; light EM
         # passes intentionally re-run every locus each iteration.
         if em_final:
-            loci_ids -= set(
+            excluded |= set(
                 run_state.read_progress(self.db_path, run_state.DECONVOLUTION_STAGE)
             )
+        loci_ids = [locus_id for locus_id in self.loci_ids if locus_id not in excluded]
 
         price2_logger = logging.getLogger("price2")
-        log_level = logging.getLevelName(self.config.log_level)
-        pbar = tqdm(total=len(loci_ids), disable=log_level > logging.INFO)
+        pbar = tqdm(total=len(loci_ids), disable=not logger.isEnabledFor(logging.INFO))
         writer = export.OutputWriter(layout.regions_activities_dir)
         progress = run_state.ProgressRecorder(
             self.db_path, run_state.DECONVOLUTION_STAGE
@@ -547,7 +550,15 @@ class ORFActivityEstimator:
                 locus_id = futures[future]
                 try:
                     result = future.result()
-                except (TimeoutError, Exception) as exc:
+                except TimeoutError:
+                    reason = (
+                        f"abandoned after {self.locus_timeout} s "
+                        f"(config.timeout = {self.config.timeout} s per run)"
+                    )
+                    logger.error("locus %s %s", locus_id, reason)
+                    with open(layout.failed_loci_path, "a") as fh:
+                        fh.write(f"{locus_id}\n{reason}\n\n")
+                except Exception as exc:
                     logger.error("locus %s failed: %s", locus_id, exc)
                     with open(layout.failed_loci_path, "a") as fh:
                         fh.write(f"{locus_id}\n{exc}\n{traceback.format_exc()}\n\n")
