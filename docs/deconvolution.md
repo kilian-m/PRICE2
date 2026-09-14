@@ -7,7 +7,7 @@ All node labels name the function that implements the step.
 
 ## 1. Whole run — the EM outer loop
 
-`price.py :: run_pipeline` / `_run_em_deconvolution`
+`price.py :: run_pipeline` / `orf_activity_estimator.py :: ORFActivityEstimator.run_multimap_em`
 
 ```mermaid
 flowchart TD

@@ -14,11 +14,9 @@ import logging
 import os
 import shutil
 import sys
-from dataclasses import dataclass
 
 from pyfaidx import Fasta
 
-from price2 import database
 from price2 import multimap
 from price2 import run_state
 from price2.config import Config
@@ -242,21 +240,7 @@ def run_pipeline(config: Config) -> None:
         run_stages(_collection_stages(config))
         run_state.write_state(db_path, collection_complete="1")
 
-    estimator = ORFActivityEstimator(config)
-    logger.info(
-        "run ORF deconvolution for %d loci in %d process(es)...",
-        len(estimator.loci_ids),
-        config.processes,
-    )
-    if config.multimap_em:
-        _run_em_deconvolution(config, estimator, resume=plan.reuse_deconvolution)
-    else:
-        run_stage("ORF deconvolution", estimator.run_orf_deconvolution)
-
-    run_stage(
-        "generate TPM output",
-        lambda: generate_tpm_output(config.o_dir, export_tsv=config.export_tsv),
-    )
+    run_stages(_deconvolution_stages(config, plan))
 
 
 class _Collection:
@@ -327,165 +311,30 @@ def _collection_stages(config: Config) -> list[Stage]:
     ]
 
 
-@dataclass(frozen=True)
-class EmCheckpoint:
-    """Where an interrupted multimapping EM continues.
-
-    Parameters
-    ----------
-    start_iteration : int
-        The iteration to run next.
-    finished : set[str]
-        Loci whose light M-step of that iteration already completed.
-    final_only : bool
-        The loop had already converged; only the final full pass is left.
-    """
-
-    start_iteration: int
-    finished: set[str]
-    final_only: bool
-
-
-def _em_checkpoint(db_path: str, resume: bool) -> EmCheckpoint:
-    """Read the EM checkpoint, or reset the EM state for a fresh loop."""
-    point = multimap.em_resume_point(db_path) if resume else None
-    if point is None:
-        # Clear any per-iteration state from a previous run so a warm re-run
-        # cannot consume stale λ / weights / activities.
-        multimap.reset_em_state(db_path)
-        run_state.write_state(db_path, em_final_iteration="")
-        return EmCheckpoint(0, set(), False)
-    start_iteration, finished = point
-    # The loop has already ended if its last run recorded the iteration the
-    # final pass consumes and the checkpoint still sits there.
-    stored_final = run_state.read_state(db_path).get("em_final_iteration")
-    return EmCheckpoint(start_iteration, finished, stored_final == str(start_iteration))
-
-
-def _run_em_deconvolution(
-    config: Config,
-    estimator: ORFActivityEstimator,
-    resume: bool = False,
-) -> None:
-    """Drive the multimapping-EM outer loop around the per-locus fan-out.
-
-    Each iteration runs a light M-step fan-out (one interleaved Huber
-    reweight per locus, warm-started, writing activities and per-slot λ),
-    then a single global E-step that re-normalises each multimapping
-    read's fractional weight across its loci.  The loop stops when the
-    E-step's weight change falls below ``config.em_tol`` or after
-    ``config.em_max_iter`` iterations, followed by one final full M-step
-    (filtering + activity estimation + export) using the converged
-    weights.
-
-    Parameters
-    ----------
-    config : Config
-        Fully populated configuration object.
-    estimator : ORFActivityEstimator
-        Estimator bound to the run's database.
-    resume : bool, optional
-        Continue an interrupted EM from its last checkpoint instead of
-        restarting it (see :func:`price2.multimap.em_resume_point`).  The
-        caller sets this from the run's :class:`~price2.run_state.ResumePlan`.
-    """
-    db_path = config.layout.db_path
-
-    if not multimap.has_multimap_index(db_path):
-        logger.warning(
-            "multimap_em is enabled but no populated linkage index was "
-            "found in %s. Either no read maps to >=2 in-locus slots, or "
-            "price.db was collected with multimap_em disabled -- in which "
-            "case its multimapping reads were discarded as well, and only a "
-            "cold re-collection with multimap_em=true can restore them. "
-            "Running a single classic pass instead.",
-            db_path,
-        )
-        run_stage("ORF deconvolution", estimator.run_orf_deconvolution)
-        return
-
-    database.enable_wal(db_path)
-    # Fails here, with the reason, rather than in the E-step after a fan-out.
-    multimap.load_linkage(db_path)
-    checkpoint = _em_checkpoint(db_path, resume)
-    # Loci with no multimap slots do not change across EM iterations, so the
-    # light passes only need to touch the loci that carry slots.
-    slot_loci = multimap.slot_locus_ids(db_path)
-    if checkpoint.final_only:
-        logger.info(
-            "EM already converged; resuming at the final full M-step "
-            "(iteration %d).",
-            checkpoint.start_iteration,
-        )
-    elif resume and (checkpoint.start_iteration or checkpoint.finished):
-        logger.info(
-            "resuming the multimapping EM at iteration %d (%d of %d slot "
-            "loci already done).",
-            checkpoint.start_iteration,
-            len(checkpoint.finished & slot_loci),
-            len(slot_loci),
-        )
-
-    # One broker pool and one worker pool for the whole EM: every M-step
-    # would otherwise rebuild them, paying a CUDA context per broker process
-    # and a fresh pool + manager per iteration.
-    with estimator.gpu_broker_pool(), estimator.worker_pool():
-        final_iteration = checkpoint.start_iteration
-        if not checkpoint.final_only:
-            final_iteration = _em_loop(
-                config, estimator, db_path, checkpoint, slot_loci
-            )
-            # From here a resume can skip straight to the final pass.
-            run_state.write_state(db_path, em_final_iteration=str(final_iteration))
-        run_stage(
-            "EM final full M-step",
-            lambda: estimator.run_orf_deconvolution(
-                em_iteration=final_iteration, em_final=True
-            ),
-        )
-
-
-def _em_loop(
-    config: Config,
-    estimator: ORFActivityEstimator,
-    db_path: str,
-    checkpoint: EmCheckpoint,
-    slot_loci: set[str],
-) -> int:
-    """Alternate light M-steps and E-steps; return the final pass's iteration."""
-    finished = checkpoint.finished
-    last_iteration = checkpoint.start_iteration
-    for iteration in range(checkpoint.start_iteration, config.em_max_iter):
-        last_iteration = iteration
-        # Only the resumed iteration has loci already behind it; every later
-        # one starts empty.
-        subset = slot_loci - finished
-        finished = set()
-        if subset:
-            run_stage(
-                f"EM iteration {iteration} light M-step",
-                lambda: estimator.run_orf_deconvolution(
-                    em_iteration=iteration, em_final=False, loci_subset=subset
-                ),
-            )
-        else:
-            logger.info(
-                "EM iteration %d light M-step was already complete.", iteration
-            )
-        delta = multimap.e_step(db_path, iteration=iteration)
-        logger.info(
-            "EM iteration %d: read mass reassigned (L1 fraction) = %.3e",
-            iteration,
-            delta,
-        )
-        if delta < config.em_tol:
-            logger.info(
-                "EM converged after %d iteration(s) (tol=%.1e).",
-                iteration + 1,
-                config.em_tol,
-            )
-            break
-    return last_iteration + 1
+def _deconvolution_stages(config: Config, plan: run_state.ResumePlan) -> list[Stage]:
+    """The stages that turn ``price.db`` into the output tables, in order."""
+    estimator = ORFActivityEstimator(config)
+    logger.info(
+        "run ORF deconvolution for %d loci in %d process(es)...",
+        len(estimator.loci_ids),
+        config.processes,
+    )
+    return [
+        Stage(
+            "ORF deconvolution with the multimapping EM",
+            lambda: estimator.run_multimap_em(resume=plan.reuse_deconvolution),
+            enabled=config.multimap_em,
+        ),
+        Stage(
+            "ORF deconvolution",
+            estimator.run_orf_deconvolution,
+            enabled=not config.multimap_em,
+        ),
+        Stage(
+            "generate TPM output",
+            lambda: generate_tpm_output(config.o_dir, export_tsv=config.export_tsv),
+        ),
+    ]
 
 
 def main(argv: list[str] | None = None) -> None:
