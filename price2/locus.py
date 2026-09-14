@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import logging
 import time
+from dataclasses import dataclass
 
 import HTSeq
 import numpy as np
@@ -43,6 +44,35 @@ _distribution_theta = distribution_theta
 poisson_nll_grad = likelihood.poisson_nll_grad
 weighted_poisson_nll_grad = likelihood.weighted_poisson_nll_grad
 weighted_poisson_nll_grad_lasso = likelihood.weighted_poisson_nll_grad_lasso
+
+
+@dataclass(frozen=True)
+class SparseSystem:
+    """The linear system of one locus, as the solvers take it.
+
+    Parameters
+    ----------
+    X : csr_matrix
+        Design matrix, rows ``(EG, run)``, columns ``(RGR, run)``; the
+        column blocks are in ``rgr.index`` order.
+    y : np.ndarray
+        Read counts per row, under the current read weights.
+    num_rgrs, num_runs : int
+        The group layout of the activities.
+    rgr_lengths : np.ndarray
+        Length of every RGR, by ``rgr.index``.
+    initial_guess : np.ndarray
+        Starting activities, flattened ``(num_rgrs, num_runs)``: the last
+        result when there is one (a warm start), else all ones.
+    """
+
+    X: csr_matrix
+    y: np.ndarray
+    num_rgrs: int
+    num_runs: int
+    rgr_lengths: np.ndarray
+    initial_guess: np.ndarray
+
 
 class Locus:
     """A genomic locus containing overlapping transcripts and ORF candidates.
@@ -582,44 +612,33 @@ class Locus:
 
         return {k for k, v in rgr_indices.items() if v not in all_kept}
 
-    def to_sparse_args(
-        self,
-        runs: list[RiboSeqRun],
-    ) -> dict:
-        """Build argument dictionary for the sparse-matrix objective functions.
+    def sparse_system(self, runs: list[RiboSeqRun]) -> SparseSystem:
+        """The design matrix, response and starting point of the next solve.
 
-        Assembles the CSR design matrix and the response from the read
-        routing, plus the initial-guess vector.
+        Built from the read routing under the current read weights and the
+        runs' model tables.
 
         Parameters
         ----------
         runs : list[RiboSeqRun]
-            Ribo-seq runs to include.
-
-        Returns
-        -------
-        dict
-            Keys: ``X``, ``y``, ``num_rgrs``, ``rgr_lengths``, ``num_runs``,
-            ``initial_guess``.
+            Ribo-seq runs to include, in the column order of ``result``.
         """
         num_runs = len(runs)
         routing = self.routing
-        # ``rgr_lengths`` is aligned with ``rgr.index`` (the design-matrix
-        # column blocks and the rows of ``result``).
         num_rgrs = routing.num_rgrs
         if self.result is not None:
             initial_guess = self.result
         else:
             initial_guess = np.ones((num_rgrs, num_runs))
         cm_lut, coverage_params = read_routing.model_tables(runs)
-        return {
-            "X": routing.design_matrix(cm_lut, coverage_params, num_runs),
-            "y": self.eg_read_counts,
-            "num_rgrs": num_rgrs,
-            "rgr_lengths": routing.rgr_lengths,
-            "num_runs": num_runs,
-            "initial_guess": initial_guess.flatten(),
-        }
+        return SparseSystem(
+            X=routing.design_matrix(cm_lut, coverage_params, num_runs),
+            y=self.eg_read_counts,
+            num_rgrs=num_rgrs,
+            num_runs=num_runs,
+            rgr_lengths=routing.rgr_lengths,
+            initial_guess=initial_guess.flatten(),
+        )
 
     def deconvolve(
         self,
@@ -639,7 +658,7 @@ class Locus:
         ``config.irls_huber_tol``.
 
         Warm-starts from ``self.result`` when present (via
-        :meth:`to_sparse_args`); with no prior result the initial guess is
+        :meth:`sparse_system`); with no prior result the initial guess is
         all ones, identical to a cold start.
 
         Parameters
@@ -669,23 +688,18 @@ class Locus:
         """
         # ── Build sparse system ──────────────────────────────────────────
         s1 = time.time()
-        args_dict = self.to_sparse_args(runs)
-        X = args_dict["X"]
-        y = args_dict["y"]
-        num_rgrs = args_dict["num_rgrs"]
-        num_runs = args_dict["num_runs"]
-        rgr_lengths = args_dict["rgr_lengths"]
+        system = self.sparse_system(runs)
         data_time = time.time() - s1
 
         # ── Solve ────────────────────────────────────────────────────────
         s1 = time.time()
         fit = solver.irls_huber(
-            X,
-            y,
-            args_dict["initial_guess"],
+            system.X,
+            system.y,
+            system.initial_guess,
             config,
-            num_rgrs,
-            num_runs,
+            system.num_rgrs,
+            system.num_runs,
             max_outer=max_outer,
         )
         opt_time = time.time() - s1
@@ -697,7 +711,7 @@ class Locus:
         )
 
         # ── Store result ─────────────────────────────────────────────────
-        result_matrix = fit.w.reshape(num_rgrs, num_runs)
+        result_matrix = fit.w.reshape(system.num_rgrs, system.num_runs)
         result_matrix[result_matrix <= config.pseudo_min] = 0
         self.result = result_matrix
 
@@ -705,7 +719,7 @@ class Locus:
         if prune:
             x = self.result
             x_t = x.T
-            canonical_indices = (rgr_lengths * x_t).argmax(axis=1)
+            canonical_indices = (system.rgr_lengths * x_t).argmax(axis=1)
             min_activities = np.maximum(
                 x_t[np.arange(x_t.shape[0]), canonical_indices]
                 * config.min_activity_fraction,
@@ -909,12 +923,10 @@ class Locus:
         """
 
         theta = distribution_theta(config)
-        sparse_args = self.to_sparse_args(runs)
-        X_lr = sparse_args["X"]
-        y_lr = sparse_args["y"]
-        num_rgrs = sparse_args["num_rgrs"]
-        num_runs = sparse_args["num_runs"]
-        initial_guess = sparse_args["initial_guess"]
+        system = self.sparse_system(runs)
+        X_lr, y_lr = system.X, system.y
+        num_rgrs, num_runs = system.num_rgrs, system.num_runs
+        initial_guess = system.initial_guess
         # Transposed once for the many MU solves below.
         XT_lr = X_lr.T.tocsr() if config.inner_solver == "mu" else None
 
@@ -1038,21 +1050,16 @@ class Locus:
         theta = distribution_theta(config)
         rgrs_removed = True
         while rgrs_removed:
-            args_dict = self.to_sparse_args(runs)
-            X_ea = args_dict["X"]
-            y_ea = args_dict["y"]
-            num_runs = args_dict["num_runs"]
-            num_rgrs = args_dict["num_rgrs"]
-            initial_guess = args_dict["initial_guess"]
+            system = self.sparse_system(runs)
 
             w = solver.solve(
-                X_ea,
-                y_ea,
-                initial_guess,
+                system.X,
+                system.y,
+                system.initial_guess,
                 solver.SolveSpec(theta=theta, strict=True),
                 config,
             )
-            tmp = w.copy().reshape(num_rgrs, num_runs)
+            tmp = w.copy().reshape(system.num_rgrs, system.num_runs)
             tmp[tmp <= config.pseudo_min] = 0
             self.result = tmp
 

@@ -803,8 +803,17 @@ def assign_reads_to_egs(
     )
 
 
+#: The tables of the runs last passed to :func:`model_tables`, kept while the
+#: caller keeps passing the same run objects (a worker holds one list of runs
+#: for every locus it handles, so the tables are built once per worker).
+_MODEL_TABLES: tuple[tuple[RiboSeqRun, ...], tuple[np.ndarray, np.ndarray]] | None = None
+
+
 def model_tables(runs: list[RiboSeqRun]) -> tuple[np.ndarray, np.ndarray]:
     """The per-run cleavage and coverage look-up tables of the design matrix.
+
+    Memoised for the run objects of the previous call; the tables must not
+    be modified by the caller.
 
     Returns
     -------
@@ -814,6 +823,19 @@ def model_tables(runs: list[RiboSeqRun]) -> tuple[np.ndarray, np.ndarray]:
     coverage_params : numpy.ndarray, shape ``(num_runs, 3)``
         The start, middle (``1``) and stop coverage factors.
     """
+    global _MODEL_TABLES
+    if _MODEL_TABLES is not None:
+        cached_runs, tables = _MODEL_TABLES
+        if len(cached_runs) == len(runs) and all(
+            a is b for a, b in zip(cached_runs, runs)
+        ):
+            return tables
+    tables = _build_model_tables(runs)
+    _MODEL_TABLES = (tuple(runs), tables)
+    return tables
+
+
+def _build_model_tables(runs: list[RiboSeqRun]) -> tuple[np.ndarray, np.ndarray]:
     num_runs = len(runs)
     cm_lut = np.zeros((num_runs, runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
     coverage_params = np.zeros((num_runs, 3))

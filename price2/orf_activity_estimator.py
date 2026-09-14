@@ -72,11 +72,16 @@ class WorkerContext:
         The run's files.
     genome : pyfaidx.Fasta
         The reference genome, opened once per worker.
+    runs : list[RiboSeqRun]
+        The Ribo-seq runs with their models, loaded once per worker (they
+        do not change during the deconvolution, and their model tables are
+        memoised on the objects' identity).
     """
 
     config: Config
     layout: RunLayout
     genome: Fasta
+    runs: list[RiboSeqRun]
 
 
 _CONTEXT: WorkerContext | None = None
@@ -101,7 +106,10 @@ def init_worker(config: Config, log_queue) -> None:
         worker_logger.addHandler(logging.handlers.QueueHandler(log_queue))
         worker_logger.setLevel(config.log_level)
         worker_logger.propagate = False
-    _CONTEXT = WorkerContext(config, config.layout, Fasta(config.fasta_path))
+    layout = config.layout
+    _CONTEXT = WorkerContext(
+        config, layout, Fasta(config.fasta_path), _load_runs(layout.db_path)
+    )
 
 
 def _context() -> WorkerContext:
@@ -594,8 +602,8 @@ def process_loc(job: LocusJob) -> LocusResult | None:
     outputs: dict[str, OutputText] = {}
     t_start = time.time()
 
+    runs = ctx.runs
     with perf.timed("db_time"):
-        runs = _load_runs(layout.db_path)
         loc, prepared = _load_locus(job, ctx, perf)
     if not prepared and not _prepare_locus(job, ctx, loc, runs, perf, outputs):
         # No transcript survived: nothing to solve, nothing to write.
