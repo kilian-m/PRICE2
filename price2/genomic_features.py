@@ -68,8 +68,6 @@ class Transcript:
     annotated_cds_iv : tuple[int, int] | None
         Start and end of the annotated CDS in transcript
         (spliced) coordinates, or ``None`` if no CDS is annotated.
-    orf_set : set[ReadGeneratingRegion]
-        ORF-type RGRs associated with this transcript.
     rgr_set : set[ReadGeneratingRegion]
         All RGRs (ORFs and NOISE) associated with this transcript.
     """
@@ -91,7 +89,6 @@ class Transcript:
         self.cds: GenomicRegion | None = None
         self.coding_length: int = 0
         self.exon_length: int = 0
-        self.orf_set: set[ReadGeneratingRegion] = set()
         self.rgr_set: set[ReadGeneratingRegion] = set()
         self.biotype: str = feature.attr.get(
             "transcript_biotype",
@@ -115,6 +112,16 @@ class Transcript:
 
     def __repr__(self) -> str:
         return f"Transcript({self.id!r})"
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore a pickle; earlier releases stored the ORFs as a second set."""
+        state.pop("orf_set", None)
+        self.__dict__.update(state)
+
+    @property
+    def orf_set(self) -> set[ReadGeneratingRegion]:
+        """The ORF-type RGRs among :attr:`rgr_set`."""
+        return {rgr for rgr in self.rgr_set if rgr.is_orf}
 
     def add_exon(self, exon: HTSeq.features.GenomicFeature) -> None:
         """Add an exon feature to this transcript.
@@ -168,18 +175,16 @@ class Transcript:
         orf : ReadGeneratingRegion
             The ORF to associate with this transcript.
         """
-        self.orf_set.add(orf)
         self.rgr_set.add(orf)
 
     def update_with_filtered_orfs(self, rgr_set: set[ReadGeneratingRegion]) -> None:
-        """Restrict :attr:`orf_set` and :attr:`rgr_set` to the survivors of a filter.
+        """Restrict :attr:`rgr_set` to the survivors of a filter.
 
         Parameters
         ----------
         rgr_set : set[ReadGeneratingRegion]
             The surviving RGRs after a filtering step.
         """
-        self.orf_set = self.orf_set & rgr_set
         self.rgr_set = self.rgr_set & rgr_set
 
 

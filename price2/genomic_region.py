@@ -298,11 +298,7 @@ class GenomicRegion:
             if cumulative >= end:
                 break
 
-        return GenomicRegion(
-            [Interval(rs, re) for rs, re in result_ivs if rs != re],
-            chrom=self.chrom,
-            strand=self.strand,
-        )
+        return GenomicRegion(result_ivs, chrom=self.chrom, strand=self.strand)
 
     def get_sequence(self, genome: Fasta) -> str:
         """Extract the nucleotide sequence for this region.
@@ -321,21 +317,30 @@ class GenomicRegion:
             Spliced nucleotide sequence.
         """
         chrom = genome[self.chrom]
-        parts: list[str] = []
         if self.strand == "+":
-            for iv in self.intervals:
-                parts.append(str(chrom[iv.start : iv.end]))
-        elif self.strand == "-":
-            for iv in self.intervals[::-1]:
-                parts.append(str(-chrom[iv.start : iv.end]))
+            parts = [str(chrom[iv.start : iv.end]) for iv in self.intervals]
+        else:
+            parts = [str(-chrom[iv.start : iv.end]) for iv in self.intervals[::-1]]
         return "".join(parts)
+
+    def _from_stop(self) -> list[tuple[int, int]]:
+        """The intervals from the 3' end backwards, as if on the ``+`` strand.
+
+        Negating the coordinates of a ``-`` strand region turns it into a
+        ``+`` strand region read in the opposite direction, so the strand
+        cases of :meth:`contains_to_stop` collapse into one.
+        """
+        if self.strand == "+":
+            return [(iv.start, iv.end) for iv in self.intervals[::-1]]
+        return [(-iv.end, -iv.start) for iv in self.intervals]
 
     def contains_to_stop(self, other: GenomicRegion) -> bool:
         """Check whether *other* is contained in *self* sharing the same stop end.
 
-        The two regions must share the same 3'-most exon
-        boundaries; *other* may start later (for ``+``) or
-        earlier (for ``-``) than *self*.
+        Seen from the 3' end, every interval of *other* but its 5'-most one
+        has to be an interval of *self*, and that 5'-most one has to be the
+        3' part of its partner: *other* may start later than *self* but
+        must otherwise follow its splicing.
 
         Parameters
         ----------
@@ -353,24 +358,12 @@ class GenomicRegion:
         if len(self.intervals) < len(other.intervals):
             return False
 
-        if self.strand == "+":
-            s_ivs = self.intervals[::-1]
-            o_ivs = other.intervals[::-1]
-        else:
-            s_ivs = self.intervals
-            o_ivs = other.intervals
-
-        for i in range(len(o_ivs)):
-            s_iv = s_ivs[i]
-            o_iv = o_ivs[i]
+        o_ivs = other._from_stop()
+        for i, (s_iv, o_iv) in enumerate(zip(self._from_stop(), o_ivs)):
             if s_iv == o_iv:
                 continue
             if i + 1 < len(o_ivs):
                 return False
-            if self.strand == "-":
-                if s_iv.start != o_iv.start or s_iv.end < o_iv.end:
-                    return False
-            else:
-                if s_iv.end != o_iv.end or s_iv.start > o_iv.start:
-                    return False
+            if s_iv[1] != o_iv[1] or s_iv[0] > o_iv[0]:
+                return False
         return True

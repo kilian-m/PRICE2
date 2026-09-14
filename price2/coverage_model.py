@@ -89,10 +89,14 @@ class CoverageModel:
     ) -> None:
         self.start_factor = start_factor
         self.stop_factor = stop_factor
-        if start_hist is not None:
-            self.start_hist = start_hist
-        if stop_hist is not None:
-            self.stop_hist = stop_hist
+        self.start_hist = start_hist
+        self.stop_hist = stop_hist
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore a pickle; earlier releases left absent histograms unset."""
+        self.start_hist = None
+        self.stop_hist = None
+        self.__dict__.update(state)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -182,9 +186,9 @@ class CoverageModel:
         tsv_fh.write(f"{dataset_id}\t{self.start_factor:.6g}\t{self.stop_factor:.6g}\n")
 
         if npz_data is not None:
-            if hasattr(self, "start_hist"):
+            if self.start_hist is not None:
                 npz_data[f"{dataset_id}_start_hist"] = self.start_hist
-            if hasattr(self, "stop_hist"):
+            if self.stop_hist is not None:
                 npz_data[f"{dataset_id}_stop_hist"] = self.stop_hist
 
     @classmethod
@@ -277,7 +281,14 @@ class CoverageModel:
 
         Requires at least :data:`MIN_READS` P-sites on the start codon, on
         the stop peak, and over each ORF body.
+
+        Raises
+        ------
+        ValueError
+            For a model without histograms (loaded from the TSV alone).
         """
+        if self.start_hist is None or self.stop_hist is None:
+            raise ValueError("a coverage model without histograms cannot be judged")
         return bool(
             self.start_hist[START_CODON_IDX] >= MIN_READS
             and self.start_hist[START_BODY_SLICE].sum() >= MIN_READS

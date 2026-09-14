@@ -10,6 +10,7 @@ enrichment factors.
 
 from __future__ import annotations
 
+from typing import NamedTuple
 
 import numpy as np
 import pysam
@@ -21,6 +22,7 @@ from price2.coverage_model import (
     START_CODON_IDX,
     STOP_HIST_OFFSET,
 )
+from price2.genomic_features import Transcript
 from price2.reference_annotation import ReferenceAnnotation
 from price2.ribo_seq_alignment import RiboSeqAlignment
 
@@ -32,11 +34,22 @@ _START_WINDOW: tuple[int, int] = (-30, 330)
 _STOP_WINDOW: tuple[int, int] = (-330, 30)
 
 
+class PSiteAssignment(NamedTuple):
+    """Where a read sits on the one coding transcript it was assigned to."""
+
+    #: The coding transcript.
+    transcript: Transcript
+    #: ``(start, end)`` of the read in CDS coordinates (0-based, half-open).
+    iv_on_cds: tuple[int, int]
+    #: CDS coordinate of the inferred P-site.
+    p_site: int
+
+
 def _try_assign_p_site(
     aln: RiboSeqAlignment,
     ra: ReferenceAnnotation,
     cm: CleavageModel,
-) -> tuple[object, tuple[int, int], int] | None:
+) -> PSiteAssignment | None:
     """Attempt to assign *aln* to a unique P-site on a coding transcript.
 
     Parameters
@@ -50,15 +63,9 @@ def _try_assign_p_site(
 
     Returns
     -------
-    tuple or None
-        ``(transcript, iv_on_cds, p_site_cds_pos)`` when the read can be
-        unambiguously assigned to a single CDS interval and a dominant P-site
-        position; ``None`` otherwise.
-
-        * *transcript* – the coding transcript the read was assigned to.
-        * *iv_on_cds* – ``(start, end)`` of the read projected onto CDS
-          coordinates (0-based, half-open).
-        * *p_site_cds_pos* – CDS coordinate of the inferred P-site.
+    PSiteAssignment or None
+        The assignment when the read maps onto exactly one CDS and the
+        cleavage model names a dominant P-site codon; ``None`` otherwise.
     """
     transcript_candidates = ra.collect_coding_transcripts(aln.genomic_region)
     if not transcript_candidates:
@@ -90,7 +97,7 @@ def _try_assign_p_site(
         return None
 
     p_site_cds_pos = iv_on_cds[0] + (-frame) % 3 + winner * 3
-    return transcript, iv_on_cds, p_site_cds_pos
+    return PSiteAssignment(transcript, iv_on_cds, p_site_cds_pos)
 
 
 def build_histograms(
@@ -157,12 +164,11 @@ def build_histograms(
         aln = RiboSeqAlignment.from_pysam(raw_aln, end_to_end=end_to_end)
         if aln is None:
             continue
-        result = _try_assign_p_site(aln, ra, cm)
-        if result is None:
+        assigned = _try_assign_p_site(aln, ra, cm)
+        if assigned is None:
             continue
-        transcript, iv_on_cds, p_site = result
-
-        coding_length = transcript.coding_length
+        iv_on_cds, p_site = assigned.iv_on_cds, assigned.p_site
+        coding_length = assigned.transcript.coding_length
 
         if start_lo < iv_on_cds[0] < start_hi and not (
             iv_on_cds[0] < coding_length < iv_on_cds[1]

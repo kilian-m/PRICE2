@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import MISSING, Field, dataclass, field
 import json
 import logging
+import os
 
 from price2.layout import RunLayout
 
@@ -423,11 +424,11 @@ class Config:
             select L-BFGS-B).
         """
         if self.o_dir == "":
-            self.o_dir = f"{self.base_dir}/o_dir"
+            self.o_dir = os.path.join(self.base_dir, "o_dir")
         if self.w_dir == "":
-            self.w_dir = f"{self.base_dir}/w_dir"
+            self.w_dir = os.path.join(self.base_dir, "w_dir")
         if self.bam_dir == "":
-            self.bam_dir = f"{self.base_dir}/bam_dir"
+            self.bam_dir = os.path.join(self.base_dir, "bam_dir")
         self.start_codons = _codons("start_codons", self.start_codons)
         self.stop_codons = _codons("stop_codons", self.stop_codons)
         self._validate()

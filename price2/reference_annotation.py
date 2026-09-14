@@ -18,10 +18,12 @@ from price2.genomic_features import Transcript
 
 logger = logging.getLogger(__name__)
 
-#: Flattened CDS interval index: per ``(chromosome, strand)``, the start position
-#: of every step and the transcripts whose CDS covers it (``None`` where there
-#: are none).  The first step starts at 0 and the last one is unbounded.
-CdsIndex = dict[tuple[str, str], tuple[list[int], list[frozenset | None]]]
+#: The steps of one ``(chromosome, strand)``: the start position of every step
+#: and the transcripts whose CDS covers it (``None`` where there are none).  The
+#: first step starts at 0 and the last one is unbounded.
+Steps = tuple[list[int], list[frozenset | None]]
+#: Flattened CDS interval index, per ``(chromosome, strand)``.
+CdsIndex = dict[tuple[str, str], Steps]
 
 
 class ReferenceAnnotation:
@@ -56,6 +58,9 @@ class ReferenceAnnotation:
         self.transcripts = {}
         self.transcript_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
         chromosomes: set[str] = set()
+        # Exon and CDS features whose transcript was never declared: GENCODE
+        # lists gene-only features, but a truncated file looks the same.
+        orphans = 0
 
         for feature in HTSeq.GFF_Reader(gtf_path):
             transcript_id = feature.attr.get("transcript_id")
@@ -68,10 +73,18 @@ class ReferenceAnnotation:
 
             if feature.type == "transcript":
                 if transcript_id not in self.transcripts:
-                    self.transcripts[transcript_id] = Transcript(feature)
+                    try:
+                        self.transcripts[transcript_id] = Transcript(feature)
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"{gtf_path}: transcript {transcript_id} at "
+                            f"{feature.iv} lacks the attribute {exc}"
+                        ) from None
                 continue
             transcript = self.transcripts.get(transcript_id)
             if transcript is None:
+                if feature.type in ("exon", "CDS"):
+                    orphans += 1
                 continue
             if feature.type == "exon":
                 transcript.add_exon(feature)
@@ -84,31 +97,25 @@ class ReferenceAnnotation:
         self._cds_index = _cds_index_from(self.transcripts.values())
 
         logger.info("Loaded %d transcripts from %s", len(self.transcripts), gtf_path)
+        if orphans:
+            logger.warning(
+                "%s: %d exon/CDS feature(s) belong to no declared transcript "
+                "and were ignored",
+                gtf_path,
+                orphans,
+            )
 
     def _coding_transcripts_at(
         self, chrom: str, strand: str, start: int, end: int
-    ) -> frozenset | None:
-        """Transcripts whose CDS overlaps ``[start, end)``, or ``None``."""
+    ) -> frozenset[Transcript]:
+        """Transcripts whose CDS overlaps ``[start, end)``."""
         try:
             starts, step_sets = self._cds_index[(chrom, strand)]
         except KeyError:
-            return None
-
-        first = bisect_right(starts, start) - 1
-        if first < 0:
-            first = 0
+            return frozenset()
+        first = max(bisect_right(starts, start) - 1, 0)
         last = bisect_left(starts, end)
-
-        if last - first == 1:
-            return step_sets[first]
-
-        found = None
-        for i in range(first, last):
-            step = step_sets[i]
-            if step is None:
-                continue
-            found = step if found is None else found | step
-        return found
+        return _union(step_sets[first:last])
 
     def collect_coding_transcripts(self, region: GenomicRegion) -> frozenset[Transcript]:
         """Return all transcripts with a CDS overlapping *region*.
@@ -123,15 +130,25 @@ class ReferenceAnnotation:
         frozenset[Transcript]
             Transcripts whose CDS intervals overlap any exon of *region*.
         """
-        found = None
-        for interval in region.intervals:
-            step = self._coding_transcripts_at(
+        return _union(
+            self._coding_transcripts_at(
                 region.chrom, region.strand, interval.start, interval.end
             )
-            if step is None:
-                continue
+            for interval in region.intervals
+        )
+
+
+def _union(steps: Iterable[frozenset | None]) -> frozenset:
+    """The union of the transcript sets in *steps*, skipping the empty ``None``.
+
+    Returns a step's own (interned) set when it is the only one, so the
+    common single-step query allocates nothing.
+    """
+    found = None
+    for step in steps:
+        if step:
             found = step if found is None else found | step
-        return found if found is not None else frozenset()
+    return found if found is not None else frozenset()
 
 
 def _cds_index_from(transcripts: Iterable[Transcript]) -> CdsIndex:
