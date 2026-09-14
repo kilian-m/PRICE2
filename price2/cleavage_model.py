@@ -57,6 +57,12 @@ PLAUSIBLE_P_SITE_OFFSETS: frozenset[int] = frozenset({11, 12, 13})
 #: Minimum probability mass on the upstream cleavage peak of a healthy model.
 MIN_PEAK_PROBABILITY: float = 0.3
 
+#: A read is assigned a P-site codon (:meth:`CleavageModel.p_site_codon`) only
+#: when some codon reaches this likelihood ...
+P_SITE_MIN_CODON_LIKELIHOOD: float = 0.01
+#: ... and the best codon carries this fraction of the total over the codons.
+P_SITE_MIN_DOMINANT_FRACTION: float = 0.8
+
 #: ``region_end`` value meaning "no downstream bound" (see *Conventions*).
 UNBOUNDED: int = 10**10
 
@@ -300,6 +306,72 @@ class CleavageModel:
         relative to the start of an ORF's last base (noise) or last codon (in
         frame); ``KeyError`` when none exists (*Conventions*)."""
         return self.dist_to_orf_end[(read_length, oua, frame)]
+
+    def p_site_codon(
+        self, length: int, frame: int, untemplated_addition: bool
+    ) -> Optional[int]:
+        """Index of the codon a read of this shape places its P-site on.
+
+        The per-codon likelihood vector of a read depends only on its
+        matching length, its reading frame and whether it carries an
+        untemplated addition — never on *where* the read sits — so the
+        answer is memoised per triple.  Relative to the read start the CDS
+        codon boundaries sit at ``f0``, ``f0 + 3``, ... with
+        ``f0 = (-frame) % 3`` (the *Conventions* section above); only codons
+        that fit entirely inside the read can carry the P-site.
+
+        Parameters
+        ----------
+        length : int
+            Matching length of the read.
+        frame : int
+            Reading frame of the read start relative to the CDS.
+        untemplated_addition : bool
+            Whether the read carries a 5' untemplated addition.
+
+        Returns
+        -------
+        int or None
+            The index of the winning codon, counted from ``f0``; ``None``
+            when no codon fits, no codon reaches
+            :data:`P_SITE_MIN_CODON_LIKELIHOOD`, or the best one carries less
+            than :data:`P_SITE_MIN_DOMINANT_FRACTION` of the total, and for
+            reads longer than the model can produce.
+        """
+        # Memo on the instance, created lazily so that models pickled by an
+        # earlier release work too; dropped again by ``__getstate__``.
+        cache = self.__dict__.setdefault("_p_site_codons", {})
+        key = (length, frame, bool(untemplated_addition))
+        try:
+            return cache[key]
+        except KeyError:
+            pass
+        winner = None
+        f0 = (-frame) % 3
+        n_codons = (length - f0) // 3
+        if n_codons > 0 and length < len(self.pl) + len(self.pr) + 4:
+            likelihoods = np.array(
+                [
+                    read_in_cds_likelihood(
+                        self.pl, self.pr, self.pu, length, frame, key[2],
+                        f0 + 3 * i, f0 + 3 * i + 3,
+                    )
+                    for i in range(n_codons)
+                ]
+            )
+            if likelihoods.max() >= P_SITE_MIN_CODON_LIKELIHOOD:
+                likelihoods /= likelihoods.sum()
+                if likelihoods.max() >= P_SITE_MIN_DOMINANT_FRACTION:
+                    winner = int(np.argmax(likelihoods))
+        cache[key] = winner
+        return winner
+
+    def __getstate__(self) -> dict:
+        """Pickle without the P-site memo (and the memo of earlier releases)."""
+        state = dict(self.__dict__)
+        state.pop("_p_site_codons", None)
+        state.pop("_p_site_table_cache", None)
+        return state
 
     def is_plausible(self) -> bool:
         """Whether the upstream cleavage peak looks like a healthy library's.
