@@ -122,21 +122,19 @@ def solve(
 
 
 def _solve_mu(X, y, w0, spec, config, *, XT, gpu):
-    weights = np.ones(X.shape[0]) if spec.weights is None else spec.weights
-    num_rgrs, num_runs = spec.group_shape or (len(w0), 1)
-    pmin = config.pseudo_min
-    max_iter = config.mu_inner_max_iter
-    tol = config.mu_inner_tol
+    settings = dict(
+        weights=spec.weights,
+        lam=spec.lam,
+        group_shape=spec.group_shape,
+        pmin=config.pseudo_min,
+        max_iter=config.mu_inner_max_iter,
+        tol=config.mu_inner_tol,
+        theta=spec.theta,
+    )
     if gpu is not None and spec.fixed_mask is None:
-        return gpu.solve(
-            weights, w0, spec.lam, num_rgrs, num_runs, pmin, max_iter, tol,
-            theta=spec.theta,
-        )
-    if XT is None:
-        XT = X.T.tocsr()
+        return gpu.solve(w0, **settings)
     return mu_solver.mu_inner_cpu(
-        X, XT, y, weights, w0, spec.lam, num_rgrs, num_runs, pmin,
-        max_iter, tol, fixed_mask=spec.fixed_mask, theta=spec.theta,
+        X, y, w0, fixed_mask=spec.fixed_mask, XT=XT, **settings
     )
 
 

@@ -26,10 +26,11 @@ The address lives in Linux's abstract namespace, so it needs no filesystem
 entry, no cleanup, and — unlike a semaphore or an fd — it is just a string and
 travels through the ordinary job dict.
 
-The update rule is the weighted Richardson-Lucy + group-LASSO step of
-``price2.mu_solver``; note that this copy checks convergence only every
-``check_every`` inner iterations, so results are close to but not identical
-with the in-worker CPU/GPU path.
+The update rule, including the overflow floor on ``delta``, is the weighted
+Richardson-Lucy + group-LASSO step of ``price2.mu_solver``; note that this
+copy checks convergence only every ``check_every`` inner iterations (a
+``.item()`` is a GPU sync), so results are close to but not identical with
+the in-worker CPU/GPU path.
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from price2.mu_solver import silence_sparse_beta_warning
+from price2.mu_solver import OVERFLOW_CAP, silence_sparse_beta_warning
 
 
 # ------------------------------------------------------------------ #
@@ -147,6 +148,7 @@ class Params:
 def _gpu_deconvolve(torch, job, dtype, check_every=25):
     """Full IRLS-Huber group-LASSO deconvolution of one locus on the GPU."""
     tiny = 1e-30 if dtype == torch.float32 else 1e-300
+    cap = OVERFLOW_CAP["float32" if dtype == torch.float32 else "float64"]
     shms = []
     try:
         sX, Xd = _shm_get(job["X_data"]); shms.append(sX)
@@ -191,22 +193,29 @@ def _gpu_deconvolve(torch, job, dtype, check_every=25):
             ar = pr.abs()
             omega = torch.where(ar <= c, torch.ones_like(ar), c / ar.clamp_min(1e-14))
             omega_y = omega * yt
+            # The per-element delta floor of mu_solver.mu_inner_cpu: it keeps
+            # omega_y/delta from overflowing the X^T mat-vec to +Inf, which
+            # would cascade into NaN through the group-norm penalty.
+            delta_floor = (omega_y * (1.0 / cap)).clamp_min(tiny)
             # Poisson denominator data term X^T ω is constant across inner iterations.
             if poisson:
                 Xt_omega = torch.mv(XcT, omega)
             w_outer0 = w
             for it in range(p.mu_inner_max_iter):
-                delta = torch.mv(Xc, w).clamp_min(tiny)
+                delta = torch.maximum(torch.mv(Xc, w), delta_floor)
                 num = torch.mv(XcT, omega_y / delta)
                 if poisson:
                     data_den = Xt_omega
                 else:
                     # NB denominator data term X^T(ω (y+θ)/(θ+δ)) depends on δ.
                     data_den = torch.mv(XcT, omega * (yt + theta) / (theta + delta))
-                W = w.view(nr, ns)
-                norms = (W * W).sum(1).sqrt()
-                pen = (lam * (W / norms.clamp_min(tiny).view(-1, 1))).reshape(-1)
-                den = (data_den + pen).clamp_min(tiny)
+                if lam > 0.0:
+                    W = w.view(nr, ns)
+                    norms = (W * W).sum(1).sqrt()
+                    pen = (lam * (W / norms.clamp_min(tiny).view(-1, 1))).reshape(-1)
+                    den = (data_den + pen).clamp_min(tiny)
+                else:
+                    den = data_den.clamp_min(tiny)
                 w_new = (w * num / den).clamp_min(pmin)
                 if (it + 1) % check_every == 0:
                     rel = ((w_new - w).norm() / w.norm().clamp_min(1e-14)).item()
