@@ -3,7 +3,7 @@
 Main entry point for the PRICE2 pipeline.  Orchestrates the full analysis
 from raw Ribo-seq BAM files to a table of active translons:
 
-1. Parse reference annotation (GTF) and genome (FASTA).
+1. Parse the reference annotation (GTF).
 2. Collect Ribo-seq runs and estimate cleavage/coverage models.
 3. Map reads to loci and generate ORF candidates.
 4. Run group-LASSO ORF deconvolution in parallel.
@@ -15,13 +15,11 @@ import os
 import shutil
 import sys
 
-from pyfaidx import Fasta
-
 from price2 import multimap
 from price2 import run_state
 from price2.config import Config
 from price2.data_collector import DataCollector
-from price2.ribo_seq_run import save_dataset_models
+from price2.dataset_models import save_dataset_models
 from price2.orf_activity_estimator import ORFActivityEstimator
 from price2.pipeline import Stage, run_stage, run_stages
 from price2.reference_annotation import ReferenceAnnotation
@@ -199,26 +197,6 @@ def _outputs_resumable(config: Config) -> bool:
     return True
 
 
-def load_genome(fasta_path: str) -> Fasta:
-    """Open the reference genome FASTA via :mod:`pyfaidx`.
-
-    Returns an ``mmap``-backed handle so that the OS shares a single
-    page cache across worker processes.  The ``.fai`` index is built
-    on first access if not already present.
-
-    Parameters
-    ----------
-    fasta_path : str
-        Path to the genome FASTA file.
-
-    Returns
-    -------
-    pyfaidx.Fasta
-        Chromosome-keyed indexed FASTA handle.
-    """
-    return Fasta(fasta_path)
-
-
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -257,14 +235,15 @@ class _Collection:
             "load reference annotation",
             lambda: ReferenceAnnotation(self.config.gtf_path),
         )
-        genome = run_stage("load genome", lambda: load_genome(self.config.fasta_path))
-        self.collector = DataCollector(reference, genome, self.config)
+        self.collector = DataCollector(reference, self.config)
 
     def collect_runs(self) -> None:
         self.collector.collect_runs()
 
     def save_models(self) -> None:
-        save_dataset_models(self.collector.runs, self.config.o_dir)
+        save_dataset_models(
+            self.collector.runs, self.config.layout.dataset_models_dir
+        )
 
     def collect_mappings(self) -> None:
         self.collector.collect_mappings()

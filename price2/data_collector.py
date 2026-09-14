@@ -9,10 +9,10 @@ working directory (``price.db``).
 
 import bisect
 import logging
+import math
 import os
 import HTSeq
 import pysam
-from pyfaidx import Fasta
 import pandas as pd
 import numpy as np
 import multiprocessing as mp
@@ -56,7 +56,6 @@ class DataCollector:
     def __init__(
         self,
         reference_annotation: ReferenceAnnotation,
-        genome: Fasta,
         config: Config,
     ) -> None:
         """Initialise the DataCollector.
@@ -65,13 +64,10 @@ class DataCollector:
         ----------
         reference_annotation : ReferenceAnnotation
             Parsed reference annotation used to define loci.
-        genome : pyfaidx.Fasta
-            Indexed FASTA handle keyed by chromosome name.
         config : Config
             Run configuration.
         """
         self.config = config
-        self.genome = genome
         self.reference_annotation = reference_annotation
         self.bam_dir = config.bam_dir
         self.db_path = config.layout.db_path
@@ -161,14 +157,7 @@ class DataCollector:
         :mod:`price2.multimap`).
         """
         logger.info("Collecting read mappings...")
-        with database.connect(self.db_path, commit=True) as db:
-            cur = db.cursor()
-            database.create_collection_tables(cur)
-            processed_run_ids = {
-                run_id
-                for run_id, in cur.execute("SELECT DISTINCT run_id FROM reads")
-            }
-
+        processed_run_ids = self._processed_run_ids()
         pending = [run for run in self.runs if run.id not in processed_run_ids]
         if not pending:
             logger.info("Read mappings already collected for all runs.")
@@ -188,10 +177,53 @@ class DataCollector:
                 "are discarded, not stored."
             )
 
-        # Chunk the loci in BAM coordinate order so each worker's fetches
-        # sweep a contiguous slab of the file instead of seeking randomly.
+        loci = self._loci_in_bam_order()
+        spill_root = ""
+        if record_multimap:
+            spill_root = self._prepare_spill(loci, pending, processed_run_ids)
+
+        n_proc = max(1, self.config.processes)
+        bounds = _locus_chunks(len(loci), n_proc)
+        end_to_end = self.config.align_ends_type == "endtoend"
+        for run in pending:
+            tasks = [
+                (
+                    run.id,
+                    self.bam_dir,
+                    lo,
+                    hi,
+                    chunk_idx,
+                    os.path.join(spill_root, run.id) if record_multimap else "",
+                    end_to_end,
+                    drop_multimap,
+                )
+                for chunk_idx, (lo, hi) in enumerate(bounds)
+            ]
+            self._map_run_reads(run.id, tasks, n_proc, loci)
+
+        with database.connect(self.db_path, commit=True) as db:
+            database.create_read_indexes(db.cursor())
+
+        logger.info("Read mappings collected.")
+
+    def _processed_run_ids(self) -> set[str]:
+        """The runs whose reads are stored, creating the tables on a cold start."""
+        with database.connect(self.db_path, commit=True) as db:
+            cur = db.cursor()
+            database.create_collection_tables(cur)
+            return {
+                run_id
+                for run_id, in cur.execute("SELECT DISTINCT run_id FROM reads")
+            }
+
+    def _loci_in_bam_order(self) -> list[Locus]:
+        """The loci in BAM coordinate order.
+
+        Chunked in this order, each worker's fetches sweep a contiguous slab
+        of the file instead of seeking randomly.
+        """
         chr_rank = {c: i for i, c in enumerate(self.chr_order or [])}
-        loci = sorted(
+        return sorted(
             self.loci,
             key=lambda loc: (
                 chr_rank.get(loc.iv.chrom, len(chr_rank)),
@@ -200,78 +232,46 @@ class DataCollector:
             ),
         )
 
-        spill_root = ""
-        if record_multimap:
-            # The derived EM tables are rebuilt from these spill files (see
-            # build_multimap_index).  Spills of runs collected by an earlier,
-            # interrupted pass are kept; the pending runs start clean.
-            spill_root = multimap.init_spill(
-                self.db_path, [loc.id for loc in loci]
-            )
-            for run in pending:
-                multimap.reset_run_spill(spill_root, run.id)
-                # Create it even if the run turns out to have no multimapping
-                # alignments, so a later resume can tell "collected, nothing to
-                # spill" apart from "never collected".
-                os.makedirs(os.path.join(spill_root, run.id), exist_ok=True)
-            missing = [
-                run_id
-                for run_id in processed_run_ids
-                if not os.path.isdir(os.path.join(spill_root, run_id))
-            ]
-            if missing:
-                logger.warning(
-                    "runs %s have stored reads but no multimapping spill; "
-                    "their alignments will be absent from the linkage index",
-                    ", ".join(sorted(missing)),
-                )
+    def _prepare_spill(
+        self, loci: list[Locus], pending: list, processed_run_ids: set[str]
+    ) -> str:
+        """Set up the multimapping spill directory for the pending runs.
 
-        # Read depth spans orders of magnitude between loci — the deepest
-        # single locus of a human Ribo-seq run costs seconds on its own — so
-        # a chunk must stay small enough that one hot locus cannot become the
-        # critical path.  A handful of loci per chunk keeps enough genomic
-        # locality for the BAM fetches to sweep the file, while leaving the
-        # ``imap_unordered`` dispatch free to balance the rest.
-        n_proc = max(1, self.config.processes)
-        chunk_size = max(1, min(4, -(-len(loci) // (n_proc * 4))))
-        bounds = [
-            (i, min(i + chunk_size, len(loci)))
-            for i in range(0, len(loci), chunk_size)
+        The derived EM tables are rebuilt from the spill files (see
+        :func:`price2.multimap.build_multimap_index`).  Spills of runs
+        collected by an earlier, interrupted pass are kept; the pending runs
+        start clean.
+
+        Raises
+        ------
+        RuntimeError
+            When a run has stored reads but no spill: its alignments would
+            be absent from the linkage index, and the EM would silently
+            treat them as unique.
+        """
+        spill_root = multimap.init_spill(self.db_path, [loc.id for loc in loci])
+        for run in pending:
+            multimap.reset_run_spill(spill_root, run.id)
+            # Create it even if the run turns out to have no multimapping
+            # alignments, so a later resume can tell "collected, nothing to
+            # spill" apart from "never collected".
+            os.makedirs(os.path.join(spill_root, run.id), exist_ok=True)
+        missing = [
+            run_id
+            for run_id in processed_run_ids
+            if not os.path.isdir(os.path.join(spill_root, run_id))
         ]
+        if missing:
+            raise RuntimeError(
+                f"runs {', '.join(sorted(missing))} have stored reads but no "
+                "multimapping spill, so their alignments cannot enter the "
+                "linkage index; re-collect with warm_start=false"
+            )
+        return spill_root
 
-        # Workers read the loci through this module global: with the default
-        # fork start method they inherit it copy-on-write, so the (large)
-        # Locus objects are never pickled.
-        global _WORKER_LOCI
-        _WORKER_LOCI = loci
-
-        end_to_end = self.config.align_ends_type == "endtoend"
-
-        try:
-            for run in pending:
-                tasks = [
-                    (
-                        run.id,
-                        self.bam_dir,
-                        lo,
-                        hi,
-                        chunk_idx,
-                        os.path.join(spill_root, run.id) if record_multimap else "",
-                        end_to_end,
-                        drop_multimap,
-                    )
-                    for chunk_idx, (lo, hi) in enumerate(bounds)
-                ]
-                self._map_run_reads(run.id, tasks, n_proc)
-        finally:
-            _WORKER_LOCI = []
-
-        with database.connect(self.db_path, commit=True) as db:
-            database.create_read_indexes(db.cursor())
-
-        logger.info("Read mappings collected.")
-
-    def _map_run_reads(self, run_id: str, tasks: list, n_proc: int) -> None:
+    def _map_run_reads(
+        self, run_id: str, tasks: list, n_proc: int, loci: list[Locus]
+    ) -> None:
         """Map one run's BAM against every locus chunk and store the result.
 
         Parameters
@@ -282,13 +282,18 @@ class DataCollector:
             One :func:`collect_mappings_chunk` argument tuple per locus chunk.
         n_proc : int
             Number of worker processes.
+        loci : list[Locus]
+            The loci the chunks index into.
         """
         # Fork before opening the database: SQLite connections must not be
         # carried across fork(), and the workers have no use for one.
-        # ``fork`` so that the workers inherit ``_WORKER_LOCI`` without
-        # pickling it; the deconvolution pool uses ``forkserver`` instead.
+        # ``fork`` so that the workers inherit the loci through the
+        # initializer's arguments without pickling them; the deconvolution
+        # pool uses ``forkserver`` instead.
         try:
-            pool = mp.get_context("fork").Pool(n_proc)
+            pool = mp.get_context("fork").Pool(
+                n_proc, initializer=_init_mapping_worker, initargs=(loci,)
+            )
         except AssertionError:
             # A daemonic process may not spawn children (Process.start
             # asserts this); fall back to mapping the chunks in-process.
@@ -314,6 +319,7 @@ class DataCollector:
                 )
 
             if pool is None:
+                _init_mapping_worker(loci)
                 for task in tasks:
                     store(collect_mappings_chunk(task))
                 # This process buffered the spill itself, so flush it here.
@@ -434,9 +440,31 @@ def build_loci(
     return loci
 
 
-#: Loci to map against, shared with the collection workers by fork.  Set by
-#: :meth:`DataCollector.collect_mappings` before the pool is created.
+def _locus_chunks(n_loci: int, n_proc: int) -> list[tuple[int, int]]:
+    """Split ``range(n_loci)`` into the ``(lo, hi)`` chunks of the mapping tasks.
+
+    Read depth spans orders of magnitude between loci — the deepest single
+    locus of a human Ribo-seq run costs seconds on its own — so a chunk must
+    stay small enough that one hot locus cannot become the critical path.  A
+    handful of loci per chunk keeps enough genomic locality for the BAM
+    fetches to sweep the file, while leaving the ``imap_unordered`` dispatch
+    free to balance the rest.
+    """
+    chunk_size = max(1, min(4, math.ceil(n_loci / (n_proc * 4))))
+    return [
+        (i, min(i + chunk_size, n_loci)) for i in range(0, n_loci, chunk_size)
+    ]
+
+
+#: Loci to map against, indexed by the chunk bounds of the tasks.  Set in
+#: every mapping worker by :func:`_init_mapping_worker`.
 _WORKER_LOCI: list[Locus] = []
+
+
+def _init_mapping_worker(loci: list[Locus]) -> None:
+    """Give a mapping worker its loci (the pool's ``initializer``)."""
+    global _WORKER_LOCI
+    _WORKER_LOCI = loci
 
 #: Layout of the collapsed-reads blob.  ``count`` is how many identical
 #: mappings collapse into one key; on deep, non-deduplicated libraries a
@@ -649,8 +677,8 @@ def collect_mappings_chunk(data: tuple) -> tuple:
 
     Designed to be called via :class:`multiprocessing.Pool`; the loci
     themselves are read from the :data:`_WORKER_LOCI` module global, which
-    forked workers inherit without pickling.  Each locus's reads are
-    tallied by :func:`_map_locus_reads`.
+    :func:`_init_mapping_worker` sets in every worker.  Each locus's reads
+    are tallied by :func:`_map_locus_reads`.
 
     Parameters
     ----------

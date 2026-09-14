@@ -3,18 +3,21 @@
 A :class:`RiboSeqRun` bundles the run identifier with the estimated
 :class:`~price2.cleavage_model.CleavageModel` and
 :class:`~price2.coverage_model.CoverageModel` derived from the mapped reads.
-The module also provides helpers that construct
-:class:`RiboSeqRun` objects from BAM files, including downsampling to at most
-10 million reads before model estimation.
+The module also constructs :class:`RiboSeqRun` objects from BAM files,
+downsampling each to at most 10 million reads before model estimation
+(:mod:`price2.dataset_models` exports the fitted models).
 
 BAM files are assumed to be coordinate-sorted and indexed.
 """
+
+from __future__ import annotations
 
 import logging
 import multiprocessing as mp
 import os
 import shutil
 import subprocess
+from typing import NamedTuple
 
 import numba
 import numpy as np
@@ -142,8 +145,6 @@ def ribo_seq_runs_from_bams(
     list[RiboSeqRun]
         One :class:`RiboSeqRun` per BAM file, ordered by BAM filename.
     """
-    global _WORKER_RA, _WORKER_CLEAVAGE, _WORKER_END_TO_END
-
     sample_dir = f"{wdir}/sample_bam"
     os.makedirs(sample_dir, exist_ok=True)
     bam_files = sorted(f"{bam_id}.bam" for bam_id in bam_ids)
@@ -152,72 +153,104 @@ def ribo_seq_runs_from_bams(
         os.rmdir(sample_dir)
         return []
 
-    # ``fork`` so that the workers inherit the module globals below without
-    # pickling them; the deconvolution pool uses ``forkserver`` instead.
+    # ``fork`` so that the workers inherit the annotation and the models
+    # through the initializer's arguments without pickling them; the
+    # deconvolution pool uses ``forkserver`` instead.
     ctx = mp.get_context("fork")
-    _WORKER_RA = ref_annotation
-    _WORKER_END_TO_END = end_to_end
-    fitted: list[tuple[str, int, str, int, CleavageModel]] = []
     try:
-        # Phase one runs one worker per BAM, so each may use several threads of
-        # its own for samtools and for the EM.
-        threads = max(1, processes // len(bam_files))
-        with ctx.Pool(
-            min(processes, len(bam_files)),
-            initializer=_init_cleavage_worker,
-            initargs=(threads,),
-        ) as pool:
-            fitted = pool.starmap(
-                _sample_and_fit_cleavage,
-                [(bam_dir, bam_file, sample_dir) for bam_file in bam_files],
-            )
-
-        _WORKER_CLEAVAGE = {run_id: cm for run_id, _, _, _, cm in fitted}
-        tasks = [
-            (run_id, sample_bam, window)
-            for run_id, _, sample_bam, _, _ in fitted
-            for window in _coverage_windows(sample_bam)
-        ]
-        histograms = {
-            run_id: (np.zeros(HIST_SIZE), np.zeros(HIST_SIZE))
-            for run_id, _, _, _, _ in fitted
-        }
-        with ctx.Pool(min(processes, len(tasks))) as pool:
-            for run_id, start_hist, stop_hist in pool.imap_unordered(
-                _coverage_window, tasks, chunksize=1
-            ):
-                histograms[run_id][0][:] += start_hist
-                histograms[run_id][1][:] += stop_hist
+        fitted = _fit_cleavage_models(
+            ctx, bam_dir, bam_files, sample_dir, ref_annotation, end_to_end, processes
+        )
+        histograms = _coverage_histograms(
+            ctx, fitted, ref_annotation, end_to_end, processes
+        )
     finally:
-        _WORKER_RA = None
-        _WORKER_CLEAVAGE = {}
-        _WORKER_END_TO_END = False
         # Also clears the samples of a phase that died half-way, which would
         # otherwise mask the original exception with a "directory not empty".
         shutil.rmtree(sample_dir, ignore_errors=True)
 
     ribo_seq_runs = [
         _assemble_run(
-            run_id,
-            read_count,
-            counted_alns,
-            cleavage_model,
-            CoverageModel.from_histograms(*histograms[run_id], run_id),
+            fit.run_id,
+            fit.read_count,
+            fit.counted_alns,
+            fit.cleavage_model,
+            CoverageModel.from_histograms(*histograms[fit.run_id], fit.run_id),
         )
-        for run_id, read_count, _, counted_alns, cleavage_model in fitted
+        for fit in fitted
     ]
+    if not high_quality_only:
+        return ribo_seq_runs
 
-    if high_quality_only:
-        filtered = [r for r in ribo_seq_runs if r.is_high_quality]
-        excluded = [r for r in ribo_seq_runs if not r.is_high_quality]
-        if excluded:
-            logger.warning(
-                "Excluding %d low-quality run(s): %s",
-                len(excluded),
-                ", ".join(r.id for r in excluded),
-            )
-        return filtered
-    return ribo_seq_runs
+    excluded = [r for r in ribo_seq_runs if not r.is_high_quality]
+    if excluded:
+        logger.warning(
+            "Excluding %d low-quality run(s): %s",
+            len(excluded),
+            ", ".join(r.id for r in excluded),
+        )
+    return [r for r in ribo_seq_runs if r.is_high_quality]
+
+
+def _fit_cleavage_models(
+    ctx,
+    bam_dir: str,
+    bam_files: list[str],
+    sample_dir: str,
+    ref_annotation: ReferenceAnnotation,
+    end_to_end: bool,
+    processes: int,
+) -> list[FittedRun]:
+    """Downsample every BAM and fit its cleavage model, one worker per BAM.
+
+    Each worker may use several threads of its own for samtools and for
+    the EM, since there are fewer BAMs than cores.
+    """
+    threads = max(1, processes // len(bam_files))
+    with ctx.Pool(
+        min(processes, len(bam_files)),
+        initializer=_init_worker,
+        initargs=(ref_annotation, end_to_end, {}, threads),
+    ) as pool:
+        return pool.starmap(
+            _sample_and_fit_cleavage,
+            [(bam_dir, bam_file, sample_dir) for bam_file in bam_files],
+        )
+
+
+def _coverage_histograms(
+    ctx,
+    fitted: list[FittedRun],
+    ref_annotation: ReferenceAnnotation,
+    end_to_end: bool,
+    processes: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """The start and stop P-site histograms of every fitted run.
+
+    Accumulated by workers that each take one genomic window of one sample
+    BAM: there are far more windows than BAM files, so this phase — which
+    dominates the run time — keeps every core busy.
+    """
+    cleavage_models = {fit.run_id: fit.cleavage_model for fit in fitted}
+    tasks = [
+        (fit.run_id, fit.sample_bam, window)
+        for fit in fitted
+        for window in _coverage_windows(fit.sample_bam)
+    ]
+    histograms = {
+        fit.run_id: (np.zeros(HIST_SIZE), np.zeros(HIST_SIZE)) for fit in fitted
+    }
+    with ctx.Pool(
+        min(processes, len(tasks)),
+        initializer=_init_worker,
+        initargs=(ref_annotation, end_to_end, cleavage_models, None),
+    ) as pool:
+        for run_id, start_hist, stop_hist in pool.imap_unordered(
+            _coverage_window, tasks, chunksize=1
+        ):
+            histograms[run_id][0][:] += start_hist
+            histograms[run_id][1][:] += stop_hist
+    return histograms
 
 
 def _assemble_run(
@@ -259,36 +292,53 @@ def _coverage_windows(sample_bam: str) -> list[tuple[str, int, int]]:
 # Worker state and tasks
 # ---------------------------------------------------------------------------
 
-#: Set in the parent before a pool is forked, and read by its workers.  This is
-#: what keeps the reference annotation and the cleavage models out of the task
-#: pickles.
+#: What every worker of the two pools reads, set by :func:`_init_worker`
+#: (the pools' ``initializer``).  Passing these as initializer arguments of
+#: a forked pool keeps the reference annotation and the cleavage models out
+#: of the task pickles.
 _WORKER_RA: ReferenceAnnotation | None = None
 _WORKER_CLEAVAGE: dict[str, CleavageModel] = {}
-#: EndToEnd untemplated-addition detection, set in the parent before forking.
+#: EndToEnd untemplated-addition detection.
 _WORKER_END_TO_END: bool = False
-
-#: Per-worker state, populated after the fork.
+#: Threads for samtools and the EM.
 _WORKER_THREADS: int = 1
 
 
-def _init_cleavage_worker(threads: int) -> None:
-    """Cap each worker's thread budget so the pool does not oversubscribe."""
-    global _WORKER_THREADS
+def _init_worker(
+    ref_annotation: ReferenceAnnotation,
+    end_to_end: bool,
+    cleavage_models: dict[str, CleavageModel],
+    threads: int | None,
+) -> None:
+    """Give a worker its inputs; *threads* caps its budget so the pool does
+    not oversubscribe (``None`` for a phase without threaded work)."""
+    global _WORKER_RA, _WORKER_END_TO_END, _WORKER_CLEAVAGE, _WORKER_THREADS
 
-    _WORKER_THREADS = threads
-    numba.set_num_threads(threads)
+    _WORKER_RA = ref_annotation
+    _WORKER_END_TO_END = end_to_end
+    _WORKER_CLEAVAGE = cleavage_models
+    if threads is not None:
+        _WORKER_THREADS = threads
+        numba.set_num_threads(threads)
+
+
+class FittedRun(NamedTuple):
+    """What :func:`_sample_and_fit_cleavage` returns for one BAM."""
+
+    run_id: str
+    #: Mapped reads in the original BAM.
+    read_count: int
+    #: The downsampled, indexed BAM the coverage phase reads.
+    sample_bam: str
+    #: Alignments the cleavage estimator counted.
+    counted_alns: int
+    cleavage_model: CleavageModel
 
 
 def _sample_and_fit_cleavage(
     bam_dir: str, bam_file: str, sample_dir: str
-) -> tuple[str, int, str, int, CleavageModel]:
-    """Downsample one BAM and fit its cleavage model.
-
-    Returns
-    -------
-    tuple
-        ``(run_id, read_count, sample_bam_path, counted_alns, cleavage_model)``.
-    """
+) -> FittedRun:
+    """Downsample one BAM and fit its cleavage model."""
     run_id = os.path.splitext(bam_file)[0]
     bam_file_path = f"{bam_dir}/{bam_file}"
 
@@ -320,7 +370,9 @@ def _sample_and_fit_cleavage(
 
     estimator = CleavageEstimator()
     estimator.collect_data(_WORKER_RA, sample_bam, end_to_end=_WORKER_END_TO_END)
-    return run_id, read_count, sample_bam, estimator.counted_alns, estimator.run()
+    return FittedRun(
+        run_id, read_count, sample_bam, estimator.counted_alns, estimator.run()
+    )
 
 
 def _coverage_window(
@@ -336,136 +388,3 @@ def _coverage_window(
         end_to_end=_WORKER_END_TO_END,
     )
     return run_id, start_hist, stop_hist
-
-
-# ---------------------------------------------------------------------------
-# Dataset model I/O
-# ---------------------------------------------------------------------------
-
-
-def save_dataset_models(
-    runs: list[RiboSeqRun],
-    output_dir: str,
-    save_optional: bool = True,
-) -> None:
-    """Save cleavage and coverage model summaries, plots, and optional data.
-
-    Creates a ``dataset_models/`` sub-directory under *output_dir* and
-    writes:
-
-    * ``cleavage_models.tsv`` – obligatory attributes (pl, pr, pu).
-    * ``cleavage_models.pdf`` – multi-page diagnostic plots (requires
-      optional cleavage attributes).
-    * ``coverage_models.tsv`` – obligatory attributes (start_factor,
-      stop_factor).
-    * ``coverage_models.pdf`` – multi-page histogram plots (requires
-      optional coverage attributes).
-
-    When *save_optional* is True, also writes:
-
-    * ``cleavage_models.npz`` – optional arrays (dist_starts, table).
-    * ``coverage_models.npz`` – optional arrays (start_hist, stop_hist).
-
-    Parameters
-    ----------
-    runs : list[RiboSeqRun]
-        Ribo-seq runs whose models should be exported.
-    output_dir : str
-        Root output directory (``config.o_dir``).
-    save_optional : bool, optional
-        Whether to write ``.npz`` files with optional model attributes
-        (default True).
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    dm_dir = os.path.join(output_dir, "dataset_models")
-    os.makedirs(dm_dir, exist_ok=True)
-
-    # --- Cleavage TSV + optional NPZ ---
-    cleavage_tsv = os.path.join(dm_dir, "cleavage_models.tsv")
-    cleavage_npz_data: dict[str, np.ndarray] = {} if save_optional else None
-    with open(cleavage_tsv, "w") as fh:
-        fh.write(CleavageModel.TSV_HEADER + "\n")
-        for run in runs:
-            run.cleavage_model.to_files(run.id, fh, cleavage_npz_data)
-    if cleavage_npz_data:
-        np.savez(os.path.join(dm_dir, "cleavage_models.npz"), **cleavage_npz_data)
-
-    # --- Cleavage PDF ---
-    path = os.path.join(dm_dir, "cleavage_models.pdf")
-    with PdfPages(path) as pdf:
-        for run in runs:
-            fig = run.cleavage_model.plot_full()
-            fig.suptitle(run.id, fontsize=14, fontweight="bold")
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-
-    # --- Coverage TSV + optional NPZ ---
-    coverage_tsv = os.path.join(dm_dir, "coverage_models.tsv")
-    coverage_npz_data: dict[str, np.ndarray] = {} if save_optional else None
-    with open(coverage_tsv, "w") as fh:
-        fh.write(CoverageModel.TSV_HEADER + "\n")
-        for run in runs:
-            run.coverage_model.to_files(run.id, fh, coverage_npz_data)
-    if coverage_npz_data:
-        np.savez(os.path.join(dm_dir, "coverage_models.npz"), **coverage_npz_data)
-
-    # --- Coverage PDF ---
-    path = os.path.join(dm_dir, "coverage_models.pdf")
-    with PdfPages(path) as pdf:
-        for run in runs:
-            fig = run.coverage_model.plot()
-            fig.suptitle(run.id, fontsize=14, fontweight="bold")
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-
-
-def load_cleavage_models(
-    dm_dir: str,
-    load_optional: bool = False,
-) -> dict[str, CleavageModel]:
-    """Load cleavage models from a ``dataset_models/`` directory.
-
-    Parameters
-    ----------
-    dm_dir : str
-        Path to a ``dataset_models/`` directory.
-    load_optional : bool, optional
-        Whether to load optional attributes from the ``.npz`` file
-        (default False).
-
-    Returns
-    -------
-    dict[str, CleavageModel]
-        Mapping of dataset identifier to the reconstructed model.
-    """
-    tsv = os.path.join(dm_dir, "cleavage_models.tsv")
-    npz = os.path.join(dm_dir, "cleavage_models.npz")
-    return CleavageModel.from_files(tsv, npz if load_optional and os.path.exists(npz) else None)
-
-
-def load_coverage_models(
-    dm_dir: str,
-    load_optional: bool = False,
-) -> dict[str, CoverageModel]:
-    """Load coverage models from a ``dataset_models/`` directory.
-
-    Parameters
-    ----------
-    dm_dir : str
-        Path to a ``dataset_models/`` directory.
-    load_optional : bool, optional
-        Whether to load optional attributes from the ``.npz`` file
-        (default False).
-
-    Returns
-    -------
-    dict[str, CoverageModel]
-        Mapping of dataset identifier to the reconstructed model.
-    """
-    tsv = os.path.join(dm_dir, "coverage_models.tsv")
-    npz = os.path.join(dm_dir, "coverage_models.npz")
-    return CoverageModel.from_files(tsv, npz if load_optional and os.path.exists(npz) else None)

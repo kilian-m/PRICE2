@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # Re-exported for callers (and tests) that import the objectives from here.
 _huber_weights = huber_weights
 _distribution_theta = distribution_theta
+
+
+def _by_id(transcripts) -> list[Transcript]:
+    """The transcripts sorted by id: a fixed order that no hash seed can change."""
+    return sorted(transcripts, key=lambda transcript: transcript.id)
 poisson_nll_grad = likelihood.poisson_nll_grad
 weighted_poisson_nll_grad = likelihood.weighted_poisson_nll_grad
 weighted_poisson_nll_grad_lasso = likelihood.weighted_poisson_nll_grad_lasso
@@ -100,7 +105,9 @@ class Locus:
 
     iv: HTSeq.GenomicInterval
     id: str
-    transcripts: set[Transcript]
+    #: The annotated transcripts sorted by id; after ``build_rgrs`` the
+    #: read-supported ones, in selection order.
+    transcripts: list[Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
     exon_length: int
 
@@ -133,13 +140,13 @@ class Locus:
         for iv, val in transcript_intervals[self.iv].steps():
             self.transcript_intervals[iv] = val
 
-        self.transcripts: set[Transcript] = set()
-
+        transcripts: set[Transcript] = set()
         self.exon_length = 0
         for iv, value in self.transcript_intervals.steps():
-            self.transcripts |= value
+            transcripts |= value
             if value:
                 self.exon_length += iv.length
+        self.transcripts = _by_id(transcripts)
 
     def _init_state(self) -> None:
         """Reset everything a worker fills in after the skeleton is built."""
@@ -208,9 +215,11 @@ class Locus:
         """Restore a pickle, filling in attributes older pickles lack."""
         self._init_state()
         # Skeletons collected before the RGRs became an ordered list carry
-        # an (empty) ``rgr_set``.
+        # an (empty) ``rgr_set``, and older ones a set of transcripts.
         state.pop("rgr_set", None)
         self.__dict__.update(state)
+        if isinstance(self.transcripts, (set, frozenset)):
+            self.transcripts = _by_id(self.transcripts)
 
     def __repr__(self) -> str:
         return f"Locus({self.iv})"

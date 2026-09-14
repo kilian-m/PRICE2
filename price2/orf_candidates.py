@@ -60,7 +60,7 @@ ORF_TYPES_LEVELS: list[set[str]] = [
 
 def get_orf_type(
     orf: ReadGeneratingRegion,
-    transcripts: set[Transcript],
+    transcripts: list[Transcript],
 ) -> str:
     """Classify an ORF relative to the annotated CDSs of compatible transcripts.
 
@@ -76,7 +76,7 @@ def get_orf_type(
     ----------
     orf : ReadGeneratingRegion
         An ORF-type RGR whose type should be classified.
-    transcripts : set[Transcript]
+    transcripts : list[Transcript]
         All transcripts belonging to the locus.
 
     Returns
@@ -343,67 +343,24 @@ def build_rgrs(
         RGRs were built; ``False`` for empty loci that downstream code
         should skip.
     """
-    with database.connect(db_path) as db:
-        rows = db.execute(
-            "SELECT transcript_read_counts_blob FROM transcript_read_counts "
-            "WHERE locus_id = ?",
-            (locus.id,),
-        ).fetchall()
-
-    transcript_read_counts: dict = {}
-    for (blob,) in rows:
-        for k, v in database.decompress_blob(blob).items():
-            transcript_read_counts[k] = transcript_read_counts.get(k, 0) + v
-
-    # ``locus.transcripts`` is a set; the greedy selection below keeps the
-    # first of several transcripts explaining the same reads, so its order
-    # has to be fixed for the result not to depend on the hash seed.
-    tr_ids = sorted(t.id for t in locus.transcripts)
-    explaining_transcripts_reads_list = []
-
-    if tr_ids and transcript_read_counts:
-        n_tr = len(tr_ids)
-        n_rs = len(transcript_read_counts)
-        tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
-
-        M = np.zeros((n_rs, n_tr), dtype=bool)
-        counts = np.zeros(n_rs, dtype=np.float64)
-
-        for row_i, (read_set, count) in enumerate(transcript_read_counts.items()):
-            counts[row_i] = count
-            for member in read_set:
-                if member in tr_to_col:
-                    M[row_i, tr_to_col[member]] = True
-
-        while counts.sum() > 0:
-            weighted = M.T @ counts
-            best_col = int(np.argmax(weighted))
-            best_score = weighted[best_col]
-            if best_score == 0:
-                break
-            explaining_transcripts_reads_list.append(
-                (tr_ids[best_col], best_score)
-            )
-            counts[M[:, best_col]] = 0.0
-
-    transcripts_dict = {tr.id: tr for tr in locus.transcripts}
+    transcripts_by_id = {tr.id: tr for tr in locus.transcripts}
+    explained = _explaining_transcripts(
+        sorted(transcripts_by_id), _transcript_read_counts(db_path, locus.id)
+    )
 
     locus.transcripts_number = len(locus.transcripts)
     locus.transcripts = [
-        transcripts_dict[tr_id]
-        for tr_id, count in explaining_transcripts_reads_list
+        transcripts_by_id[tr_id]
+        for tr_id, count in explained
         if count > min_explained_reads
     ]
 
+    kept = set(locus.transcripts)
     new_tr_intervals = HTSeq.GenomicArray(
         list(locus.transcript_intervals.chrom_vectors.keys()), typecode="O"
     )
     for step_iv, step_set in locus.transcript_intervals.steps():
-        new_step_set = set()
-        for tr in step_set:
-            if tr in locus.transcripts:
-                new_step_set.add(tr)
-        new_tr_intervals[step_iv] = new_step_set
+        new_tr_intervals[step_iv] = step_set & kept
     locus.transcript_intervals = new_tr_intervals
 
     if not locus.transcripts:
@@ -411,3 +368,61 @@ def build_rgrs(
 
     make_rgrs(locus, genome, config)
     return True
+
+
+def _transcript_read_counts(db_path: str, locus_id: str) -> dict[frozenset, int]:
+    """Reads per compatible transcript set, summed over the runs."""
+    with database.connect(db_path) as db:
+        rows = db.execute(
+            "SELECT transcript_read_counts_blob FROM transcript_read_counts "
+            "WHERE locus_id = ?",
+            (locus_id,),
+        ).fetchall()
+    counts: dict[frozenset, int] = {}
+    for (blob,) in rows:
+        for k, v in database.decompress_blob(blob).items():
+            counts[k] = counts.get(k, 0) + v
+    return counts
+
+
+def _explaining_transcripts(
+    tr_ids: list[str], transcript_read_counts: dict[frozenset, int]
+) -> list[tuple[str, float]]:
+    """Greedy set cover of the reads by the transcripts.
+
+    Repeatedly picks the transcript compatible with the most not yet
+    explained reads and marks those reads explained, until none is left.
+    Ties go to the first of *tr_ids*, so its order fixes the result.
+
+    Parameters
+    ----------
+    tr_ids : list[str]
+        The locus's transcripts.
+    transcript_read_counts : dict
+        ``{frozenset of transcript ids: reads compatible with exactly them}``.
+
+    Returns
+    -------
+    list of (transcript id, reads it explained)
+        In selection order.
+    """
+    if not tr_ids or not transcript_read_counts:
+        return []
+    tr_to_col = {tr_id: i for i, tr_id in enumerate(tr_ids)}
+    M = np.zeros((len(transcript_read_counts), len(tr_ids)), dtype=bool)
+    counts = np.zeros(len(transcript_read_counts), dtype=np.float64)
+    for row_i, (read_set, count) in enumerate(transcript_read_counts.items()):
+        counts[row_i] = count
+        for member in read_set:
+            if member in tr_to_col:
+                M[row_i, tr_to_col[member]] = True
+
+    explained: list[tuple[str, float]] = []
+    while counts.sum() > 0:
+        weighted = M.T @ counts
+        best_col = int(np.argmax(weighted))
+        if weighted[best_col] == 0:
+            break
+        explained.append((tr_ids[best_col], weighted[best_col]))
+        counts[M[:, best_col]] = 0.0
+    return explained
