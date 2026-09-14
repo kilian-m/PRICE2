@@ -375,7 +375,7 @@ _APPENDED_SUFFIXES: tuple[str, ...] = (".tsv", ".bed", ".gtf", ".txt")
 _LOCUS_COLUMNS: tuple[str, ...] = ("locus_id", "loc_id")
 
 #: Column index of the locus id in the headerless intermediate TSV written by
-#: ``ReadGeneratingRegion.to_tsv_line`` (id, gene_id, loc_id, location, type).
+#: ``export.rgr_tsv_line`` (id, gene_id, loc_id, location, orf_type).
 _HEADERLESS_LOCUS_COLUMN = 2
 
 _GTF_LOCUS = re.compile(r'\b(?:locus_id|loc_id) "([^"]+)"')

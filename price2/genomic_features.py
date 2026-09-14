@@ -12,6 +12,7 @@ intervals stored in **chromosome order**.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 
 import HTSeq
@@ -176,6 +177,7 @@ class Transcript:
         self.rgr_set = self.rgr_set & rgr_set
 
 
+@dataclasses.dataclass(eq=False, repr=False)
 class ReadGeneratingRegion:
     """A candidate translated region that can generate Ribo-seq reads.
 
@@ -184,83 +186,54 @@ class ReadGeneratingRegion:
     transcript-local coordinates and participates in the group-LASSO
     deconvolution.
 
-    Attributes
-    ----------
-    type : RGRType
-        ``RGRType.ORF`` or ``RGRType.NOISE``.
-    id : str
-        Unique identifier for this RGR.
-    transcript : Transcript
-        The parent transcript.
-    transcript_id : str
-        Identifier of the parent transcript.
-    genomic_region : GenomicRegion
-        The coding body (stop codon excluded) as a genomic region.
-    full_genomic_region : GenomicRegion
-        The coding body including the stop codon (ORFs only;
-        equals :attr:`genomic_region` for NOISE regions).
-    iv_on_transcript : tuple[int, int]
-        Spliced transcript coordinates ``(start, end)`` of the coding
-        body, 0-based half-open.
-    dist_to_transcript_start : int
-        Distance in nt from the RGR start to the transcript 5' end.
-    dist_to_transcript_end : int
-        Distance in nt from the RGR end to the transcript 3' end.
-    read_count : int
-        Observed read count (populated externally).
-    orf_type : str | None
-        ORF type classification (e.g. ``'cORF'``, ``'uORF'``), or
-        ``None`` for NOISE regions or before classification.
+    The genomic coordinates are derived from the parent transcript's exon
+    structure when the region is created; :attr:`orf_type` and
+    :attr:`index` are assigned later by the locus that owns the region.
+
+    **Identity.**  Two RGRs are equal when they have the same type and the
+    same coding body (:attr:`genomic_region`); the ``id``, the parent
+    transcript, the ORF type and the index take no part.  This is what
+    lets :func:`~price2.orf_candidates.make_rgrs` deduplicate the same ORF
+    found on several transcripts of a locus.
     """
 
-    def __init__(
-        self,
-        type: RGRType | str,
-        transcript: Transcript,
-        id: str,
-        iv_on_transcript: tuple[int, int],
-    ) -> None:
-        """Create a ReadGeneratingRegion.
+    #: ``RGRType.ORF`` or ``RGRType.NOISE`` (a plain string is coerced).
+    type: RGRType
+    #: The parent transcript.
+    transcript: Transcript
+    #: Unique identifier for this RGR.
+    id: str
+    #: Spliced transcript coordinates ``(start, end)`` of the coding body,
+    #: 0-based half-open, stop codon excluded.
+    iv_on_transcript: tuple[int, int]
+    #: ORF type classification (e.g. ``'cORF'``, ``'uORF'``), or ``None``
+    #: for NOISE regions or before classification.
+    orf_type: str | None = None
+    #: Position in ``Locus.rgrs``, which addresses the region's
+    #: design-matrix column block and its row of the activity matrix;
+    #: ``-1`` until the locus assigns it.
+    index: int = -1
+    #: The coding body (stop codon excluded) as a genomic region.
+    genomic_region: GenomicRegion = dataclasses.field(init=False)
+    #: The coding body including the stop codon (ORFs only; equals
+    #: :attr:`genomic_region` for NOISE regions).
+    full_genomic_region: GenomicRegion = dataclasses.field(init=False)
+    #: Distance in nt from the RGR start to the transcript 5' end.
+    dist_to_transcript_start: int = dataclasses.field(init=False)
+    #: Distance in nt from the RGR end to the transcript 3' end.
+    dist_to_transcript_end: int = dataclasses.field(init=False)
 
-        Genomic coordinates are derived from the parent transcript's exon
-        structure.
-
-        Parameters
-        ----------
-        type : RGRType | str
-            ``RGRType.ORF`` or ``RGRType.NOISE`` (plain strings are
-            also accepted for backward compatibility).
-        transcript : Transcript
-            The parent transcript.
-        id : str
-            Unique identifier for this RGR.
-        iv_on_transcript : tuple[int, int]
-            Spliced transcript coordinates ``(start, end)``, 0-based
-            half-open.
-        """
-        self.type: RGRType = RGRType(type)
-        self.read_count: int = 0
-        self.id: str = id
-        self.transcript: Transcript = transcript
-        self.orf_type: str | None = None
-
-        self.genomic_region: GenomicRegion = transcript.exons.map_to_global(
-            iv_on_transcript
-        )
-        if self.type == "ORF":
-            self.full_genomic_region: GenomicRegion = (
-                transcript.exons.map_to_global(
-                    (iv_on_transcript[0], iv_on_transcript[1] + 3)
-                )
-            )
+    def __post_init__(self) -> None:
+        self.type = RGRType(self.type)
+        exons = self.transcript.exons
+        start, end = self.iv_on_transcript
+        self.genomic_region = exons.map_to_global(self.iv_on_transcript)
+        if self.type is RGRType.ORF:
+            self.full_genomic_region = exons.map_to_global((start, end + 3))
         else:
             self.full_genomic_region = self.genomic_region
-        self.transcript_id: str = transcript.id
-        self.iv_on_transcript: tuple[int, int] = iv_on_transcript
-        self.dist_to_transcript_start: int = iv_on_transcript[0]
-        self.dist_to_transcript_end: int = (
-            transcript.exon_length - iv_on_transcript[1]
-        )
+        self.dist_to_transcript_start = start
+        self.dist_to_transcript_end = self.transcript.exon_length - end
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ReadGeneratingRegion):
@@ -270,7 +243,7 @@ class ReadGeneratingRegion:
         )
 
     def __hash__(self) -> int:
-        return hash(self.genomic_region)
+        return hash((self.type, self.genomic_region))
 
     def __len__(self) -> int:
         return len(self.genomic_region)
