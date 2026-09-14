@@ -88,9 +88,8 @@ def get_orf_type(
     assignments: dict[Transcript, str] = {}
 
     for tr in transcripts:
-        try:
-            orf_interval = tr.exons.map_to_local(orf.genomic_region)
-        except ValueError:
+        orf_interval = tr.exons.try_map_to_local(orf.genomic_region)
+        if orf_interval is None:
             continue
 
         if tr.annotated_cds_iv is not None:

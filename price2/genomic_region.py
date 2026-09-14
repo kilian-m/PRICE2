@@ -153,16 +153,32 @@ class GenomicRegion:
         Raises
         ------
         ValueError
-            If *other* is ``None`` or has a different chromosome or strand or is not fully contained in *self*.
+            If *other* is ``None`` or has a different chromosome or strand or
+            is not fully contained in *self*.  Callers that expect the
+            failure — every "does this read fit this transcript?" loop —
+            use :meth:`try_map_to_local` instead.
         """
         if other is None:
             raise ValueError("Cannot map None region to local coordinates.")
+        span = self._map_to_local(other)
+        if isinstance(span, str):
+            raise ValueError(span)
+        return span
 
+    def try_map_to_local(self, other: GenomicRegion) -> tuple[int, int] | None:
+        """:meth:`map_to_local`, returning ``None`` where it would raise.
+
+        For the loops that test a read against every candidate transcript:
+        most candidates fail, and an exception per failure costs more than
+        the mapping itself.
+        """
+        span = self._map_to_local(other)
+        return None if isinstance(span, str) else span
+
+    def _map_to_local(self, other: GenomicRegion) -> tuple[int, int] | str:
+        """The span of *other* in *self*, or the reason there is none."""
         if self.chrom != other.chrom or self.strand != other.strand:
-            raise ValueError("Cannot map region with different chromosome or strand.")
-
-        # self_ivs = sorted(self.intervals, key=lambda iv: iv.start)
-        # other_ivs = sorted(other.intervals, key=lambda iv: iv.start)
+            return "Cannot map region with different chromosome or strand."
 
         j = 0
         cum_len = 0  # cumulative spliced length of self-intervals before index j
@@ -181,43 +197,29 @@ class GenomicRegion:
                 j += 1
 
             if j >= len(self.intervals):
-                raise ValueError(
-                    "Other region extends beyond the bounds of this region."
-                )
+                return "Other region extends beyond the bounds of this region."
 
             x, y = self.intervals[j].start, self.intervals[j].end
 
             # other-interval must be fully contained within this self-interval.
             if not (x <= a and b <= y):
-                raise ValueError(
-                    "Other region is not fully contained within this region."
-                )
+                return "Other region is not fully contained within this region."
 
             # Contiguity check: no self-intervals were skipped between matches.
             if prev_j is not None and j > prev_j + 1:
-                raise ValueError(
-                    "Other region spans a junction not present in this region."
-                )
+                return "Other region spans a junction not present in this region."
 
             # Same-exon junction: consecutive read exons within one
             # self-interval means a spurious splice inside an exon.
             if prev_j is not None and j == prev_j:
-                raise ValueError(
-                    "Read has a splice junction inside a reference exon."
-                )
+                return "Read has a splice junction inside a reference exon."
 
             # Junction boundary check: when consecutive other-intervals
             # map to consecutive self-intervals, the splice sites must
             # align exactly.
             if prev_j is not None and j == prev_j + 1:
-                if prev_other_end != self.intervals[prev_j].end:
-                    raise ValueError(
-                        "Read junction does not match reference exon boundary."
-                    )
-                if a != x:
-                    raise ValueError(
-                        "Read junction does not match reference exon boundary."
-                    )
+                if prev_other_end != self.intervals[prev_j].end or a != x:
+                    return "Read junction does not match reference exon boundary."
 
             offset_start = cum_len + (a - x)
             offset_end = cum_len + (b - x)

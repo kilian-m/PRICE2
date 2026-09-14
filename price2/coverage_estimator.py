@@ -71,9 +71,8 @@ def _try_assign_p_site(
     transcript = None
     iv_on_cds = None
     for tr in transcript_candidates:
-        try:
-            iv_on_exons = tr.exons.map_to_local(aln.genomic_region)
-        except ValueError:
+        iv_on_exons = tr.exons.try_map_to_local(aln.genomic_region)
+        if iv_on_exons is None:
             continue
         if transcript is not None:
             return None

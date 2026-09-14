@@ -151,14 +151,13 @@ class CleavageEstimator:
                 for tr in transcript_candidates:
                     if tr.annotated_cds_iv is None:
                         continue
-                    try:
-                        iv_on_tr = tr.exons.map_to_local(aln.genomic_region)
-                        iv_on_cds = (
-                            iv_on_tr[0] - tr.annotated_cds_iv[0],
-                            iv_on_tr[1] - tr.annotated_cds_iv[0],
-                        )
-                    except ValueError:
+                    iv_on_tr = tr.exons.try_map_to_local(aln.genomic_region)
+                    if iv_on_tr is None:
                         continue
+                    iv_on_cds = (
+                        iv_on_tr[0] - tr.annotated_cds_iv[0],
+                        iv_on_tr[1] - tr.annotated_cds_iv[0],
+                    )
 
                     if (
                         iv_on_cds[0] > min_dist_to_start
@@ -186,17 +185,12 @@ class CleavageEstimator:
                 for tr in transcript_candidates:
                     if not tr.annotated_cds_iv:
                         continue
-                    try:
-                        new_dist_to_exon_start = tr.exons.map_to_local(
-                            aln.genomic_region
-                        )[0]
-                        new_dist_to_cds_start = (
-                            new_dist_to_exon_start - tr.annotated_cds_iv[0]
-                        )
-                    except ValueError:
-                        new_dist_to_cds_start = None
-
-                    new_dist_to_start = new_dist_to_cds_start
+                    iv_on_tr = tr.exons.try_map_to_local(aln.genomic_region)
+                    new_dist_to_start = (
+                        None
+                        if iv_on_tr is None
+                        else iv_on_tr[0] - tr.annotated_cds_iv[0]
+                    )
 
                     if isinstance(new_dist_to_start, int):
                         if dist_to_start is None:

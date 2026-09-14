@@ -510,14 +510,11 @@ def _slow_path_transcripts(blocks: list, locus: Locus) -> list:
     region = GenomicRegion(
         [HTSeq.GenomicInterval(chrom, s, e, strand) for s, e in blocks]
     )
-    transcripts = []
-    for transcript in set.intersection(*transcript_sets):
-        try:
-            transcript.exons.map_to_local(region)
-            transcripts.append(transcript)
-        except ValueError:
-            continue
-    return transcripts
+    return [
+        transcript
+        for transcript in set.intersection(*transcript_sets)
+        if transcript.exons.try_map_to_local(region) is not None
+    ]
 
 
 #: The transcript set of a read that maps into none.

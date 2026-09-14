@@ -683,10 +683,10 @@ def rgr_compatibility(
     noise_cl = noise_lut[read_length, oua_i] if in_lut else 0.0
 
     for tr in overlap_transcripts:
-        try:
-            rsa_lo, rsa_hi = tr.exons.map_to_local(rsa.genomic_region)
-        except ValueError:
+        span = tr.exons.try_map_to_local(rsa.genomic_region)
+        if span is None:
             continue
+        rsa_lo, rsa_hi = span
         for rgr in tr.rgr_set:
             rgr_lo, rgr_hi = rgr.iv_on_transcript
             inside = rgr_lo <= rsa_lo and rgr_hi >= rsa_hi
