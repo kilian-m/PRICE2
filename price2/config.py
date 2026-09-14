@@ -364,16 +364,128 @@ class Config:
         return cls(**{k: v for k, v in kwargs.items() if k in known_fields})
 
     def __post_init__(self) -> None:
-        """Resolve empty path fields to their default locations under ``base_dir``."""
-        allowed_ends = ("local", "endtoend")
-        if self.align_ends_type not in allowed_ends:
-            raise ValueError(
-                f"align_ends_type must be one of {allowed_ends}, "
-                f"got {self.align_ends_type!r}"
-            )
+        """Resolve the empty path fields under ``base_dir`` and validate the options.
+
+        Raises
+        ------
+        ValueError
+            For an option outside its allowed values or range.  Checking
+            here, rather than where the option is first read, fails the run
+            before any work is done instead of inside a worker hours later
+            (an unknown ``inner_solver``, say, would otherwise silently
+            select L-BFGS-B).
+        """
         if self.o_dir == "":
             self.o_dir = f"{self.base_dir}/o_dir"
         if self.w_dir == "":
             self.w_dir = f"{self.base_dir}/w_dir"
         if self.bam_dir == "":
             self.bam_dir = f"{self.base_dir}/bam_dir"
+        self.start_codons = _codons("start_codons", self.start_codons)
+        self.stop_codons = _codons("stop_codons", self.stop_codons)
+        self._validate()
+
+    def _validate(self) -> None:
+        for name, allowed in _CHOICES.items():
+            value = getattr(self, name)
+            if value not in allowed:
+                raise ValueError(
+                    f"{name} must be one of {', '.join(map(repr, allowed))}, "
+                    f"got {value!r}"
+                )
+        if not isinstance(logging.getLevelName(self.log_level), int):
+            raise ValueError(f"log_level is not a logging level: {self.log_level!r}")
+        for name in _POSITIVE:
+            _check_number(name, getattr(self, name), strict=True)
+        for name in _NON_NEGATIVE:
+            _check_number(name, getattr(self, name), strict=False)
+        for name in _INTEGER:
+            if not isinstance(getattr(self, name), int):
+                raise ValueError(
+                    f"{name} must be an integer, got {getattr(self, name)!r}"
+                )
+        if self.bam_ids is not None and not all(
+            isinstance(bam_id, str) and bam_id for bam_id in self.bam_ids
+        ):
+            raise ValueError(f"bam_ids must be a list of names, got {self.bam_ids!r}")
+
+
+#: Options restricted to a fixed set of values.
+_CHOICES: dict[str, tuple[str, ...]] = {
+    "align_ends_type": ("local", "endtoend"),
+    "distribution": ("poisson", "nb"),
+    "inner_solver": ("mu", "lbfgs"),
+    "mu_dtype": ("float32", "float64"),
+}
+
+#: Numeric options that must be greater than zero.
+_POSITIVE: tuple[str, ...] = (
+    "processes",
+    "timeout",
+    "pseudo_min",
+    "min_well_fitting_reads_per_length",
+    "deconvolution_filter_min_activity",
+    "stop_factor_relative",
+    "maxls",
+    "rgr_min_activity",
+    "min_activity_fraction",
+    "irls_huber_c",
+    "irls_huber_max_outer",
+    "irls_huber_tol",
+    "irls_active_patience",
+    "nb_dispersion",
+    "mu_inner_max_iter",
+    "mu_inner_tol",
+    "mu_broker_procs",
+    "mu_broker_streams",
+    "likelihood_ratio_alpha",
+    "em_max_iter",
+    "em_tol",
+    "em_huber_steps",
+)
+
+#: Numeric options that must not be negative.
+_NON_NEGATIVE: tuple[str, ...] = (
+    "worker_max_tasks",
+    "min_explained_reads_per_run",
+    "ftol",
+    "gtol",
+    "lam",
+    "mu_gpu_min_rows",
+)
+
+#: Options that are counts: an integer, not merely a number.
+_INTEGER: tuple[str, ...] = (
+    "processes",
+    "worker_max_tasks",
+    "maxls",
+    "irls_huber_max_outer",
+    "irls_active_patience",
+    "mu_gpu_min_rows",
+    "mu_inner_max_iter",
+    "mu_broker_procs",
+    "mu_broker_streams",
+    "em_max_iter",
+    "em_huber_steps",
+)
+
+_NUCLEOTIDES = frozenset("ACGT")
+
+
+def _check_number(name: str, value: object, *, strict: bool) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    if value < 0 or (strict and value == 0):
+        bound = "greater than zero" if strict else "zero or more"
+        raise ValueError(f"{name} must be {bound}, got {value!r}")
+
+
+def _codons(name: str, codons: object) -> tuple[str, ...]:
+    """Return *codons* as a tuple of upper-case triplets, or raise."""
+    if isinstance(codons, str) or not isinstance(codons, (list, tuple)) or not codons:
+        raise ValueError(f"{name} must be a non-empty list of codons, got {codons!r}")
+    result = tuple(str(codon).upper() for codon in codons)
+    bad = [codon for codon in result if len(codon) != 3 or set(codon) - _NUCLEOTIDES]
+    if bad:
+        raise ValueError(f"{name} holds invalid codon(s): {', '.join(bad)}")
+    return result
