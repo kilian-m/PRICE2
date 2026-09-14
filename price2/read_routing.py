@@ -694,7 +694,7 @@ def rgr_compatibility(
                 rsa_lo <= rgr_lo <= rsa_hi or rsa_lo <= rgr_hi <= rsa_hi
             ):
                 continue
-            if rgr.type == "NOISE":
+            if not rgr.is_orf:
                 frame = None
                 cl = noise_cl
                 base = rgr.index * CELL_CODES + _NOISE_FRAME
@@ -743,10 +743,10 @@ def count_well_fitting_reads(loc: Locus, runs: list[RiboSeqRun]) -> None:
     for run in runs:
         well_fitting_rcs[run.id] = {}
         for rgr in loc.rgrs:
-            if rgr.type == "ORF":
+            if rgr.is_orf:
                 well_fitting_rcs[run.id][rgr.id] = 0
     # ORF id by ``rgr.index`` (``None`` for NOISE), to resolve the cells.
-    orf_id_of = [rgr.id if rgr.type == "ORF" else None for rgr in loc.rgrs]
+    orf_id_of = [rgr.id if rgr.is_orf else None for rgr in loc.rgrs]
     for run in runs:
         well_fitting_indices = run.cleavage_model.get_high_prob_indices()
         well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}

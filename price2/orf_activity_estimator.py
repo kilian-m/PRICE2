@@ -819,7 +819,7 @@ def _full_pass(
         with perf.timed("likelihood_ratio_time"):
             loc.likelihood_ratio_filtering(config, runs)
         perf["filtered_lrt_rgr_count"] = len(loc.rgrs)
-        perf["orf_count"] = sum(1 for rgr in loc.rgrs if rgr.type == "ORF")
+        perf["orf_count"] = sum(1 for rgr in loc.rgrs if rgr.is_orf)
 
     with perf.timed("activity_time"):
         loc.estimate_activities(runs, config)

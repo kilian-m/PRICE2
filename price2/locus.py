@@ -383,7 +383,7 @@ class Locus:
         rgrs_to_remove = {
             rgr
             for rgr in self.rgrs
-            if rgr.id in rgrs_to_remove_ids and rgr.type == "ORF"
+            if rgr.id in rgrs_to_remove_ids and rgr.is_orf
         }
 
         self.remove_rgrs(rgrs_to_remove)
@@ -413,7 +413,7 @@ class Locus:
         rgrs_to_remove = {
             rgr
             for rgr in self.rgrs
-            if rgr.type == "ORF" and rgr.id in rgr_ids_to_remove
+            if rgr.is_orf and rgr.id in rgr_ids_to_remove
         }
 
         self.remove_rgrs(rgrs_to_remove)
@@ -434,7 +434,7 @@ class Locus:
         """
         stop_groups = {}
         for rgr in self.rgrs:
-            if rgr.type == "NOISE":
+            if not rgr.is_orf:
                 continue
             if rgr.genomic_region.strand == "+":
                 stop = rgr.genomic_region.intervals[-1].end
@@ -785,7 +785,7 @@ class Locus:
     def _orfs_at(self, indices) -> set[ReadGeneratingRegion]:
         """The ORF-type RGRs among ``rgrs[i] for i in indices``."""
         return {
-            rgr for rgr in map(self.rgrs.__getitem__, indices) if rgr.type == "ORF"
+            rgr for rgr in map(self.rgrs.__getitem__, indices) if rgr.is_orf
         }
 
     def update_transcript_rgrs(self) -> None:
@@ -971,9 +971,9 @@ class Locus:
             return w, log_likelihood
 
         noise_rgr_indices = {
-            rgr.index for rgr in self.rgrs if rgr.type == "NOISE"
+            rgr.index for rgr in self.rgrs if not rgr.is_orf
         }
-        test_rgr_indices = {rgr.index for rgr in self.rgrs if rgr.type == "ORF"}
+        test_rgr_indices = {rgr.index for rgr in self.rgrs if rgr.is_orf}
         keep_rgr_indices = noise_rgr_indices | test_rgr_indices
 
         full_activities, full_log_likelihood = fit(initial_guess, None)

@@ -119,7 +119,7 @@ def rgr_gtf(rgr: ReadGeneratingRegion, locus_id: str) -> str:
     if rgr.orf_type is not None:
         attributes += f' orf_type "{rgr.orf_type}";'
     intervals = region.intervals if strand == "+" else region.intervals[::-1]
-    features = ["exon", "CDS"] if rgr.type == "ORF" else ["exon"]
+    features = ["exon", "CDS"] if rgr.is_orf else ["exon"]
     lines = []
     for interval in intervals:
         for feature in features:
@@ -190,11 +190,11 @@ def gtf_outputs(
         outputs["loci.gtf"] = OutputText(locus_gtf_line(loc))
     if write_transcripts:
         outputs["transcripts.gtf"] = OutputText(
-            "".join(rgr_gtf(r, loc.id) for r in loc.rgrs if r.type == "NOISE")
+            "".join(rgr_gtf(r, loc.id) for r in loc.rgrs if not r.is_orf)
         )
     if write_orfs:
         outputs["orfs.gtf"] = OutputText(
-            "".join(rgr_gtf(r, loc.id) for r in loc.rgrs if r.type == "ORF")
+            "".join(rgr_gtf(r, loc.id) for r in loc.rgrs if r.is_orf)
         )
     return outputs
 
@@ -223,7 +223,7 @@ def tsv_output(
     with_activities = runs is not None and loc.result_df is not None
     lines = []
     for rgr in loc.rgrs:
-        if not include_noise and rgr.type != "ORF":
+        if not include_noise and not rgr.is_orf:
             continue
         if with_activities:
             activities = "\t".join(f"{v:.2e}" for v in loc.result_df.loc[rgr.id])
@@ -244,7 +244,7 @@ def bed_output(loc: Locus, include_noise: bool = False) -> tuple[str, OutputText
     body = "".join(
         rgr_bed_line(rgr)
         for rgr in loc.rgrs
-        if include_noise or rgr.type == "ORF"
+        if include_noise or rgr.is_orf
     )
     return name, OutputText(body)
 

@@ -115,7 +115,7 @@ class EquivalenceGroupIntervals:
         covpos : CoveragePosition
             Which part of the coverage profile this interval corresponds to.
         """
-        if rgr.type == "NOISE":
+        if not rgr.is_orf:
             phases_to_fill = [0, 1, 2]
         else:
             phases_to_fill = [phase]
@@ -580,7 +580,7 @@ def make_equivalence_intervals(
     cov_middle = CoveragePosition.middle
     cov_stop = CoveragePosition.stop
     for rgr in transcript.rgr_set:
-        if rgr.type == "NOISE":
+        if not rgr.is_orf:
             try:
                 start = max(
                     0,

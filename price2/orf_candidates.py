@@ -16,7 +16,7 @@ from pyfaidx import Fasta
 
 from price2 import database
 from price2.config import Config
-from price2.genomic_features import ReadGeneratingRegion, Transcript
+from price2.genomic_features import ReadGeneratingRegion, RGRType, Transcript
 from price2.locus import Locus
 
 # Transcript biotypes that count as long non-coding RNA.  Ensembl (>=97)
@@ -221,14 +221,14 @@ def make_rgrs(
         ):
             # cds_start = transcript.exons.map_to_local(transcript.cds)[0]
             noise1 = ReadGeneratingRegion(
-                "NOISE",
+                RGRType.NOISE,
                 transcript,
                 f"{transcript.id}_a",
                 (0, cds_start),
             )
 
             noise2 = ReadGeneratingRegion(
-                "NOISE",
+                RGRType.NOISE,
                 transcript,
                 f"{transcript.id}_b",
                 (cds_start, len(transcript.exons)),
@@ -252,7 +252,7 @@ def make_rgrs(
 
         else:
             noise = ReadGeneratingRegion(
-                "NOISE",
+                RGRType.NOISE,
                 transcript,
                 transcript.id,
                 (0, len(transcript.exons)),
@@ -283,7 +283,7 @@ def make_rgrs(
             )  # remove stop codon
             c += 1
             orf = ReadGeneratingRegion(
-                "ORF",
+                RGRType.ORF,
                 transcript,
                 f"{transcript.id}_{c:04d}",
                 rgr_iv_on_transcript,

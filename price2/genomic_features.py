@@ -23,8 +23,9 @@ from price2.genomic_region import GenomicRegion
 class RGRType(str, enum.Enum):
     """Type of a :class:`ReadGeneratingRegion`.
 
-    Inherits from ``str`` so that comparisons with plain string
-    literals (e.g. ``rgr.type == "ORF"``) keep working.
+    Inherits from ``str`` so that it renders as its value in the output
+    tables and a plain string is accepted at construction; code asks
+    :attr:`ReadGeneratingRegion.is_orf` rather than comparing strings.
     """
 
     ORF = "ORF"
@@ -234,6 +235,11 @@ class ReadGeneratingRegion:
             self.full_genomic_region = self.genomic_region
         self.dist_to_transcript_start = start
         self.dist_to_transcript_end = self.transcript.exon_length - end
+
+    @property
+    def is_orf(self) -> bool:
+        """Whether this is an ORF candidate (else a NOISE region)."""
+        return self.type is RGRType.ORF
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ReadGeneratingRegion):
