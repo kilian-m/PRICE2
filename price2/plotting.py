@@ -204,9 +204,8 @@ def plot_cleavage_full(
 
     # Panel 1: read length / reading-frame distribution.
     #
-    # ``model.table`` is in the EM's frame convention: after
-    # :meth:`CleavageEstimator.correct_table` column ``c`` holds the reads
-    # whose P-site offset is ``c`` (mod 3).  What this panel should show,
+    # ``model.table`` is in the EM's frame convention: column ``c`` holds
+    # the reads whose P-site offset is ``c`` (mod 3).  What this panel should show,
     # though, is the *genomic* reading frame of the read start relative to
     # the CDS start (``read_start_offset % 3``) -- the phase the reads
     # actually fall into: a 12-nt cleavage distance is frame 0, 13 nt is

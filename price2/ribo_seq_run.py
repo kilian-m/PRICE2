@@ -320,7 +320,6 @@ def _sample_and_fit_cleavage(
 
     estimator = CleavageEstimator()
     estimator.collect_data(_WORKER_RA, sample_bam, end_to_end=_WORKER_END_TO_END)
-    estimator.correct_table()
     return run_id, read_count, sample_bam, estimator.counted_alns, estimator.run()
 
 

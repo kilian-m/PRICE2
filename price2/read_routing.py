@@ -22,6 +22,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 
 from price2 import database, multimap
+from price2.cleavage_model import OVERLAP_LIKELIHOOD_RATIO
 from price2.coverage_position import CoveragePosition
 from price2.equivalence_groups import CELL_CODES, NO_FRAME
 from price2.genomic_region import GenomicRegion
@@ -650,7 +651,7 @@ def rgr_compatibility(
     loc: Locus,
     rsa: RiboSeqAlignment,
     run: RiboSeqRun,
-    overlap_likelihood_ratio_threshold: float = 0.2,
+    overlap_likelihood_ratio_threshold: float = OVERLAP_LIKELIHOOD_RATIO,
 ) -> frozenset[int] | None:
     """Determine which RGRs a read alignment is compatible with.
 
@@ -862,15 +863,16 @@ def model_tables(runs: list[RiboSeqRun]) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _build_model_tables(runs: list[RiboSeqRun]) -> tuple[np.ndarray, np.ndarray]:
-    num_runs = len(runs)
-    cm_lut = np.zeros((num_runs, runs[0].cleavage_model.cds_lut.shape[0], 4, 2))
-    coverage_params = np.zeros((num_runs, 3))
-    for i, run in enumerate(runs):
-        cm_lut[i, :, NO_FRAME, :] = run.cleavage_model.noise_lut
-        cm_lut[i, :, :NO_FRAME, :] = run.cleavage_model.cds_lut
-        coverage_params[i, 0] = run.coverage_model.start_factor
-        coverage_params[i, 1] = 1
-        coverage_params[i, 2] = run.coverage_model.stop_factor
+    # The frame axis of a cleavage model's table is the frame code of a cell
+    # (``cleavage_model.NO_FRAME`` is ``equivalence_groups.NO_FRAME``), so
+    # the tables stack as they are.
+    cm_lut = np.stack([run.cleavage_model.lut for run in runs])
+    coverage_params = np.array(
+        [
+            (run.coverage_model.start_factor, 1.0, run.coverage_model.stop_factor)
+            for run in runs
+        ]
+    )
     return cm_lut, coverage_params
 
 

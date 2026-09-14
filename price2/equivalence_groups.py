@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
+from price2.cleavage_model import NO_FRAME
 from price2.coverage_position import CoveragePosition
 from price2.genomic_features import Transcript
 
@@ -36,12 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 #: Distinct ``frame_code * 3 + coverage_position`` values per RGR: four frame
-#: codes (0, 1, 2 and 3 for "no frame", i.e. NOISE) times three coverage
-#: positions.
+#: codes (0, 1, 2 and :data:`NO_FRAME` for NOISE, the frame axis of the
+#: cleavage model's look-up table) times three coverage positions.
 CELL_CODES = 12
-
-#: Frame code of a cell without a reading frame (a NOISE region).
-NO_FRAME = 3
 
 
 def pack_cell(

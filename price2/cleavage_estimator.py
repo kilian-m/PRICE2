@@ -17,11 +17,15 @@ import numpy as np
 import pysam
 from numba import njit, prange
 
+from typing import NamedTuple
+
 from price2.bam import iter_mapped
 from price2.cleavage_model import (
+    CANONICAL_P_SITE_OFFSET,
     DIST_STARTS_CENTRE,
     MIN_PEAK_PROBABILITY,
     PLAUSIBLE_P_SITE_OFFSETS,
+    UA_MISMATCH_PROB,
     CleavageModel,
 )
 from price2.genomic_features import Transcript
@@ -32,6 +36,43 @@ logger = logging.getLogger(__name__)
 
 #: Minimum number of counted alignments for a reliable cleavage model.
 MIN_COUNTED_ALNS: int = 100_000
+
+#: Read lengths tallied, ``[MIN_READ_LENGTH, MAX_READ_LENGTH)``; the fitted
+#: cleavage distributions run over the positions ``0 .. MAX_READ_LENGTH``.
+MIN_READ_LENGTH: int = 15
+MAX_READ_LENGTH: int = 40
+
+#: A read counts for the reading frame only when it lies more than this far
+#: inside the CDS at both ends, where the frame is unambiguous.
+MIN_DIST_TO_CDS_BOUND: int = 30
+
+#: Inclusive range of read-start-to-CDS-start distances searched for the
+#: translation onset (the P-site offset).
+MIN_ONSET_OFFSET: int = 6
+MAX_ONSET_OFFSET: int = 25
+
+#: Probability mass of ``pl`` / ``pr`` kept by :meth:`CleavageEstimator.regularize`.
+REGULARIZE_KEEP_MASS: float = 0.9
+
+#: How a restart's random ``pl`` is tilted towards the expected peak: the
+#: factors on the position before it, on it and after it.
+_INIT_PEAK_TILT: tuple[float, float, float] = (4.0, 10.0, 4.0)
+
+#: Guard against an empty likelihood in the E-step's normalisation.
+_EM_EPS: float = 1e-14
+
+
+class EmFit(NamedTuple):
+    """The best of the EM restarts of :func:`repeat`."""
+
+    #: Log-likelihood of the fitted model.
+    ll: float
+    #: Untemplated-addition probability.
+    u: float
+    #: Left cleavage distribution.
+    pl: np.ndarray
+    #: Right cleavage distribution.
+    pr: np.ndarray
 
 
 def project_onto_cds(
@@ -111,6 +152,9 @@ class CleavageEstimator:
         Convergence threshold on parameter change (L1, on ``pl`` and ``pr``).
     seed : int, optional
         Random seed for reproducibility.
+    min_length, max_length : int, optional
+        Read lengths tallied, ``[min_length, max_length)``; the fitted
+        distributions have ``max_length + 1`` positions.
     """
 
     def __init__(
@@ -119,15 +163,18 @@ class CleavageEstimator:
         maxiter: int = 10_000,
         delta_cutoff: float = 1e-8,
         seed: int = 42,
+        min_length: int = MIN_READ_LENGTH,
+        max_length: int = MAX_READ_LENGTH,
     ) -> None:
-        self.obs_min_len = 15
-        self.obs_max_len = 40
+        self.min_length = min_length
+        self.max_length = max_length
         self.seed = seed
         self.repeats = repeats
         self.maxiter = maxiter
         self.delta_cutoff = delta_cutoff
-        #: Counts by ``(length, frame, untemplated addition)``; see :meth:`tally`.
-        self.table = np.zeros(shape=(self.obs_max_len + 10, 3, 2), dtype=np.int32)
+        #: Counts by ``(length, frame column, untemplated addition)``, the
+        #: frame column being the EM's ``(-frame) % 3`` (see :meth:`tally`).
+        self.table = np.zeros(shape=(max_length + 1, 3, 2), dtype=np.int32)
         #: Read starts by distance to the CDS start, centred on
         #: ``DIST_STARTS_CENTRE``.
         self.dist_starts = np.zeros(shape=(2 * DIST_STARTS_CENTRE,), dtype=np.int32)
@@ -140,10 +187,8 @@ class CleavageEstimator:
         self,
         reference_annotation: ReferenceAnnotation,
         sample_bam_path: str,
-        min_considered_length: int = 15,
-        max_considered_length: int = 40,
-        min_dist_to_start: int = 30,
-        min_dist_to_end: int = 30,
+        min_dist_to_start: int = MIN_DIST_TO_CDS_BOUND,
+        min_dist_to_end: int = MIN_DIST_TO_CDS_BOUND,
         min_counted_alns: int = MIN_COUNTED_ALNS,
         end_to_end: bool = False,
     ) -> None:
@@ -160,8 +205,6 @@ class CleavageEstimator:
             Parsed reference annotation.
         sample_bam_path : str
             Path to the BAM file.
-        min_considered_length, max_considered_length : int, optional
-            Read lengths considered, ``[min, max)``.
         min_dist_to_start, min_dist_to_end : int, optional
             Minimum distance of the read from the CDS start and end for its
             frame to be counted.
@@ -181,8 +224,6 @@ class CleavageEstimator:
             self.tally(
                 (aln for aln in alignments if aln is not None),
                 reference_annotation,
-                min_considered_length,
-                max_considered_length,
                 min_dist_to_start,
                 min_dist_to_end,
             )
@@ -199,18 +240,18 @@ class CleavageEstimator:
         self,
         alignments: Iterable[RiboSeqAlignment],
         reference_annotation: ReferenceAnnotation,
-        min_considered_length: int = 15,
-        max_considered_length: int = 40,
-        min_dist_to_start: int = 30,
-        min_dist_to_end: int = 30,
+        min_dist_to_start: int = MIN_DIST_TO_CDS_BOUND,
+        min_dist_to_end: int = MIN_DIST_TO_CDS_BOUND,
     ) -> None:
         """Count the reads that map uniquely into annotated CDSs.
 
-        Every read whose length is in range, that maps uniquely, and whose
-        coding transcripts agree on its reading frame (:func:`project_onto_cds`)
-        adds one to ``table[length, frame, untemplated_addition]``; every
-        read whose coding transcripts agree on its distance to the CDS start
-        adds one to :attr:`dist_starts`.  The rejections are counted in
+        Every read whose length is in ``[min_length, max_length)``, that
+        maps uniquely, and whose coding transcripts agree on its reading
+        frame (:func:`project_onto_cds`) adds one to
+        ``table[length, (-frame) % 3, untemplated_addition]`` -- the column
+        convention of the EM (*Conventions* of :mod:`price2.cleavage_model`);
+        every read whose coding transcripts agree on its distance to the CDS
+        start adds one to :attr:`dist_starts`.  The rejections are counted in
         :attr:`skipped`.  Pure over its input: any iterable of alignments and
         any object with ``collect_coding_transcripts`` will do.
 
@@ -220,17 +261,16 @@ class CleavageEstimator:
             The reads.
         reference_annotation : ReferenceAnnotation
             Where the coding transcripts come from.
-        min_considered_length, max_considered_length : int, optional
-            Read lengths considered, ``[min, max)``.
         min_dist_to_start, min_dist_to_end : int, optional
             See :func:`project_onto_cds`.
         """
         table, dist_starts, skipped = self.table, self.dist_starts, self.skipped
+        min_length, max_length = self.min_length, self.max_length
         for aln in alignments:
             if not aln.unique:
                 skipped["not_unique"] += 1
                 continue
-            if not min_considered_length <= len(aln) < max_considered_length:
+            if not min_length <= len(aln) < max_length:
                 skipped["bad_length"] += 1
                 continue
             transcripts = reference_annotation.collect_coding_transcripts(
@@ -243,16 +283,12 @@ class CleavageEstimator:
                 aln, transcripts, min_dist_to_start, min_dist_to_end
             )
             if frame is not None:
-                table[len(aln), frame, int(aln.untemplated_addition)] += 1
+                table[len(aln), (-frame) % 3, int(aln.untemplated_addition)] += 1
                 self.counted_alns += 1
             elif ambiguous:
                 skipped["ambiguous_frame"] += 1
             if dist_to_start is not None and abs(dist_to_start) < DIST_STARTS_CENTRE:
                 dist_starts[DIST_STARTS_CENTRE + dist_to_start] += 1
-
-    def correct_table(self) -> None:
-        """Swap frame-1 and frame-2 columns in the count table."""
-        self.table = np.ascontiguousarray(self.table[:, [0, 2, 1]])
 
     def run(self, regularize: bool = True) -> CleavageModel:
         """Run EM estimation and return the fitted cleavage model.
@@ -269,8 +305,8 @@ class CleavageEstimator:
         """
         self.best_ll, self.best_u, self.best_pl, self.best_pr = repeat(
             self.repeats,
-            self.obs_max_len,
-            self.obs_min_len,
+            self.max_length,
+            self.min_length,
             self.table,
             self.maxiter,
             self.delta_cutoff,
@@ -307,16 +343,17 @@ class CleavageEstimator:
             table=table.copy() if table is not None else None,
         )
 
-    def regularize(self, keep_prob: float = 0.9) -> None:
+    def regularize(self, keep_prob: float = REGULARIZE_KEEP_MASS) -> None:
         """Zero out low-probability entries and re-normalise.
 
         Parameters
         ----------
         keep_prob : float, optional
-            Cumulative probability mass to retain (default 0.9).
+            Cumulative probability mass to retain
+            (:data:`REGULARIZE_KEEP_MASS` by default).
         """
-        self.best_pl = select_and_scale(self.best_pl.copy(), keep_prob)
-        self.best_pr = select_and_scale(self.best_pr.copy(), keep_prob)
+        self.best_pl = select_and_scale(self.best_pl, keep_prob)
+        self.best_pr = select_and_scale(self.best_pr, keep_prob)
 
     def _height(self, offset: int) -> float:
         """Read-start count at ``offset`` nt upstream of the CDS start.
@@ -328,7 +365,9 @@ class CleavageEstimator:
         idx = DIST_STARTS_CENTRE - offset
         return float(dist_starts[idx]) if 0 <= idx < len(dist_starts) else 0.0
 
-    def _reading_frame(self, min_offset: int = 6, max_offset: int = 25) -> int:
+    def _reading_frame(
+        self, min_offset: int = MIN_ONSET_OFFSET, max_offset: int = MAX_ONSET_OFFSET
+    ) -> int:
         """Reading frame (``offset % 3``) of the P-site relative to the CDS.
 
         The read-start metagene around the CDS start often carries a second comb
@@ -373,9 +412,9 @@ class CleavageEstimator:
     def _onset_offset(
         self,
         frame: int | None = None,
-        min_offset: int = 6,
-        max_offset: int = 25,
-        default: int = 12,
+        min_offset: int = MIN_ONSET_OFFSET,
+        max_offset: int = MAX_ONSET_OFFSET,
+        default: int = CANONICAL_P_SITE_OFFSET,
     ) -> int:
         """Read-start-to-CDS-start distance at the translation onset.
 
@@ -419,7 +458,7 @@ class CleavageEstimator:
         comb = [o for o in offsets if o % 3 == frame % 3]
         return max(comb, key=lambda o: self._height(o) - self._height(o + 3))
 
-    def init_peak(self, default: int = 12) -> int:
+    def init_peak(self, default: int = CANONICAL_P_SITE_OFFSET) -> int:
         """Expected position of the ``pl`` peak, for initialising the EM.
 
         Delegates to :meth:`_onset_offset`; the most frequent distance from a
@@ -460,26 +499,30 @@ class CleavageEstimator:
         return onset - int(np.argmax(self.best_pl))
 
     def correct_max_pos(self, shift: int) -> None:
-        """Shift pl and pr arrays and re-normalise.
+        """Move ``pl`` *shift* positions right and ``pr`` as far left, re-normalised.
 
         Parameters
         ----------
         shift : int
             Number of positions to shift.
         """
-        n = len(self.best_pl)
-        pl = np.zeros(n)
-        for i in range(n):
-            if 0 <= i - shift < n:
-                pl[i] = self.best_pl[i - shift]
+        self.best_pl = _shifted(self.best_pl, shift)
+        self.best_pr = _shifted(self.best_pr, -shift)
 
-        pr = np.zeros(len(self.best_pr))
-        for i in range(len(self.best_pr)):
-            if 0 <= i + shift < n:
-                pr[i] = self.best_pr[i + shift]
 
-        self.best_pl = pl / pl.sum()
-        self.best_pr = pr / pr.sum()
+def _shifted(dist: np.ndarray, shift: int) -> np.ndarray:
+    """*dist* moved *shift* positions right (left when negative), re-normalised.
+
+    What runs off the end is lost and the vacated positions are zero.
+    """
+    n = len(dist)
+    out = np.zeros_like(dist)
+    k = min(abs(shift), n)
+    if shift >= 0:
+        out[k:] = dist[: n - k]
+    else:
+        out[: n - k] = dist[k:]
+    return out / out.sum()
 
 
 @njit(cache=True)
@@ -519,19 +562,19 @@ def compute_ll(
 
             if n > 0:
                 # Visible soft-clip UTA -> plain footprint geometry (see repeat()).
-                # An UTA is present and mismatches the reference: prob u * 3/4.
+                # An UTA is present and mismatches the reference.
                 i = np.arange(frame, min(len(pl), length - 2), 3)
-                p = (pl[i] * pr[length - i - 3]).sum() * u * 3 / 4
+                p = (pl[i] * pr[length - i - 3]).sum() * u * UA_MISMATCH_PROB
                 ll += n * np.log(p)
 
             untemplated_addition = 0
             n = table[length, frame, untemplated_addition]
 
             if n > 0:
-                # Either an UTA that matches the reference (prob u * 1/4, the
-                # footprint is one shorter and one frame over), or no UTA at all.
+                # Either an UTA that matches the reference (the footprint is
+                # one shorter and one frame over), or no UTA at all.
                 i = np.arange(frame1, min(len(pl), length - 3), 3)
-                p = (pl[i] * pr[length - i - 3 - 1]).sum() * u / 4
+                p = (pl[i] * pr[length - i - 3 - 1]).sum() * u * (1 - UA_MISMATCH_PROB)
                 i = np.arange(frame, min(len(pl), length - 2), 3)
                 p += (pl[i] * pr[length - i - 3]).sum() * (1 - u)
                 ll += n * np.log(p)
@@ -560,9 +603,9 @@ def _init_restarts(
         pl = np.random.rand(obs_max_len + 1)
         pr = np.random.rand(obs_max_len + 1)
 
-        pl[peak - 1] *= 4
-        pl[peak] *= 10
-        pl[peak + 1] *= 4
+        pl[peak - 1] *= _INIT_PEAK_TILT[0]
+        pl[peak] *= _INIT_PEAK_TILT[1]
+        pl[peak + 1] *= _INIT_PEAK_TILT[2]
 
         pls[rep] = pl / pl.sum()
         prs[rep] = pr / pr.sum()
@@ -590,15 +633,16 @@ def _em_restart(
     tuple[float, float]
         ``(log_likelihood, u)`` of the fitted model.
     """
+    # Initial guess: the visible untemplated additions are the mismatching
+    # fraction of all of them.
     N = table[obs_min_len : obs_max_len + 1, :, 1].sum()
-    u = N * 4 / 3
+    u = N / UA_MISMATCH_PROB
 
     N += table[obs_min_len : obs_max_len + 1, :, 0].sum()
     u /= N
 
+    eps = _EM_EPS
     for it in range(maxiter):
-        eps = 1e-14
-
         ql0 = np.zeros(obs_max_len + 1)
         qr0 = np.zeros(obs_max_len + 1)
         ql1 = np.zeros(obs_max_len + 1)
@@ -634,6 +678,7 @@ def _em_restart(
                 sum0 = eps
                 sum1 = eps
 
+                # P(matching UTA | no visible UTA) = (u/4) / (1 - u + u/4).
                 prop = u / (4 - 3 * u)
 
                 sum1 += (pl[left1] * pr[length - left1 - 3 - 1] * prop).sum()
@@ -714,8 +759,8 @@ def repeat(
     maxiter: int,
     delta_cutoff: float,
     seed: int = 42,
-    init_peak: int = 12,
-) -> tuple:
+    init_peak: int = CANONICAL_P_SITE_OFFSET,
+) -> EmFit:
     """Run the EM algorithm with multiple random restarts.
 
     Each restart starts from a uniform random ``pl``/``pr`` whose ``pl`` is then
@@ -745,12 +790,13 @@ def repeat(
     init_peak : int, optional
         Expected position of the ``pl`` peak, used to tilt the initialisation.
         :meth:`CleavageEstimator.init_peak` derives it from the observed
-        read-start-to-CDS-start histogram; 12 is the canonical value.
+        read-start-to-CDS-start histogram; :data:`CANONICAL_P_SITE_OFFSET`
+        otherwise.
 
     Returns
     -------
-    tuple
-        ``(best_ll, best_u, best_pl, best_pr)``.
+    EmFit
+        The best restart.
     """
     total = table[obs_min_len : obs_max_len + 1, :, :].sum()
     peak = min(max(init_peak, 1), obs_max_len - 1)
@@ -761,14 +807,14 @@ def repeat(
     )
 
     best = int(np.argmax(lls))
-    return lls[best], us[best], pls[best].copy(), prs[best].copy()
+    return EmFit(lls[best], us[best], pls[best].copy(), prs[best].copy())
 
 
 def select_and_scale(arr: np.ndarray, keep_prob: float) -> np.ndarray:
     """Keep the largest elements up to *keep_prob* mass, zero the rest.
 
-    Elements are selected in descending order until their cumulative
-    sum reaches *keep_prob*, then the result is re-normalised.
+    Elements are selected in descending order while the mass selected so
+    far is below *keep_prob*, then the result is re-normalised.
 
     Parameters
     ----------
@@ -782,21 +828,12 @@ def select_and_scale(arr: np.ndarray, keep_prob: float) -> np.ndarray:
     np.ndarray
         Filtered and re-normalised distribution.
     """
-    sorted_indices = np.argsort(arr)[::-1]
-    sorted_arr = arr[sorted_indices]
-
-    cumulative_sum = 0.0
-    selected_indices: list[int] = []
-    for i, elem in enumerate(sorted_arr):
-        if cumulative_sum >= keep_prob:
-            break
-        selected_indices.append(sorted_indices[i])
-        cumulative_sum += elem
+    order = np.argsort(arr)[::-1]
+    mass_before = np.concatenate(([0.0], np.cumsum(arr[order])[:-1]))
+    kept = order[mass_before < keep_prob]
 
     result = np.zeros_like(arr)
-    for idx in selected_indices:
-        result[idx] = arr[idx]
-
+    result[kept] = arr[kept]
     total = result.sum()
     if total > 0:
         result /= total

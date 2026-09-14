@@ -20,10 +20,17 @@ default region ``(0, UNBOUNDED)`` is served from the lookup tables.
 start the codon boundaries therefore sit at ``f0 = (-frame) % 3``, ``f0 + 3``,
 ...; an in-frame region bound must be ``≡ f0 (mod 3)``, and a P-site offset of
 ``i`` nt puts the read in frame ``(-i) % 3``.  ``frame=None`` selects the
-noise model, which has no frame.  The estimator's count table is collected
-with column ``frame`` and, after ``CleavageEstimator.correct_table``, holds in
-column ``c`` the reads with P-site offset ``≡ c (mod 3)``, i.e. frame
-``(-c) % 3`` -- the convention of the EM and of :func:`read_in_cds_likelihood`.
+noise model, which has no frame.  The estimator's count table holds in column
+``c`` the reads with P-site offset ``≡ c (mod 3)``, i.e. frame ``(-c) % 3`` --
+the convention of the EM and of :func:`read_in_cds_likelihood`.
+
+**Look-up table.**  :attr:`CleavageModel.lut` holds the unbounded likelihood
+of every read shape, ``lut[length, frame, oua]`` for the three frames and
+``lut[length, NO_FRAME, oua]`` for the noise model; :attr:`~CleavageModel.cds_lut`
+and :attr:`~CleavageModel.noise_lut` are views of it.  The frame axis is the
+frame code of a packed equivalence-group cell
+(:func:`price2.equivalence_groups.pack_cell`), so the design matrix indexes
+the table directly.
 
 **Distances to the ORF bounds.**  ``dist_to_orf_start[(length, oua, frame)]``
 is ``-p`` for the largest region-start offset ``p`` at which the read keeps at
@@ -58,14 +65,39 @@ PLAUSIBLE_P_SITE_OFFSETS: frozenset[int] = frozenset({11, 12, 13})
 #: Minimum probability mass on the upstream cleavage peak of a healthy model.
 MIN_PEAK_PROBABILITY: float = 0.3
 
+#: The canonical read-start-to-P-site distance: the estimator's fallback when
+#: a library's own metagene cannot place the translation onset.
+CANONICAL_P_SITE_OFFSET: int = 12
+
 #: A read is assigned a P-site codon (:meth:`CleavageModel.p_site_codon`) only
 #: when some codon reaches this likelihood ...
 P_SITE_MIN_CODON_LIKELIHOOD: float = 0.01
 #: ... and the best codon carries this fraction of the total over the codons.
 P_SITE_MIN_DOMINANT_FRACTION: float = 0.8
 
+#: A read bounded to a region still overlaps it when the bounded likelihood
+#: keeps this fraction of the unbounded one -- the rule of the distance
+#: tables (:meth:`CleavageModel.dist_to_orf_bounds`) and of the read routing
+#: (:func:`price2.read_routing.rgr_compatibility`).
+OVERLAP_LIKELIHOOD_RATIO: float = 0.2
+
+#: The CDS table entries carrying this much cumulative probability define the
+#: well-fitting read shapes of the coverage and deconvolution filters
+#: (:meth:`CleavageModel.get_high_prob_indices`).
+WELL_FITTING_MASS: float = 0.3
+
+#: An untemplated 5' base is one of four, so it mismatches the reference with
+#: this probability and is seen (soft-clipped or, under EndToEnd, recovered);
+#: a matching one is invisible and the read looks one base longer, in the
+#: next frame.
+UA_MISMATCH_PROB: float = 3 / 4
+
 #: ``region_end`` value meaning "no downstream bound" (see *Conventions*).
 UNBOUNDED: int = 10**10
+
+#: Frame code of the noise model on the frame axis of :attr:`CleavageModel.lut`
+#: (the same code :mod:`price2.equivalence_groups` packs into a cell).
+NO_FRAME: int = 3
 
 #: Index of ``dist_starts`` that counts the read starts sitting on the CDS
 #: start; the histogram has ``2 * DIST_STARTS_CENTRE`` bins.
@@ -109,7 +141,9 @@ class CleavageModel:
 
     Models the probability of left (upstream) and right (downstream)
     cleavage positions relative to the P-site, plus the probability
-    of an untemplated addition (UTA).
+    of an untemplated addition (UTA).  The distributions are read-only:
+    the look-up table and the distance tables are derived from them once,
+    at construction.
 
     Parameters
     ----------
@@ -119,6 +153,22 @@ class CleavageModel:
         Right cleavage probability distribution, shape (n_right,).
     pu : float
         Probability of an untemplated addition.
+    dist_starts : np.ndarray, optional
+        The estimator's read-start metagene (*Conventions*), for the plots.
+    table : np.ndarray, optional
+        The estimator's count table, for the plots.
+
+    Attributes
+    ----------
+    lut : np.ndarray, shape ``(max_length, 4, 2)``
+        The unbounded likelihood of every read shape (*Conventions*).
+    cds_lut, noise_lut : np.ndarray
+        Views of ``lut``: the three frames, and the noise model.
+    non_zero_lengths : np.ndarray
+        The read lengths the model can produce.
+    dist_to_orf_start, dist_to_orf_end : dict
+        The distance tables (*Conventions*), read through
+        :meth:`dist_to_orf_bounds`.
     """
 
     def __init__(
@@ -129,47 +179,53 @@ class CleavageModel:
         dist_starts: np.ndarray | None = None,
         table: np.ndarray | None = None,
     ) -> None:
-        self.pl = pl
-        self.pr = pr
-        self.pu = pu
-        if dist_starts is not None:
-            self.dist_starts = dist_starts
-        if table is not None:
-            self.table = _count_table(table)
-        # Axis 0 size is len(pl) + len(pr) + 4 so the longest physically
-        # possible read (len(pl) + len(pr) + 2 bases of cleavage + 1
-        # untemplated addition) has a valid LUT entry.
-        lut_len = len(self.pl) + len(self.pr) + 4
-        self.cds_lut = np.zeros((lut_len, 3, 2), dtype=np.float64)
-        for length in range(lut_len):
-            for frame in range(3):
-                for oua in range(2):
-                    self.cds_lut[length, frame, oua] = read_in_cds_likelihood(
-                        pl=self.pl,
-                        pr=self.pr,
-                        pu=self.pu,
-                        length=length,
-                        frame=frame,
-                        oua=oua,
-                        region_start=0,
-                        region_end=UNBOUNDED,
-                    )
-        self.noise_lut = np.zeros((lut_len, 2), dtype=np.float64)
-        for length in range(lut_len):
-            for oua in range(2):
-                self.noise_lut[length, oua] = read_in_noise_likelihood(
-                    pl=self.pl,
-                    pr=self.pr,
-                    pu=self.pu,
-                    length=length,
-                    oua=oua,
-                    region_start=0,
-                    region_end=UNBOUNDED,
-                )
-
+        self._pl = pl
+        self._pr = pr
+        self._pu = pu
+        self.dist_starts = dist_starts
+        self.table = None if table is None else _count_table(table)
+        self.lut = self._build_lut()
+        self._set_lut_views()
         self.non_zero_lengths = np.nonzero(self.noise_lut.sum(axis=1))[0]
         self.dist_to_orf_start = self._dist_to_orf_bound(end=False)
         self.dist_to_orf_end = self._dist_to_orf_bound(end=True)
+
+    @property
+    def pl(self) -> np.ndarray:
+        """Left cleavage probability distribution."""
+        return self._pl
+
+    @property
+    def pr(self) -> np.ndarray:
+        """Right cleavage probability distribution."""
+        return self._pr
+
+    @property
+    def pu(self) -> float:
+        """Probability of an untemplated addition."""
+        return self._pu
+
+    def _build_lut(self) -> np.ndarray:
+        """The unbounded likelihood of every read shape (*Look-up table*)."""
+        # Axis 0 size is len(pl) + len(pr) + 4 so the longest physically
+        # possible read (len(pl) + len(pr) + 2 bases of cleavage + 1
+        # untemplated addition) has a valid entry.
+        lut_len = len(self._pl) + len(self._pr) + 4
+        lut = np.zeros((lut_len, NO_FRAME + 1, 2), dtype=np.float64)
+        for length in range(lut_len):
+            for oua in range(2):
+                for frame in range(NO_FRAME):
+                    lut[length, frame, oua] = read_in_cds_likelihood(
+                        self._pl, self._pr, self._pu, length, frame, oua, 0, UNBOUNDED
+                    )
+                lut[length, NO_FRAME, oua] = read_in_noise_likelihood(
+                    self._pl, self._pr, self._pu, length, oua, 0, UNBOUNDED
+                )
+        return lut
+
+    def _set_lut_views(self) -> None:
+        self.cds_lut = self.lut[:, :NO_FRAME, :]
+        self.noise_lut = self.lut[:, NO_FRAME, :]
 
     def pmf(
         self,
@@ -200,16 +256,16 @@ class CleavageModel:
         float
             Probability of the read under the model.
         """
-        if length >= len(self.pl) + len(self.pr) + 3 + int(oua):
+        if length >= len(self._pl) + len(self._pr) + 3 + int(oua):
             return 0
 
         if frame is None:  # noise
             if region_start == 0 and region_end == UNBOUNDED:
                 return self.noise_lut[length, int(oua)]
             return read_in_noise_likelihood(
-                self.pl,
-                self.pr,
-                self.pu,
+                self._pl,
+                self._pr,
+                self._pu,
                 length,
                 oua,
                 region_start,
@@ -227,9 +283,9 @@ class CleavageModel:
                 raise ValueError("region_end and frame are not compatible")
 
             return read_in_cds_likelihood(
-                self.pl,
-                self.pr,
-                self.pu,
+                self._pl,
+                self._pr,
+                self._pu,
                 length,
                 frame,
                 oua,
@@ -237,7 +293,9 @@ class CleavageModel:
                 region_end,
             )
 
-    def get_high_prob_indices(self, prob_sum: float = 0.3) -> list[tuple[int, ...]]:
+    def get_high_prob_indices(
+        self, prob_sum: float = WELL_FITTING_MASS
+    ) -> list[tuple[int, ...]]:
         """Return CDS LUT indices covering the highest-probability entries.
 
         Greedily selects entries from ``cds_lut`` until their cumulative
@@ -246,7 +304,8 @@ class CleavageModel:
         Parameters
         ----------
         prob_sum : float, optional
-            Cumulative probability threshold (default 0.3).
+            Cumulative probability threshold, :data:`WELL_FITTING_MASS` by
+            default.
 
         Returns
         -------
@@ -264,7 +323,7 @@ class CleavageModel:
         return max_prob_positions
 
     def _dist_to_orf_bound(
-        self, end: bool, overlap_likelihood_ratio_thresh: float = 0.2
+        self, end: bool, overlap_likelihood_ratio_thresh: float = OVERLAP_LIKELIHOOD_RATIO
     ) -> dict[tuple[int, bool, int | None], int]:
         """Distances from the read start to the ORF start or end (*Conventions*).
 
@@ -369,11 +428,11 @@ class CleavageModel:
         winner = None
         f0 = (-frame) % 3
         n_codons = (length - f0) // 3
-        if n_codons > 0 and length < len(self.pl) + len(self.pr) + 4:
+        if n_codons > 0 and length < len(self._pl) + len(self._pr) + 4:
             likelihoods = np.array(
                 [
                     read_in_cds_likelihood(
-                        self.pl, self.pr, self.pu, length, frame, key[2],
+                        self._pl, self._pr, self._pu, length, frame, key[2],
                         f0 + 3 * i, f0 + 3 * i + 3,
                     )
                     for i in range(n_codons)
@@ -387,17 +446,31 @@ class CleavageModel:
         return winner
 
     def __getstate__(self) -> dict:
-        """Pickle without the P-site memo (and the memo of earlier releases)."""
+        """Pickle without the views of ``lut`` and the P-site memo."""
         state = dict(self.__dict__)
-        state.pop("_p_site_codons", None)
-        state.pop("_p_site_table_cache", None)
+        for name in ("cds_lut", "noise_lut", "_p_site_codons", "_p_site_table_cache"):
+            state.pop(name, None)
         return state
 
     def __setstate__(self, state: dict) -> None:
-        """Restore a pickle; earlier releases stored a 4-D count table."""
+        """Restore a pickle, upgrading the layout of earlier releases.
+
+        Those stored the distributions as public attributes, the two tables
+        separately instead of as ``lut``, a 4-D count table, and left absent
+        optional arrays unset.
+        """
+        self.dist_starts = None
+        self.table = None
+        for name in ("pl", "pr", "pu"):
+            if name in state:
+                state["_" + name] = state.pop(name)
+        if "lut" not in state:
+            cds_lut, noise_lut = state.pop("cds_lut"), state.pop("noise_lut")
+            state["lut"] = np.concatenate([cds_lut, noise_lut[:, None, :]], axis=1)
         self.__dict__.update(state)
-        if "table" in state:
-            self.table = _count_table(state["table"])
+        self._set_lut_views()
+        if self.table is not None:
+            self.table = _count_table(self.table)
 
     def is_plausible(self) -> bool:
         """Whether the upstream cleavage peak looks like a healthy library's.
@@ -405,10 +478,10 @@ class CleavageModel:
         The peak must sit at one of :data:`PLAUSIBLE_P_SITE_OFFSETS` and carry
         at least :data:`MIN_PEAK_PROBABILITY` of the mass.
         """
-        max_pos = int(np.argmax(self.pl))
+        max_pos = int(np.argmax(self._pl))
         return (
             max_pos in PLAUSIBLE_P_SITE_OFFSETS
-            and float(self.pl[max_pos]) >= MIN_PEAK_PROBABILITY
+            and float(self._pl[max_pos]) >= MIN_PEAK_PROBABILITY
         )
 
     def plot(self, ax=None) -> None:
@@ -453,14 +526,14 @@ class CleavageModel:
         npz_data : dict[str, np.ndarray] or None, optional
             Accumulator dict for optional arrays.
         """
-        pl_str = ",".join(f"{v:.6g}" for v in self.pl)
-        pr_str = ",".join(f"{v:.6g}" for v in self.pr)
-        tsv_fh.write(f"{dataset_id}\t{self.pu:.6g}\t{pl_str}\t{pr_str}\n")
+        pl_str = ",".join(f"{v:.6g}" for v in self._pl)
+        pr_str = ",".join(f"{v:.6g}" for v in self._pr)
+        tsv_fh.write(f"{dataset_id}\t{self._pu:.6g}\t{pl_str}\t{pr_str}\n")
 
         if npz_data is not None:
-            if hasattr(self, "dist_starts"):
+            if self.dist_starts is not None:
                 npz_data[f"{dataset_id}_dist_starts"] = self.dist_starts
-            if hasattr(self, "table"):
+            if self.table is not None:
                 npz_data[f"{dataset_id}_table"] = self.table
 
     @classmethod
@@ -546,25 +619,21 @@ def read_in_cds_likelihood(
     """
     f0 = (-frame) % 3
 
+    # The first in-frame codon start at or after every lower bound.
     start_index = max(f0, region_start, length - len(pr) - 2)
-    if start_index % 3 == f0 % 3:
-        pass
-    elif start_index % 3 == (f0 + 1) % 3:
-        start_index += 2
-    elif start_index % 3 == (f0 + 2) % 3:
-        start_index += 1
-
+    start_index += (f0 - start_index) % 3
     i = np.arange(start_index, min(len(pl), length - 2, region_end - 2), 3)
 
     likelihood = (pl[i] * pr[length - i - 3]).sum()
 
     if oua:
-        likelihood *= pu * 3 / 4
+        likelihood *= pu * UA_MISMATCH_PROB
 
     else:
         # assume there is no ua
         likelihood *= 1 - pu
-        # assume there is an ua
+        # assume there is an ua that matches the reference: the footprint is
+        # one base shorter and one frame over
         length -= 1
         region_start -= 1
         region_end -= 1
@@ -573,16 +642,10 @@ def read_in_cds_likelihood(
         f0 = (-frame) % 3
 
         start_index = max(f0, region_start, length - len(pr) - 3)
-        if start_index % 3 == f0 % 3:
-            pass
-        elif start_index % 3 == (f0 + 1) % 3:
-            start_index += 2
-        elif start_index % 3 == (f0 + 2) % 3:
-            start_index += 1
-
+        start_index += (f0 - start_index) % 3
         i = np.arange(start_index, min(len(pl), length - 2, region_end - 2), 3)
 
-        likelihood += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
+        likelihood += (pl[i] * pr[length - i - 3]).sum() * pu * (1 - UA_MISMATCH_PROB)
 
     return likelihood * 3
 
@@ -631,13 +694,13 @@ def read_in_noise_likelihood(
     likelihood = (pl[i] * pr[length - i - 3]).sum()
 
     if oua:
-        likelihood *= pu * 3 / 4
+        likelihood *= pu * UA_MISMATCH_PROB
 
     else:
         # assume there is no ua
         likelihood *= 1 - pu
 
-        # assume there is an ua
+        # assume there is an ua that matches the reference
         length -= 1
         region_start -= 1
         region_end -= 1
@@ -646,7 +709,7 @@ def read_in_noise_likelihood(
             max(0, region_start, length - 2 - len(pr)),
             min(len(pl), length - 2, region_end - 2),
         )
-        likelihood += (pl[i] * pr[length - i - 3]).sum() * pu * 1 / 4
+        likelihood += (pl[i] * pr[length - i - 3]).sum() * pu * (1 - UA_MISMATCH_PROB)
     return likelihood
 
 
