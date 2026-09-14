@@ -483,9 +483,7 @@ def _slow_path_transcripts(blocks: list, locus: Locus) -> list:
 
     chrom = locus.iv.chrom
     strand = locus.iv.strand
-    region = GenomicRegion(
-        [HTSeq.GenomicInterval(chrom, s, e, strand) for s, e in blocks]
-    )
+    region = GenomicRegion(blocks, chrom=chrom, strand=strand)
     return [
         transcript
         for transcript in set.intersection(*transcript_sets)

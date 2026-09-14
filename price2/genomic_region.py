@@ -14,14 +14,34 @@ is the reverse of translation order.  The project convention is
 
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Sequence
+from typing import Literal, NamedTuple
 
-import HTSeq
-from HTSeq import GenomicInterval
 from pyfaidx import Fasta
 
 Strand = Literal["+", "-"]
 """Genomic strand: either ``'+'`` (forward) or ``'-'`` (reverse)."""
+
+
+class Interval(NamedTuple):
+    """A ``[start, end)`` stretch of a region's chromosome, 0-based half-open.
+
+    The chromosome and strand live on the :class:`GenomicRegion`; the
+    interval is a plain pair, hashable and cheap to build and to pickle.
+    """
+
+    start: int
+    end: int
+
+
+def _interval(iv: object) -> Interval:
+    """*iv* as an :class:`Interval`: a pair, or anything with ``start``/``end``
+    (an ``HTSeq.GenomicInterval``, say)."""
+    if isinstance(iv, Interval):
+        return iv
+    if isinstance(iv, (tuple, list)):
+        return Interval(int(iv[0]), int(iv[1]))
+    return Interval(iv.start, iv.end)
 
 
 class GenomicRegion:
@@ -38,7 +58,7 @@ class GenomicRegion:
         Chromosome / reference sequence name.
     strand : Strand
         ``'+'`` or ``'-'``.
-    intervals : tuple[GenomicInterval, ...]
+    intervals : tuple[Interval, ...]
         Exonic intervals in chromosome order.
     length : int
         Total spliced length (sum of exon lengths).
@@ -46,12 +66,12 @@ class GenomicRegion:
 
     chrom: str
     strand: Strand
-    intervals: tuple[GenomicInterval, ...]
+    intervals: tuple[Interval, ...]
     length: int
 
     def __init__(
         self,
-        intervals: list[GenomicInterval] | tuple[GenomicInterval, ...],
+        intervals: Sequence[object],
         chrom: str | None = None,
         strand: Strand | None = None,
     ) -> None:
@@ -59,12 +79,14 @@ class GenomicRegion:
 
         Parameters
         ----------
-        intervals : sequence of GenomicInterval
-            Pre-built HTSeq ``GenomicInterval`` objects in chromosome order.
+        intervals : sequence
+            ``(start, end)`` pairs in chromosome order, or objects carrying
+            ``start`` and ``end`` such as ``HTSeq.GenomicInterval``.
         chrom : str | None
-            Chromosome name (inferred from *intervals* if omitted).
+            Chromosome name; inferred from the first interval when omitted,
+            which then has to carry it (an HTSeq interval does).
         strand : Strand | None
-            Strand (inferred from *intervals* if omitted).
+            Strand; inferred like *chrom* when omitted.
 
         Raises
         ------
@@ -73,7 +95,7 @@ class GenomicRegion:
         """
         self.chrom = chrom if chrom else intervals[0].chrom
         self.strand = strand if strand else intervals[0].strand
-        self.intervals = tuple(intervals)
+        self.intervals = tuple(_interval(iv) for iv in intervals)
 
         for i in range(1, len(self.intervals)):
             if self.intervals[i - 1].end > self.intervals[i].start:
@@ -85,13 +107,13 @@ class GenomicRegion:
         self.hash = hash((self.strand, self.chrom, self.intervals))
 
     def __setstate__(self, state: dict) -> None:
-        """Restore a pickle; regions pickled by earlier releases held a list.
+        """Restore a pickle; earlier releases stored HTSeq intervals in a list.
 
         The hash is recomputed rather than restored: it involves string
         hashes, which differ between interpreter processes.
         """
         self.__dict__.update(state)
-        self.intervals = tuple(self.intervals)
+        self.intervals = tuple(_interval(iv) for iv in self.intervals)
         self.hash = hash((self.strand, self.chrom, self.intervals))
 
     def __eq__(self, other: object) -> bool:
@@ -264,7 +286,7 @@ class GenomicRegion:
         cumulative = 0
 
         for interval in self.intervals:
-            iv_len = interval.length
+            iv_len = interval.end - interval.start
             local_end = cumulative + iv_len
             overlap_start = max(start, cumulative)
             overlap_end = min(end, local_end)
@@ -276,15 +298,10 @@ class GenomicRegion:
             if cumulative >= end:
                 break
 
-        region_intervals = [
-            HTSeq.GenomicInterval(self.chrom, rs, re, self.strand)
-            for rs, re in result_ivs
-            if rs != re
-        ]
         return GenomicRegion(
-            intervals=region_intervals,
-            strand=self.strand,
+            [Interval(rs, re) for rs, re in result_ivs if rs != re],
             chrom=self.chrom,
+            strand=self.strand,
         )
 
     def get_sequence(self, genome: Fasta) -> str:

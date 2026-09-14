@@ -17,7 +17,6 @@ from __future__ import annotations
 import bisect
 from typing import TYPE_CHECKING
 
-import HTSeq
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
@@ -595,14 +594,10 @@ def load_reads(
                 )
             gr = region_cache.get(sig)
             if gr is None:
-                intervals = [
-                    HTSeq.GenomicInterval(
-                        chrom, int(starts[j]), int(ends[j]), strand
-                    )
-                    for j in range(b, e)
-                ]
                 gr = GenomicRegion(
-                    intervals=intervals, chrom=chrom, strand=strand
+                    [(int(starts[j]), int(ends[j])) for j in range(b, e)],
+                    chrom=chrom,
+                    strand=strand,
                 )
                 region_cache[sig] = gr
             rsas_run.append(

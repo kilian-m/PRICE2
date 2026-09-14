@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import HTSeq
 import pysam
 
 from price2 import bam
@@ -71,11 +70,7 @@ class RiboSeqAlignment:
         blocks, untemplated_addition = found
         chrom = aln.reference_name
         strand = "-" if aln.is_reverse else "+"
-        region = GenomicRegion(
-            [HTSeq.GenomicInterval(chrom, start, end, strand) for start, end in blocks],
-            chrom=chrom,
-            strand=strand,
-        )
+        region = GenomicRegion(blocks, chrom=chrom, strand=strand)
         return cls(region, untemplated_addition, bam.is_unique(aln))
 
     def __len__(self) -> int:

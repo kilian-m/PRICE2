@@ -148,11 +148,11 @@ class Transcript:
         coordinates.
         """
         chrom, strand = self.iv.chrom, self.iv.strand
-        by_start = sorted(self._exon_ivs, key=lambda iv: iv.start)
-        self.exons = GenomicRegion(by_start, chrom=chrom, strand=strand)
+        pairs = sorted((iv.start, iv.end) for iv in self._exon_ivs)
+        self.exons = GenomicRegion(pairs, chrom=chrom, strand=strand)
         if self._cds_ivs and self.coding_length % 3 == 0:
-            by_start = sorted(self._cds_ivs, key=lambda iv: iv.start)
-            self.cds = GenomicRegion(by_start, chrom=chrom, strand=strand)
+            pairs = sorted((iv.start, iv.end) for iv in self._cds_ivs)
+            self.cds = GenomicRegion(pairs, chrom=chrom, strand=strand)
             self.annotated_cds_iv = self.exons.map_to_local(self.cds)
         else:
             self.cds = None
