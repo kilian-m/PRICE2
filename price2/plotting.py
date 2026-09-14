@@ -54,83 +54,76 @@ def plot_coverage(
         ax_start, ax_stop = axes
         fig = ax_start.get_figure()
 
-    # Start-codon histogram (x-axis in codon positions)
-    x_start = np.arange(HIST_SIZE) - START_CODON_IDX
-
-    # Determine which body positions survive the 50% trim.
-    start_body_idx = np.arange(HIST_SIZE)[START_BODY_SLICE]
-    start_body_vals = model.start_hist[START_BODY_SLICE]
-    q25, q75 = np.percentile(start_body_vals, [25, 75])
-    start_kept = set(
-        start_body_idx[(start_body_vals >= q25) & (start_body_vals <= q75)]
+    _p_site_panel(
+        ax_start,
+        model.start_hist,
+        peak_idx=START_CODON_IDX,
+        body_slice=START_BODY_SLICE,
+        x_offset=START_CODON_IDX,
+        xlim=(-12, 105),
+        title="CDS start",
+        xlabel="Codon position relative to translation start",
+        note=f"start factor = {model.start_factor:.2f}",
+        note_x=0.95,
     )
-
-    colors_start = []
-    for i in range(HIST_SIZE):
-        if i == START_CODON_IDX:
-            colors_start.append("tab:red")
-        elif i in start_kept:
-            colors_start.append("steelblue")
-        elif i in set(start_body_idx):
-            colors_start.append("lightsteelblue")
-        else:
-            colors_start.append("lightsteelblue")
-
-    ax_start.bar(x_start, model.start_hist, width=1, color=colors_start)
-    ax_start.set_xlabel("Codon position relative to translation start")
-    ax_start.set_ylabel("P-site read count")
-    ax_start.set_title("CDS start")
-    ax_start.set_xlim(-12, 105)
-    ax_start.text(
-        0.95,
-        0.95,
-        f"start factor = {model.start_factor:.2f}",
-        transform=ax_start.transAxes,
-        ha="right",
-        va="top",
-        fontsize=10,
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    _p_site_panel(
+        ax_stop,
+        model.stop_hist,
+        peak_idx=STOP_PEAK_IDX,
+        body_slice=STOP_BODY_SLICE,
+        x_offset=STOP_HIST_OFFSET,
+        xlim=(-105, 12),
+        title="CDS stop",
+        xlabel="Codon position relative to translation end",
+        note=f"stop factor = {model.stop_factor:.2f}",
+        note_x=0.3,
     )
-
-    # Stop-codon histogram (x-axis in codon positions)
-    x_stop = np.arange(HIST_SIZE) - STOP_HIST_OFFSET
-
-    # Determine which body positions survive the 50% trim.
-    stop_body_idx = np.arange(HIST_SIZE)[STOP_BODY_SLICE]
-    stop_body_vals = model.stop_hist[STOP_BODY_SLICE]
-    q25, q75 = np.percentile(stop_body_vals, [25, 75])
-    stop_kept = set(
-        stop_body_idx[(stop_body_vals >= q25) & (stop_body_vals <= q75)]
-    )
-
-    colors_stop = []
-    for i in range(HIST_SIZE):
-        if i == STOP_PEAK_IDX:
-            colors_stop.append("tab:red")
-        elif i in stop_kept:
-            colors_stop.append("steelblue")
-        elif i in set(stop_body_idx):
-            colors_stop.append("lightsteelblue")
-        else:
-            colors_stop.append("lightsteelblue")
-
-    ax_stop.bar(x_stop, model.stop_hist, width=1, color=colors_stop)
-    ax_stop.set_xlabel("Codon position relative to translation end")
-    ax_stop.set_ylabel("P-site read count")
-    ax_stop.set_title("CDS stop")
-    ax_stop.set_xlim(-105, 12)
-    ax_stop.text(
-        0.3,
-        0.95,
-        f"stop factor = {model.stop_factor:.2f}",
-        transform=ax_stop.transAxes,
-        ha="right",
-        va="top",
-        fontsize=10,
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    )
-
     return fig
+
+
+def _p_site_panel(
+    ax: plt.Axes,
+    hist: np.ndarray,
+    *,
+    peak_idx: int,
+    body_slice: slice,
+    x_offset: int,
+    xlim: tuple[int, int],
+    title: str,
+    xlabel: str,
+    note: str,
+    note_x: float,
+) -> None:
+    """One P-site histogram: the peak in red, the trimmed body in steel blue.
+
+    The body positions whose count lies within the interquartile range are
+    the ones the enrichment factor is computed over
+    (:meth:`~price2.coverage_model.CoverageModel._enrichment_factor`); every
+    other bar, inside or outside the body, is drawn lighter.
+    """
+    body_idx = np.arange(HIST_SIZE)[body_slice]
+    body_vals = hist[body_slice]
+    q25, q75 = np.percentile(body_vals, [25, 75])
+    kept = set(body_idx[(body_vals >= q25) & (body_vals <= q75)])
+    colours = [
+        "tab:red" if i == peak_idx else "steelblue" if i in kept else "lightsteelblue"
+        for i in range(HIST_SIZE)
+    ]
+    ax.bar(np.arange(HIST_SIZE) - x_offset, hist, width=1, color=colours)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("P-site read count")
+    ax.set_title(title)
+    ax.set_xlim(*xlim)
+    ax.text(
+        note_x,
+        0.95,
+        note,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    )
 
 
 def plot_cleavage(model: CleavageModel, ax: Optional[plt.Axes] = None) -> None:
