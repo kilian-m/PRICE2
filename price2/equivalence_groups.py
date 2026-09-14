@@ -73,15 +73,25 @@ def unpack_cell(cell: int) -> tuple[int, int | None, CoveragePosition]:
     return rgr_index, (None if frame_code == NO_FRAME else frame_code), CoveragePosition(covpos)
 
 
+def _codon_span(start: int, end: int, phase: int) -> tuple[int, int]:
+    """Codon indices ``[sc, ec)`` of the positions ``≡ phase (mod 3)`` in ``[start, end)``.
+
+    Position ``3 * c + phase`` is codon ``c`` of that phase, so the span is
+    ``ceil((start - phase) / 3)`` to ``ceil((end - phase) / 3)``.
+    """
+    return -(-(start - phase) // 3), -(-(end - phase) // 3)
+
+
 class EquivalenceGroupIntervals:
     """Transcript positions where reads are compatible with a set of RGRs.
 
     Stores three lists — one per reading-frame phase (0, 1, 2) — of
     ``(start_codon, end_codon, cell)`` intervals, *cell* being the packed
-    ``(rgr, frame, CoveragePosition)`` of :func:`pack_cell`.
-    Using interval lists instead of per-position dicts avoids O(interval_length)
-    inner loops: ``add_rgr`` becomes O(1) per call, and the sweep-line in
-    ``get_egs_dict`` is O(n_intervals * log(n_intervals)).
+    ``(rgr, frame, CoveragePosition)`` of :func:`pack_cell`: a read starting
+    at position ``3 * codon + phase`` of the transcript is compatible with
+    the cell.  Using interval lists instead of per-position dicts avoids
+    O(interval_length) inner loops: ``add_rgr`` becomes O(1) per call, and
+    the sweep-line in ``get_egs_dict`` is O(n_intervals * log(n_intervals)).
     """
 
     def __init__(self) -> None:
@@ -115,26 +125,44 @@ class EquivalenceGroupIntervals:
         covpos : CoveragePosition
             Which part of the coverage profile this interval corresponds to.
         """
-        if not rgr.is_orf:
-            phases_to_fill = [0, 1, 2]
-        else:
-            phases_to_fill = [phase]
-        start_phase = start % 3
-        end_phase = end % 3
+        phases = (0, 1, 2) if not rgr.is_orf else (phase,)
         cell = pack_cell(rgr.index, frame, covpos)
-        for ph in phases_to_fill:
-            if ph >= start_phase:
-                s = start + (ph - start_phase)
-            else:
-                s = start + (ph - start_phase) + 3
-            if ph >= end_phase:
-                e = end + (ph - end_phase)
-            else:
-                e = end + (ph - end_phase) + 3
-            sc = s // 3
-            ec = e // 3
+        for ph in phases:
+            sc, ec = _codon_span(start, end, ph)
             if sc < ec:
                 self.intervals[ph].append((sc, ec, cell))
+
+    def add_slice(
+        self, source: EquivalenceGroupIntervals, start: int, length: int
+    ) -> None:
+        """Append *source*'s intervals over ``[start, start + length)``, re-based to 0.
+
+        A read starting at position ``start + p`` of *source*'s transcript
+        is the read starting at ``p`` here, so the phase of a source
+        interval shifts by ``start`` and its codons by the span's first
+        codon.
+
+        Parameters
+        ----------
+        source : EquivalenceGroupIntervals
+            The intervals of one transcript.
+        start : int
+            First transcript position (nucleotide coordinate) of the window.
+        length : int
+            Length of the window in nucleotides.
+        """
+        end = start + length
+        shift = start % 3
+        for phase in range(3):
+            sc, ec = _codon_span(start, end, phase)
+            if sc >= ec:
+                continue
+            dst = self.intervals[(phase - shift) % 3]
+            for interval_sc, interval_ec, cell in source.intervals[phase]:
+                lo = max(interval_sc, sc)
+                hi = min(interval_ec, ec)
+                if lo < hi:
+                    dst.append((lo - sc, hi - sc, cell))
 
     def get_egs_dict(
         self,
@@ -179,7 +207,7 @@ class EquivalenceGroupIntervals:
             events.sort(key=lambda x: (x[0], x[1]))
 
             # refcount dict: cell -> number of currently-open intervals.
-            # Needed because get_sub_intervals can emit duplicate (sc, ec, cell)
+            # Needed because ``add_slice`` can emit duplicate (sc, ec, cell)
             # entries when the same RGR appears on multiple transcripts; plain
             # set semantics would discard the cell too early on the first end
             # event.  A cell is "active" as long as refcount > 0.
@@ -324,12 +352,12 @@ def read_start_runs(
     return runs
 
 
-def get_equivalence_groups_dict(
+def _equivalence_groups_dict(
     runs: list[tuple[dict[Transcript, int], int]],
     egis: dict[Transcript, EquivalenceGroupIntervals],
     read_length: int,
     oua: bool,
-    key_cache: dict | None = None,
+    key_cache: dict,
 ) -> dict:
     """Aggregate equivalence groups over all read-start runs.
 
@@ -349,9 +377,9 @@ def get_equivalence_groups_dict(
         Read length for which these groups are computed.
     oua : bool
         Whether the reads carry a 5' untemplated addition.
-    key_cache : dict or None
-        Optional shared cache used to intern equivalence-group keys across
-        runs and read lengths.
+    key_cache : dict
+        Shared cache interning the equivalence-group keys across runs and
+        read lengths.
 
     Returns
     -------
@@ -360,53 +388,34 @@ def get_equivalence_groups_dict(
     """
     egs_dict: dict = {}
     for positions, length in runs:
-        run_egs = get_sub_intervals(
-            [egis[tr] for tr in positions],
-            list(positions.values()),
-            length,
-        ).get_egs_dict(read_length, oua, key_cache=key_cache)
+        window = EquivalenceGroupIntervals()
+        for transcript, start in positions.items():
+            window.add_slice(egis[transcript], start, length)
+        run_egs = window.get_egs_dict(read_length, oua, key_cache=key_cache)
         for k, run_length in run_egs.items():
             egs_dict[k] = egs_dict.get(k, 0) + run_length
     return egs_dict
 
 
-def cleavage_dist_signature(cleavage_model, read_length: int, oua: bool) -> tuple:
+def _cleavage_dist_signature(cleavage_model, read_length: int, oua: bool) -> tuple:
     """Signature of the cleavage distances that determine equivalence groups.
 
-    :func:`make_equivalence_intervals` reads the cleavage model only through
-    ``get_dist_to_orf_start`` / ``get_dist_to_orf_end`` for frames
-    ``(None, 0, 1, 2)``.  Two runs that share this signature for a given
-    ``(read_length, oua)`` therefore produce identical equivalence groups, so
-    the :func:`get_equivalence_groups_dict` result can be reused between them.
-
-    Parameters
-    ----------
-    cleavage_model :
-        Cleavage model providing ``get_dist_to_orf_start`` and
-        ``get_dist_to_orf_end``.
-    read_length : int
-        Read length to model.
-    oua : bool
-        Whether the reads carry a 5' untemplated addition.
+    :func:`_equivalence_intervals` reads the cleavage model only through
+    :meth:`~price2.cleavage_model.CleavageModel.dist_to_orf_bounds` for
+    frames ``(None, 0, 1, 2)``.  Two runs that share this signature for a
+    given ``(read_length, oua)`` therefore produce identical equivalence
+    groups, so the :func:`_equivalence_groups_dict` result can be reused
+    between them.
 
     Returns
     -------
     tuple
-        ``((start, end), ...)`` distance pairs for frames ``(None, 0, 1, 2)``;
-        a missing entry (``KeyError``) is recorded as ``None``.
+        The ``(start, end)`` bounds, or ``None``, for frames ``(None, 0, 1, 2)``.
     """
-    vals = []
-    for frame in (None, 0, 1, 2):
-        try:
-            start = cleavage_model.get_dist_to_orf_start(read_length, oua, frame)
-        except KeyError:
-            start = None
-        try:
-            end = cleavage_model.get_dist_to_orf_end(read_length, oua, frame)
-        except KeyError:
-            end = None
-        vals.append((start, end))
-    return tuple(vals)
+    return tuple(
+        cleavage_model.dist_to_orf_bounds(read_length, oua, frame)
+        for frame in (None, 0, 1, 2)
+    )
 
 
 def make_equivalence_groups(loc, runs: list) -> dict:
@@ -426,10 +435,10 @@ def make_equivalence_groups(loc, runs: list) -> dict:
 
     * :func:`read_start_runs` depends only on the transcripts and the read
       length, not the run, so the runs are built once per read length.
-    * :func:`get_equivalence_groups_dict` depends on the run only through the
-      cleavage-distance signature (see :func:`cleavage_dist_signature`), so its
-      contribution is computed once per ``(read_length, oua, signature)`` and
-      reused across runs that share that signature.
+    * :func:`_equivalence_groups_dict` depends on the run only through the
+      cleavage-distance signature (see :func:`_cleavage_dist_signature`), so
+      its contribution is computed once per ``(read_length, oua, signature)``
+      and reused across runs that share that signature.
 
     Parameters
     ----------
@@ -443,107 +452,41 @@ def make_equivalence_groups(loc, runs: list) -> dict:
     dict
         Maps each run to a dict of equivalence-group key → length in codons.
     """
-    egs: dict = {}
     key_cache: dict = {}
-    strand = loc.iv.strand
+    start_runs: dict = {}  # read_length -> read-start runs
+    contributions: dict = {}  # (read_length, oua, signature) -> {key: length}
 
-    # read_length -> read-start runs (run-independent).
-    runs_cache: dict = {}
-    # (read_length, oua, cleavage signature) -> {eg_key: length}.
-    contrib_cache: dict = {}
+    def contribution(cleavage_model, read_length: int, oua: bool) -> dict:
+        signature = _cleavage_dist_signature(cleavage_model, read_length, oua)
+        found = contributions.get((read_length, oua, signature))
+        if found is None:
+            if read_length not in start_runs:
+                start_runs[read_length] = read_start_runs(
+                    loc.transcripts, read_length, loc.iv.strand
+                )
+            egis = {
+                tr: _equivalence_intervals(tr, cleavage_model, read_length, oua)
+                for tr in loc.transcripts
+            }
+            found = _equivalence_groups_dict(
+                start_runs[read_length], egis, read_length, oua, key_cache
+            )
+            contributions[(read_length, oua, signature)] = found
+        return found
 
+    egs: dict = {}
     for run in runs:
         run_egs: dict = {}
         egs[run] = run_egs
-        cleavage_model = run.cleavage_model
-        for read_length in cleavage_model.non_zero_lengths:
-            start_runs = runs_cache.get(read_length)
-            if start_runs is None:
-                start_runs = read_start_runs(loc.transcripts, read_length, strand)
-                runs_cache[read_length] = start_runs
-
+        for read_length in run.cleavage_model.non_zero_lengths:
             for oua in (True, False):
-                ckey = (
-                    read_length,
-                    oua,
-                    cleavage_dist_signature(cleavage_model, read_length, oua),
-                )
-                contrib = contrib_cache.get(ckey)
-                if contrib is None:
-                    egis = {
-                        tr: make_equivalence_intervals(
-                            tr, cleavage_model, read_length, oua
-                        )
-                        for tr in loc.transcripts
-                    }
-                    contrib = get_equivalence_groups_dict(
-                        start_runs,
-                        egis,
-                        read_length,
-                        oua,
-                        key_cache=key_cache,
-                    )
-                    contrib_cache[ckey] = contrib
-
-                for k, length in contrib.items():
+                found = contribution(run.cleavage_model, read_length, oua)
+                for k, length in found.items():
                     run_egs[k] = run_egs.get(k, 0) + length
-
     return egs
 
 
-def get_sub_intervals(
-    egis: list[EquivalenceGroupIntervals],
-    starts: list[int],
-    length: int,
-) -> EquivalenceGroupIntervals:
-    """Extract and merge sub-intervals from multiple transcript EGIs.
-
-    For each ``(egi, start)`` pair, slices out the portion of *egi* that
-    corresponds to transcript positions ``[start, start + length)`` and
-    assembles the pieces into a single :class:`EquivalenceGroupIntervals`
-    aligned to position 0.
-
-    Parameters
-    ----------
-    egis : list[EquivalenceGroupIntervals]
-        Equivalence-group intervals for each transcript passing through a node.
-    starts : list[int]
-        Transcript-coordinate start positions for each transcript within the
-        node (parallel to *egis*).
-    length : int
-        Length of the node interval in nucleotides.
-
-    Returns
-    -------
-    EquivalenceGroupIntervals
-        Combined equivalence-group intervals aligned to position 0.
-    """
-    result_lists: tuple[list, list, list] = ([], [], [])
-
-    for egi, start in zip(egis, starts):
-        end = start + length
-        s_q, s_r = divmod(start, 3)
-        e_q, e_r = divmod(end, 3)
-        for i in range(3):  # source phase
-            p = (i - s_r) % 3  # output phase
-            sc = s_q if s_r <= i else s_q + 1
-            ec = e_q + 1 if e_r > i else e_q
-            if sc >= ec:
-                continue
-            src = egi.intervals[i]  # list of (interval_sc, interval_ec, cell)
-            dst = result_lists[p]
-            for interval_sc, interval_ec, cell in src:
-                clipped_sc = max(interval_sc, sc)
-                clipped_ec = min(interval_ec, ec)
-                if clipped_sc < clipped_ec:
-                    dst.append((clipped_sc - sc, clipped_ec - sc, cell))
-
-    result = EquivalenceGroupIntervals()
-    result.intervals = result_lists
-    return result
-
-
-def make_equivalence_intervals(
+def _equivalence_intervals(
     transcript: Transcript,
     cleavage_model,
     read_length: int,
@@ -560,8 +503,8 @@ def make_equivalence_intervals(
     transcript : Transcript
         The transcript for which to compute intervals.
     cleavage_model :
-        Cleavage model providing ``get_dist_to_orf_start`` and
-        ``get_dist_to_orf_end`` for each read length, oua flag, and frame.
+        Cleavage model providing
+        :meth:`~price2.cleavage_model.CleavageModel.dist_to_orf_bounds`.
     read_length : int
         Read length to model.
     oua : bool
@@ -579,71 +522,30 @@ def make_equivalence_intervals(
     cov_start = CoveragePosition.start
     cov_middle = CoveragePosition.middle
     cov_stop = CoveragePosition.stop
+    # One past the last position a read of this length can start at.
+    last_start = len(transcript.exons) - read_length + 1
     for rgr in transcript.rgr_set:
+        lo, hi = rgr.iv_on_transcript
         if not rgr.is_orf:
-            try:
-                start = max(
-                    0,
-                    rgr.iv_on_transcript[0]
-                    + cleavage_model.get_dist_to_orf_start(read_length, oua, None),
-                )
-                end = max(
-                    3,
-                    min(
-                        len(transcript.exons) - read_length + 1,
-                        rgr.iv_on_transcript[1]
-                        + cleavage_model.get_dist_to_orf_end(read_length, oua, None),
-                    ),
-                )
-            except KeyError:
+            bounds = cleavage_model.dist_to_orf_bounds(read_length, oua, None)
+            if bounds is None:
                 continue
-            try:
-                egi.add_rgr(rgr, start, end, None)
-            except (IndexError, ValueError):
-                pass
-
-        else:
-            for frame in [0, 1, 2]:  # frame relative to ORF start
-                try:
-                    rsos = cleavage_model.get_dist_to_orf_start(
-                        read_length, oua, frame
-                    )  # read_start_to_orf_start
-                    rsoe = cleavage_model.get_dist_to_orf_end(
-                        read_length, oua, frame
-                    )  # read_start_to_orf_end
-                    phase = (
-                        rgr.iv_on_transcript[0] + rsos
-                    ) % 3  # phase relative to transcript start
-                except KeyError:
-                    continue
-
-                # CoveragePosition.start
-                start = max(0, rgr.iv_on_transcript[0] + rsos)
-                end = max(0, rgr.iv_on_transcript[0] + 3 + rsoe)
-                try:
-                    egi.add_rgr(rgr, start, end, phase, frame, cov_start)
-                except (IndexError, ValueError):
-                    pass
-
-                # CoveragePosition.middle
-                start = max(0, rgr.iv_on_transcript[0] + 3 + rsos)
-                end = min(
-                    transcript.iv.length - read_length + 1,
-                    rgr.iv_on_transcript[1] - 3 + rsoe,
-                )
-                try:
-                    egi.add_rgr(rgr, start, end, phase, frame, cov_middle)
-                except (IndexError, ValueError):
-                    pass
-
-                # CoveragePosition.stop
-                start = max(0, rgr.iv_on_transcript[1] - 3 + rsos)
-                end = min(
-                    transcript.iv.length - read_length + 1,
-                    rgr.iv_on_transcript[1] + rsoe,
-                )
-                try:
-                    egi.add_rgr(rgr, start, end, phase, frame, cov_stop)
-                except (IndexError, ValueError):
-                    pass
+            rsos, rsoe = bounds
+            egi.add_rgr(rgr, max(0, lo + rsos), max(3, min(last_start, hi + rsoe)), None)
+            continue
+        for frame in (0, 1, 2):  # frame relative to ORF start
+            bounds = cleavage_model.dist_to_orf_bounds(read_length, oua, frame)
+            if bounds is None:
+                continue
+            # Read start to ORF start / to ORF end.
+            rsos, rsoe = bounds
+            phase = (lo + rsos) % 3  # phase relative to transcript start
+            # The start codon, the body and the stop codon of the ORF, as
+            # the read-start ranges that cover them.
+            for covpos, start, end in (
+                (cov_start, lo + rsos, max(0, lo + 3 + rsoe)),
+                (cov_middle, lo + 3 + rsos, min(last_start, hi - 3 + rsoe)),
+                (cov_stop, hi - 3 + rsos, min(last_start, hi + rsoe)),
+            ):
+                egi.add_rgr(rgr, max(0, start), end, phase, frame, covpos)
     return egi

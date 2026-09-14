@@ -307,20 +307,25 @@ class CleavageModel:
                         dist[(read_length, oua, frame)] = -(kept.min() if end else kept.max())
         return dist
 
-    def get_dist_to_orf_start(
+    def dist_to_orf_bounds(
         self, read_length: int, oua: bool, frame: int | None
-    ) -> int:
-        """Offset (``<= 0``) of the most upstream plausible read start relative
-        to an ORF start; ``KeyError`` when none exists (*Conventions*)."""
-        return self.dist_to_orf_start[(read_length, oua, frame)]
+    ) -> tuple[int, int] | None:
+        """The read-start offsets between which a read overlaps an ORF (*Conventions*).
 
-    def get_dist_to_orf_end(
-        self, read_length: int, oua: bool, frame: int | None
-    ) -> int:
-        """Offset (``<= 0``) of the most downstream plausible read start
-        relative to the start of an ORF's last base (noise) or last codon (in
-        frame); ``KeyError`` when none exists (*Conventions*)."""
-        return self.dist_to_orf_end[(read_length, oua, frame)]
+        Returns
+        -------
+        tuple[int, int] or None
+            ``(dist_to_orf_start, dist_to_orf_end)``, both ``<= 0``: the
+            offset of the most upstream plausible read start relative to an
+            ORF start, and of the most downstream one relative to the start
+            of the ORF's last base (noise) or last codon (in frame).
+            ``None`` when a read of this shape cannot overlap an ORF at all.
+        """
+        key = (read_length, oua, frame)
+        try:
+            return self.dist_to_orf_start[key], self.dist_to_orf_end[key]
+        except KeyError:
+            return None
 
     def p_site_codon(
         self, length: int, frame: int, untemplated_addition: bool
