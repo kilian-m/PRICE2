@@ -1,7 +1,15 @@
-"""Reference annotation loading and interval indexing from GTF files."""
+"""Reference annotation loading and interval indexing from GTF files.
+
+Coordinates: the GTF is 1-based and closed; :class:`HTSeq.GFF_Reader`
+converts every feature to the project's 0-based, half-open convention while
+parsing, so nothing here converts again.
+"""
+
+from __future__ import annotations
 
 import logging
 from bisect import bisect_left, bisect_right
+from collections.abc import Iterable
 
 import HTSeq
 
@@ -11,22 +19,21 @@ from price2.genomic_features import Transcript
 logger = logging.getLogger(__name__)
 
 #: Flattened CDS interval index: per ``(chromosome, strand)``, the start position
-#: of every step and the transcripts covering it (``None`` where there are none).
+#: of every step and the transcripts whose CDS covers it (``None`` where there
+#: are none).  The first step starts at 0 and the last one is unbounded.
 CdsIndex = dict[tuple[str, str], tuple[list[int], list[frozenset | None]]]
 
 
 class ReferenceAnnotation:
     """Index a GTF reference annotation for fast interval queries.
 
-    Parses a GTF file and builds interval-indexed data structures for
-    transcripts, exons, and CDS regions, enabling efficient lookup of
-    transcripts overlapping a given genomic region.
+    Parses a GTF file into :class:`~price2.genomic_features.Transcript`
+    objects and builds two indexes over them: a stranded step array of the
+    exons, from which the loci are cut, and a flattened index of the CDSs
+    answering which coding transcripts a read overlaps.
 
     Attributes
     ----------
-    cds_intervals : HTSeq.GenomicArrayOfSets
-        Interval index mapping genomic positions to transcripts whose CDS
-        overlaps those positions.
     transcripts : dict[str, Transcript]
         Mapping from transcript ID to :class:`~price2.genomic_features.Transcript`
         object.
@@ -35,95 +42,48 @@ class ReferenceAnnotation:
         overlap those positions.
     """
 
-    cds_intervals: HTSeq.GenomicArrayOfSets
     transcripts: dict[str, Transcript]
     transcript_intervals: HTSeq.GenomicArrayOfSets
 
-    #: Flattened ``cds_intervals``; see :meth:`build_cds_index`.
-    _cds_index: CdsIndex | None = None
-
     def __init__(self, gtf_path: str) -> None:
-        """Parse a GTF file and build genomic interval indexes.
+        """Parse a GTF file and build the indexes.
 
         Parameters
         ----------
         gtf_path : str
             Path to the GTF annotation file.
         """
-        chromosomes = set()
-        self.cds_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
         self.transcripts = {}
         self.transcript_intervals = HTSeq.GenomicArrayOfSets("auto", stranded=True)
+        chromosomes: set[str] = set()
 
-        gtf_file = HTSeq.GFF_Reader(gtf_path)
-
-        for feature in gtf_file:
-            if not "transcript_id" in feature.attr:
+        for feature in HTSeq.GFF_Reader(gtf_path):
+            transcript_id = feature.attr.get("transcript_id")
+            if transcript_id is None:
                 continue
-
-            if (chr := feature.iv.chrom) not in chromosomes:
-                chromosomes.add(chr)
-                self.cds_intervals.add_chrom(chr)
-                self.transcript_intervals.add_chrom(chr)
+            chrom = feature.iv.chrom
+            if chrom not in chromosomes:
+                chromosomes.add(chrom)
+                self.transcript_intervals.add_chrom(chrom)
 
             if feature.type == "transcript":
-                if not feature.attr["transcript_id"] in self.transcripts:
-                    self.transcripts[feature.attr["transcript_id"]] = Transcript(
-                        feature
-                    )
+                if transcript_id not in self.transcripts:
+                    self.transcripts[transcript_id] = Transcript(feature)
                 continue
-            if not feature.attr["transcript_id"] in self.transcripts:
+            transcript = self.transcripts.get(transcript_id)
+            if transcript is None:
                 continue
             if feature.type == "exon":
-                self.transcripts[feature.attr["transcript_id"]].add_exon(feature)
-                self.transcript_intervals[feature.iv] += self.transcripts[
-                    feature.attr["transcript_id"]
-                ]
+                transcript.add_exon(feature)
+                self.transcript_intervals[feature.iv] += transcript
             elif feature.type == "CDS":
-                self.transcripts[feature.attr["transcript_id"]].add_cds_region(feature)
+                transcript.add_cds_region(feature)
 
         for transcript in self.transcripts.values():
             transcript.finalize()
-            if transcript.cds is not None:
-                for interval in transcript.cds.intervals:
-                    self.cds_intervals[interval] += transcript
+        self._cds_index = _cds_index_from(self.transcripts.values())
 
         logger.info("Loaded %d transcripts from %s", len(self.transcripts), gtf_path)
-
-    def build_cds_index(self) -> None:
-        """Flatten ``cds_intervals`` into a per-chromosome binary-search index.
-
-        Walking an :class:`HTSeq.GenomicArrayOfSets` with ``steps()`` costs
-        several microseconds per query, which dominates cleavage- and
-        coverage-model estimation (one query per read).  The step boundaries
-        never change after construction, so they are flattened once into a
-        sorted list of step starts plus the transcript set of each step, which
-        a query resolves with two binary searches.
-
-        Equal transcript sets are interned, and steps covered by no CDS store
-        ``None``, so the index adds little memory on top of the source array.
-        Called automatically on the first query; call it explicitly in a parent
-        process to share the index with forked workers.
-        """
-        if self._cds_index is not None:
-            return
-
-        index: CdsIndex = {}
-        interned: dict[frozenset, frozenset] = {}
-        for chrom, strand_vectors in self.cds_intervals.chrom_vectors.items():
-            for strand, chrom_vector in strand_vectors.items():
-                starts: list[int] = []
-                step_sets: list[frozenset | None] = []
-                for iv, transcripts in chrom_vector.steps():
-                    if transcripts:
-                        frozen = frozenset(transcripts)
-                        frozen = interned.setdefault(frozen, frozen)
-                    else:
-                        frozen = None
-                    starts.append(iv.start)
-                    step_sets.append(frozen)
-                index[(chrom, strand)] = (starts, step_sets)
-        self._cds_index = index
 
     def _coding_transcripts_at(
         self, chrom: str, strand: str, start: int, end: int
@@ -163,16 +123,61 @@ class ReferenceAnnotation:
         frozenset[Transcript]
             Transcripts whose CDS intervals overlap any exon of *region*.
         """
-        if self._cds_index is None:
-            self.build_cds_index()
-
         found = None
         for interval in region.intervals:
             step = self._coding_transcripts_at(
-                interval.chrom, interval.strand, interval.start, interval.end
+                region.chrom, region.strand, interval.start, interval.end
             )
             if step is None:
                 continue
             found = step if found is None else found | step
         return found if found is not None else frozenset()
 
+
+def _cds_index_from(transcripts: Iterable[Transcript]) -> CdsIndex:
+    """Flatten the transcripts' CDS intervals into a per-chromosome step index.
+
+    A sweep over the interval boundaries of each ``(chromosome, strand)``:
+    every position where the set of covering CDSs changes starts a new
+    step.  A query then resolves with two binary searches, which is what
+    cleavage- and coverage-model estimation need (one query per read).
+    Equal transcript sets are interned, and steps covered by no CDS store
+    ``None``, so the index is small.
+    """
+    events: dict[tuple[str, str], list[tuple[int, int, Transcript]]] = {}
+    for transcript in transcripts:
+        if transcript.cds is None:
+            continue
+        key = (transcript.cds.chrom, transcript.cds.strand)
+        bucket = events.setdefault(key, [])
+        for interval in transcript.cds.intervals:
+            bucket.append((interval.start, 1, transcript))
+            bucket.append((interval.end, -1, transcript))
+
+    index: CdsIndex = {}
+    interned: dict[frozenset, frozenset] = {}
+    for key, bucket in events.items():
+        bucket.sort(key=lambda event: event[0])
+        starts: list[int] = [0]
+        step_sets: list[frozenset | None] = [None]
+        active: set[Transcript] = set()
+        i = 0
+        while i < len(bucket):
+            position = bucket[i][0]
+            while i < len(bucket) and bucket[i][0] == position:
+                _, delta, transcript = bucket[i]
+                if delta > 0:
+                    active.add(transcript)
+                else:
+                    active.discard(transcript)
+                i += 1
+            frozen = interned.setdefault(frozenset(active), frozenset(active)) if active else None
+            if frozen == step_sets[-1]:
+                continue
+            if position == starts[-1]:
+                step_sets[-1] = frozen
+            else:
+                starts.append(position)
+                step_sets.append(frozen)
+        index[key] = (starts, step_sets)
+    return index

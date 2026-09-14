@@ -152,10 +152,6 @@ def ribo_seq_runs_from_bams(
         os.rmdir(sample_dir)
         return []
 
-    # Build the CDS index once, before forking: every worker queries it per read
-    # and would otherwise build its own copy.
-    ref_annotation.build_cds_index()
-
     # ``fork`` so that the workers inherit the module globals below without
     # pickling them; the deconvolution pool uses ``forkserver`` instead.
     ctx = mp.get_context("fork")
