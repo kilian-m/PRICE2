@@ -186,6 +186,26 @@ def find_orfs(
     return orf_iv_on_transcript
 
 
+def _flanking_span(rgr: ReadGeneratingRegion) -> int:
+    """Transcript sequence flanking the region on both sides, in nt."""
+    return rgr.dist_to_transcript_start + rgr.dist_to_transcript_end
+
+
+def _keep_longer_span(
+    candidates: dict[ReadGeneratingRegion, ReadGeneratingRegion],
+    rgr: ReadGeneratingRegion,
+) -> None:
+    """Register *rgr*, replacing an equal region (same type and coding body,
+    found on another transcript) only when *rgr* has the longer flanking span.
+
+    An equal key stays in place; the value is the copy kept, so callers
+    read the survivors off ``candidates.values()``.
+    """
+    existing = candidates.get(rgr)
+    if existing is None or _flanking_span(rgr) > _flanking_span(existing):
+        candidates[rgr] = rgr
+
+
 def make_rgrs(
     loc,
     genome: Fasta,
@@ -233,21 +253,8 @@ def make_rgrs(
                 (cds_start, len(transcript.exons)),
             )
 
-            for noise in [noise1, noise2]:
-                if noise not in noise_dict:
-                    noise_dict[noise] = noise
-                else:
-                    existing = noise_dict[noise]
-                    existing_span = (
-                        existing.dist_to_transcript_end
-                        + existing.dist_to_transcript_start
-                    )
-                    new_span = (
-                        noise.dist_to_transcript_end
-                        + noise.dist_to_transcript_start
-                    )
-                    if new_span > existing_span:
-                        noise_dict[noise] = noise
+            _keep_longer_span(noise_dict, noise1)
+            _keep_longer_span(noise_dict, noise2)
 
         else:
             noise = ReadGeneratingRegion(
@@ -256,20 +263,7 @@ def make_rgrs(
                 transcript.id,
                 (0, len(transcript.exons)),
             )
-            if noise not in noise_dict:
-                noise_dict[noise] = noise
-            else:
-                existing = noise_dict[noise]
-                existing_span = (
-                    existing.dist_to_transcript_end
-                    + existing.dist_to_transcript_start
-                )
-                new_span = (
-                    noise.dist_to_transcript_end
-                    + noise.dist_to_transcript_start
-                )
-                if new_span > existing_span:
-                    noise_dict[noise] = noise
+            _keep_longer_span(noise_dict, noise)
 
         seq = transcript.exons.get_sequence(genome)
         c = 0
@@ -291,17 +285,7 @@ def make_rgrs(
                 continue
             if len(orf) + orf.dist_to_transcript_start < min_length_to_end:
                 continue
-            if orf not in orf_dict:
-                orf_dict[orf] = orf
-            else:
-                existing = orf_dict[orf]
-                existing_span = (
-                    existing.dist_to_transcript_end
-                    + existing.dist_to_transcript_start
-                )
-                new_span = orf.dist_to_transcript_end + orf.dist_to_transcript_start
-                if new_span > existing_span:
-                    orf_dict[orf] = orf
+            _keep_longer_span(orf_dict, orf)
 
     for noise in noise_dict.values():
         noise.transcript.rgr_set.add(noise)
