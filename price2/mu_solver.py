@@ -26,13 +26,13 @@ iterations, so its results are close to but not identical with these two.
 """
 from __future__ import annotations
 
+import functools
 import warnings
 
 import numpy as np
 from scipy.sparse import csr_matrix
 
-_TORCH = None
-_TORCH_OK = None
+from price2.likelihood import group_lasso_penalty
 
 #: Floor on ``omega * y / delta`` relative to ``omega * y``: ``delta`` is
 #: floored at ``omega * y / OVERFLOW_CAP`` so that the ratio cannot overflow
@@ -60,19 +60,28 @@ def silence_sparse_beta_warning() -> None:
     )
 
 
+@functools.cache
 def _torch():
-    """Lazily import torch; return the module or ``None`` if unavailable."""
-    global _TORCH, _TORCH_OK
-    if _TORCH_OK is None:
-        try:
-            import torch
+    """Import torch once per process; ``None`` when it or CUDA is unavailable."""
+    try:
+        import torch
 
-            _TORCH = torch
-            _TORCH_OK = torch.cuda.is_available()
-            silence_sparse_beta_warning()
-        except Exception:
-            _TORCH, _TORCH_OK = None, False
-    return _TORCH if _TORCH_OK else None
+        if not torch.cuda.is_available():
+            return None
+    except Exception:
+        return None
+    silence_sparse_beta_warning()
+    return torch
+
+
+def relative_change(w_new: np.ndarray, w: np.ndarray) -> float:
+    """Relative L2 change ``‖w_new − w‖ / ‖w‖`` of one update step.
+
+    The stopping rule of the multiplicative inner loop and of the IRLS-Huber
+    outer loop (:func:`price2.solver.irls_huber`); ``‖w‖`` is floored at
+    ``1e-14`` so an all-zero iterate cannot divide by zero.
+    """
+    return np.linalg.norm(w_new - w) / max(np.linalg.norm(w), 1e-14)
 
 
 def _check_group_shape(
@@ -161,7 +170,7 @@ def mu_inner_cpu(
     omega_y = weights * y
     # Per-row floor on delta so that omega_y/delta cannot exceed ~1e200 and
     # overflow the X^T mat-vec to +Inf. That Inf used to cascade into NaN one
-    # iteration later — the group-norm penalty computes Inf/Inf (line below) —
+    # iteration later — the group-norm penalty computes Inf/Inf —
     # which then silently poisons the whole solve (and, downstream, the EM
     # convergence metric). The floor is omega_y/1e200 (never below the original
     # 1e-300 div-by-zero guard); it is far below delta at the optimum, where
@@ -186,16 +195,14 @@ def mu_inner_cpu(
                 XT @ (weights * (y + theta) / (theta + delta))
             ).ravel()
         if lam > 0.0:
-            W = w.reshape(group_shape)
-            norms = np.sqrt((W**2).sum(axis=1))
-            pen = lam * (W / np.maximum(norms, 1e-300)[:, None]).ravel()
+            _, pen = group_lasso_penalty(w, lam, group_shape)
             den = np.maximum(data_den + pen, 1e-300)
         else:
             den = np.maximum(data_den, 1e-300)
         w_new = np.maximum(w * num / den, pmin)
         if fixed_mask is not None:
             w_new[fixed_mask] = pmin
-        rel = np.linalg.norm(w_new - w) / max(np.linalg.norm(w), 1e-14)
+        rel = relative_change(w_new, w)
         w = w_new
         if rel < tol:
             break

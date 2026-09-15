@@ -218,13 +218,39 @@ def weighted_poisson_nll_grad_lasso(
     grad : np.ndarray, shape ``(num_rgrs * num_runs,)``
     """
     loss, grad = weighted_poisson_nll_grad(w, X, y, weights, theta)
-    W = w.reshape(num_rgrs, num_runs)
+    penalty, grad_penalty = group_lasso_penalty(w, lam, (num_rgrs, num_runs))
+    return loss + penalty, grad + grad_penalty
+
+
+def group_lasso_penalty(
+    w: np.ndarray, lam: float, group_shape: tuple[int, int]
+) -> tuple[float, np.ndarray]:
+    """The group-LASSO penalty ``lam · Σ_g ‖w_g‖₂`` and its gradient.
+
+    Shared by the L-BFGS-B objective above and the denominator of the
+    multiplicative update (:mod:`price2.mu_solver`), which is the same
+    gradient ``lam · w_g / ‖w_g‖₂``.
+
+    Parameters
+    ----------
+    w : np.ndarray, shape ``(num_rgrs * num_runs,)``
+        Activities, RGR-major.
+    lam : float
+        Penalty strength.
+    group_shape : (num_rgrs, num_runs)
+        How ``w`` tiles into the penalty groups.
+
+    Returns
+    -------
+    penalty : float
+    grad : np.ndarray, shape ``(num_rgrs * num_runs,)``
+        A group at exactly zero has norm ``0``; its gradient is taken as
+        ``0`` (the norm is floored at ``1e-300``) rather than left undefined.
+    """
+    W = w.reshape(group_shape)
     norms = np.sqrt((W**2).sum(axis=1))
-    safe_norms = np.maximum(norms, 1e-300)
-    loss += lam * norms.sum()
-    grad_penalty = lam * (W / safe_norms[:, None])
-    grad = grad + grad_penalty.ravel()
-    return loss, grad
+    grad = lam * (W / np.maximum(norms, 1e-300)[:, None])
+    return lam * norms.sum(), grad.ravel()
 
 
 def weighted_poisson_log_likelihood_sparse(

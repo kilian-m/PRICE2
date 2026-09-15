@@ -210,11 +210,13 @@ class Callback:
         StopIteration
             When convergence is detected.
         """
-        ratio = self.previous / new
-        moved = (
-            ((1 - self.config.stop_factor_relative) > ratio)
-            | (ratio > (1 + self.config.stop_factor_relative))
-        ) & (new > self.config.rgr_min_activity)
+        config = self.config
+        # The box bounds keep ``new`` at or above ``pseudo_min``; the floor
+        # only guards a caller that passes an unbounded iterate.
+        ratio = self.previous / np.maximum(new, config.pseudo_min)
+        tolerance = config.stop_factor_relative
+        active = new > config.rgr_min_activity
+        moved = active & ((ratio < 1 - tolerance) | (ratio > 1 + tolerance))
         if not np.any(moved):
             self.success = True
             raise StopIteration
@@ -262,7 +264,11 @@ def _broker_irls(
         mu_inner_tol=config.mu_inner_tol,
         theta=theta,
     )
-    return BrokerClient(config.mu_broker_req_q).solve(X, XT, y, params, w0=w0)
+    # The wait is bounded by the locus's own budget (``ORFActivityEstimator``
+    # abandons a locus after ``timeout`` seconds per run).
+    return BrokerClient(config.mu_broker_req_q, config.mu_dtype).solve(
+        X, XT, y, params, w0=w0, timeout=config.timeout * max(1, num_runs)
+    )
 
 
 def irls_huber(
@@ -334,7 +340,7 @@ def irls_huber(
         weights = huber_weights(y, delta, c, theta)
         w_new = solve(X, y, w, replace(spec, weights=weights), config, XT=XT, gpu=gpu)
 
-        rel_change = np.linalg.norm(w_new - w) / max(np.linalg.norm(w), 1e-14)
+        rel_change = mu_solver.relative_change(w_new, w)
         w = w_new
         if rel_change < config.irls_huber_tol:
             break
