@@ -78,6 +78,137 @@ class SparseSystem:
     initial_guess: np.ndarray
 
 
+@dataclass(frozen=True)
+class _WeightedFit:
+    """The weighted maximum-likelihood fit the likelihood-ratio filter repeats.
+
+    Every call solves the same system under the same Huber weights; only
+    the set of RGRs pinned at zero changes between calls.
+
+    Parameters
+    ----------
+    system : SparseSystem
+        The locus's system on the surviving RGR set.
+    weights : np.ndarray
+        Huber weights at the current fit.
+    theta : float or None
+        Negative-binomial dispersion; ``None`` for the Poisson model.
+    config : Config
+        Solver settings.
+    XT : csr_matrix or None
+        ``X.T`` in CSR layout, transposed once for the many MU solves.
+    """
+
+    system: SparseSystem
+    weights: np.ndarray
+    theta: float | None
+    config: Config
+    XT: csr_matrix | None
+
+    def __call__(
+        self, w0: np.ndarray, kept: set[int] | None
+    ) -> tuple[np.ndarray, float]:
+        """Weighted MLE with every RGR outside *kept* pinned at zero.
+
+        Returns the activities and their log-likelihood; ``kept=None``
+        leaves every RGR free.
+        """
+        fixed_mask = None
+        if kept is not None:
+            fixed = np.ones((self.system.num_rgrs, self.system.num_runs), dtype=bool)
+            fixed[list(kept)] = False
+            fixed_mask = fixed.ravel()
+        w = solver.solve(
+            self.system.X,
+            self.system.y,
+            w0,
+            solver.SolveSpec(
+                theta=self.theta,
+                weights=self.weights,
+                fixed_mask=fixed_mask,
+                strict=True,
+            ),
+            self.config,
+            XT=self.XT,
+        )
+        return w, self.log_likelihood(w)
+
+    def log_likelihood(self, w: np.ndarray) -> float:
+        return weighted_poisson_log_likelihood_sparse(
+            w, self.system.X, self.system.y, self.weights, self.theta
+        )
+
+
+def _likelihood_ratio_prune(
+    fit: _WeightedFit,
+    activities: np.ndarray,
+    kept: set[int],
+    candidates: list[int],
+    config: Config,
+) -> tuple[set[int], np.ndarray]:
+    """Drop the candidates whose removal does not significantly lower the fit.
+
+    Each candidate gets a two-tier Wilks test against the current full
+    model.  The cheap tier clamps the candidate's activities to
+    ``config.pseudo_min`` without refitting; that likelihood bounds the
+    refit reduced likelihood from below, so a "not significant" verdict is
+    final.  Only a significant-looking candidate pays for the two
+    constrained refits (kept RGRs free, the candidate pinned) that confirm
+    it.  A dropped candidate stays pinned in every later fit.
+
+    Parameters
+    ----------
+    fit : _WeightedFit
+        The fit to repeat.
+    activities : np.ndarray
+        Starting point of the first full fit.
+    kept : set[int]
+        The RGR indices in the full model; shrunk in place as candidates
+        are dropped.
+    candidates : list[int]
+        The ORF RGR indices to test, in test order.
+    config : Config
+        ``likelihood_ratio_alpha`` and ``pseudo_min``.
+
+    Returns
+    -------
+    kept : set[int]
+        The surviving RGR indices (the same object).
+    activities : np.ndarray
+        The activities refit on them.
+    """
+    num_rgrs, num_runs = fit.system.num_rgrs, fit.system.num_runs
+    log_alpha = np.log(config.likelihood_ratio_alpha)
+    activities, log_likelihood = fit(activities, None)
+
+    for rgr_ind in candidates:
+        reduced_kept = kept - {rgr_ind}
+
+        reduced_activities = activities.copy().reshape(num_rgrs, -1)
+        reduced_activities[rgr_ind] = config.pseudo_min
+        reduced_activities = reduced_activities.flatten()
+        reduced_log_likelihood = fit.log_likelihood(reduced_activities)
+        log_p = wilks_test_p(
+            log_likelihood, reduced_log_likelihood, df_diff=num_runs
+        )
+        if log_p > log_alpha:
+            kept.remove(rgr_ind)
+            activities, log_likelihood = reduced_activities, reduced_log_likelihood
+            continue
+
+        activities, log_likelihood = fit(activities, kept)
+        reduced_activities, reduced_log_likelihood = fit(activities, reduced_kept)
+        log_p = wilks_test_p(
+            log_likelihood, reduced_log_likelihood, df_diff=num_runs
+        )
+        if log_p > log_alpha:
+            kept.remove(rgr_ind)
+            activities, log_likelihood = reduced_activities, reduced_log_likelihood
+
+    activities, _ = fit(activities, kept)
+    return kept, activities
+
+
 class Locus:
     """A genomic locus containing overlapping transcripts and ORF candidates.
 
@@ -917,108 +1048,40 @@ class Locus:
 
         theta = distribution_theta(config)
         system = self.sparse_system(runs)
-        X_lr, y_lr = system.X, system.y
-        num_rgrs, num_runs = system.num_rgrs, system.num_runs
-        initial_guess = system.initial_guess
-        # Transposed once for the many MU solves below.
-        XT_lr = X_lr.T.tocsr() if config.inner_solver == "mu" else None
-
         # Huber weights at the current fit, so that outlier EGs contribute
         # less to the test statistic.
-        delta = np.asarray(X_lr @ initial_guess).ravel()
-        weights = huber_weights(y_lr, delta, config.irls_huber_c, theta)
+        delta = np.asarray(system.X @ system.initial_guess).ravel()
+        weights = huber_weights(system.y, delta, config.irls_huber_c, theta)
+        fit = _WeightedFit(
+            system,
+            weights,
+            theta,
+            config,
+            XT=system.X.T.tocsr() if config.inner_solver == "mu" else None,
+        )
 
-        def fit(
-            w0: np.ndarray, kept: set[int] | None
-        ) -> tuple[np.ndarray, float]:
-            """Weighted MLE with every RGR outside *kept* pinned at zero."""
-            fixed_mask = None
-            if kept is not None:
-                fixed = np.ones((num_rgrs, num_runs), dtype=bool)
-                fixed[list(kept)] = False
-                fixed_mask = fixed.ravel()
-            w = solver.solve(
-                X_lr,
-                y_lr,
-                w0,
-                solver.SolveSpec(
-                    theta=theta,
-                    weights=weights,
-                    fixed_mask=fixed_mask,
-                    strict=True,
-                ),
-                config,
-                XT=XT_lr,
-            )
-            log_likelihood = weighted_poisson_log_likelihood_sparse(
-                w, X_lr, y_lr, weights, theta
-            )
-            return w, log_likelihood
-
-        noise_rgr_indices = {
-            rgr.index for rgr in self.rgrs if not rgr.is_orf
-        }
+        noise_rgr_indices = {rgr.index for rgr in self.rgrs if not rgr.is_orf}
         test_rgr_indices = {rgr.index for rgr in self.rgrs if rgr.is_orf}
-        keep_rgr_indices = noise_rgr_indices | test_rgr_indices
+        kept, activities = _likelihood_ratio_prune(
+            fit,
+            system.initial_guess,
+            noise_rgr_indices | test_rgr_indices,
+            self._by_ascending_activity(test_rgr_indices),
+            config,
+        )
 
-        full_activities, full_log_likelihood = fit(initial_guess, None)
-
-        rgr_ind_list = list(test_rgr_indices)
-        try:
-            act_sum = self.result[np.array(rgr_ind_list)].sum(axis=1)
-            rgr_ind_list = np.array(rgr_ind_list)[np.argsort(act_sum)]
-        except IndexError:
-            rgr_ind_list = []
-
-        # The same set object: removals below shrink ``keep_rgr_indices`` too.
-        full_rgr_ind = keep_rgr_indices
-        log_alpha = np.log(config.likelihood_ratio_alpha)
-        for rgr_ind in rgr_ind_list:
-            reduced_rgr_ind = full_rgr_ind - {rgr_ind}
-
-            # Cheap test first: clamp this ORF without refitting.  The clamped
-            # likelihood bounds the refit reduced likelihood from below, so a
-            # "not significant" verdict here is final.
-            reduced_activities = full_activities.copy().reshape(num_rgrs, -1)
-            reduced_activities[rgr_ind] = config.pseudo_min
-            reduced_activities = reduced_activities.flatten()
-            reduced_log_likelihood = weighted_poisson_log_likelihood_sparse(
-                reduced_activities, X_lr, y_lr, weights, theta
-            )
-            log_p = wilks_test_p(
-                full_log_likelihood, reduced_log_likelihood, df_diff=num_runs
-            )
-            if log_p > log_alpha:
-                full_rgr_ind.remove(rgr_ind)
-                full_activities = reduced_activities
-                full_log_likelihood = reduced_log_likelihood
-                continue
-
-            # Looks significant: confirm with properly refit full and reduced
-            # models.
-            full_activities, full_log_likelihood = fit(
-                full_activities, full_rgr_ind
-            )
-            reduced_activities, reduced_log_likelihood = fit(
-                full_activities, reduced_rgr_ind
-            )
-            log_p = wilks_test_p(
-                full_log_likelihood, reduced_log_likelihood, df_diff=num_runs
-            )
-            if log_p > log_alpha:
-                full_rgr_ind.remove(rgr_ind)
-                full_activities = reduced_activities
-                full_log_likelihood = reduced_log_likelihood
-
-        full_activities, full_log_likelihood = fit(full_activities, full_rgr_ind)
-
-        result = full_activities.reshape(num_rgrs, num_runs)
+        result = activities.reshape(system.num_rgrs, system.num_runs)
         result[result <= config.pseudo_min] = 0
         self.result = result
 
-        self.remove_rgrs(
-            self._orfs_at(set(range(len(self.rgrs))) - keep_rgr_indices)
-        )
+        self.remove_rgrs(self._orfs_at(set(range(len(self.rgrs))) - kept))
+
+    def _by_ascending_activity(self, indices: set[int]) -> list[int]:
+        """*indices* ordered by their RGRs' total activity, weakest first."""
+        if not indices:
+            return []
+        order = np.array(list(indices))
+        return order[np.argsort(self.result[order].sum(axis=1))].tolist()
 
     def estimate_activities(
         self,

@@ -227,6 +227,119 @@ def _concat(parts: list, dtype) -> np.ndarray:
     return np.concatenate(parts) if parts else np.empty(0, dtype)
 
 
+class _Memberships:
+    """The (multimap group, slot) membership rows of every run, run by run.
+
+    Each run's groups are numbered on from the last run's, so the group ids
+    are global; the slots keep the spill's locus numbering until
+    :meth:`linkage` maps them onto the linkage's.
+    """
+
+    def __init__(self) -> None:
+        self.n_groups = 0
+        self._counts: list[np.ndarray] = []
+        self._mmg: list[np.ndarray] = []
+        self._locus: list[np.ndarray] = []
+        self._run: list[np.ndarray] = []
+        self._gk: list[np.ndarray] = []
+
+    def add(self, groups: RunGroups, run_index: int) -> None:
+        """Append one run's groups."""
+        counts, slot_k, slot_li, slot_gk = groups
+        mmg_ids = np.arange(
+            self.n_groups, self.n_groups + counts.size, dtype=np.int64
+        )
+        self.n_groups += counts.size
+        self._counts.append(counts)
+        self._mmg.append(np.repeat(mmg_ids, slot_k))
+        self._locus.append(slot_li)
+        self._run.append(np.full(slot_li.size, run_index, dtype=np.int32))
+        # Group keys are 63-bit, so the unsigned spill column carries over to
+        # the signed dtype the linkage stores unchanged.
+        self._gk.append(slot_gk.astype(np.int64))
+
+    def linkage(self, spill_locus_ids: list[str], locus_ids: list[str]) -> Linkage:
+        """Number the slots in canonical order and build the linkage.
+
+        The linkage numbers the loci that carry slots (*locus_ids*, sorted)
+        while the spill numbered every locus of the run (*spill_locus_ids*).
+        The membership rows are consumed: the object is empty afterwards.
+        """
+        spill_to_linkage = np.full(len(spill_locus_ids), -1, dtype=np.int32)
+        spill_pos = {lid: i for i, lid in enumerate(spill_locus_ids)}
+        for i, lid in enumerate(locus_ids):
+            spill_to_linkage[spill_pos[lid]] = i
+        member_locus = spill_to_linkage[_concat(self._locus, np.uint32)]
+        self._locus.clear()
+        del spill_to_linkage, spill_pos
+        link = Linkage.from_memberships(
+            _concat(self._mmg, np.int64),
+            member_locus,
+            _concat(self._run, np.int32),
+            _concat(self._gk, np.int64),
+            _concat(self._counts, np.int64),
+            locus_ids,
+        )
+        for parts in (self._mmg, self._run, self._gk, self._counts):
+            parts.clear()
+        return link
+
+
+def _slot_baselines(
+    groups: RunGroups,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sum the read counts of the groups passing through every slot of a run.
+
+    Returns the distinct slots as ``(locus index, group key)`` columns in
+    lexicographic order, and ``base[slot] = Σ read counts of the MMGs
+    passing through it``.  O(#slots), not O(#alignments).
+    """
+    counts, slot_k, slot_li, slot_gk = groups
+    per_slot_count = np.repeat(counts, slot_k)
+    order = np.lexsort((slot_gk, slot_li))
+    s_li = slot_li[order]
+    s_gk = slot_gk[order]
+    new = np.empty(s_li.size, dtype=bool)
+    new[0] = True
+    np.logical_or(s_li[1:] != s_li[:-1], s_gk[1:] != s_gk[:-1], out=new[1:])
+    slot_of = np.cumsum(new) - 1
+    totals = np.bincount(slot_of, weights=per_slot_count[order])
+    return s_li[new], s_gk[new], totals
+
+
+def _add_locus_baselines(
+    base_by_locus: dict,
+    run_id: str,
+    spill_locus_ids: list[str],
+    u_li: np.ndarray,
+    u_gk: np.ndarray,
+    totals: np.ndarray,
+) -> None:
+    """Fill one run's slots into the per-locus ``{(run_id, group_key): base}`` maps."""
+    bounds = np.flatnonzero(np.concatenate(([True], u_li[1:] != u_li[:-1])))
+    for b, e in zip(bounds.tolist(), bounds[1:].tolist() + [u_li.size]):
+        d = base_by_locus[spill_locus_ids[u_li[b]]]
+        for g, t in zip(u_gk[b:e].tolist(), totals[b:e].tolist()):
+            d[(run_id, g)] = t
+
+
+def _store_baselines(cur, base_by_locus: dict) -> None:
+    """Write the slot baselines and the iteration-0 weights they seed."""
+    base_rows = [
+        (locus_id, database.pickle_blob(d)) for locus_id, d in base_by_locus.items()
+    ]
+    cur.executemany("INSERT INTO multimap_slot_base VALUES (?, ?)", base_rows)
+    # Released before the re-read below: at genome scale the baseline is ~4e7
+    # slots, and `_baseline_weight_rows` loads every blob back again.
+    del base_rows
+    # iteration-0 weights == baseline == full counts (classic behaviour), as a
+    # dense buffer in canonical slot order; reads back the rows just inserted,
+    # so it must share this cursor's transaction.
+    cur.executemany(
+        "INSERT INTO group_weights VALUES (0, ?, ?)", _baseline_weight_rows(cur)
+    )
+
+
 def build_multimap_index(db_path: str, processes: int = 1) -> int:
     """Collapse spilled alignments into multimap groups and seed weights.
 
@@ -290,109 +403,44 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         run_index = run_index_from(cur)
 
         # Merge the per-run results into the global MMG id space and accumulate
-        # per-slot baselines.  Everything below is O(#slots), not O(#alignments).
+        # the per-slot baselines, one pickled {(run_id, group_key): base} dict
+        # per locus.
         base_by_locus: dict = defaultdict(dict)
-        mmg_id = 0
+        memberships = _Memberships()
         n_slots = 0
-        mmg_counts: list = []
-        members_mmg: list = []
-        members_locus: list = []
-        members_run: list = []
-        members_gk: list = []
-
         try:
             results = (
                 pool.imap(_index_run, tasks) if pool
                 else (_index_run(t) for t in tasks)
             )
-            for run_id, (counts, slot_k, slot_li, slot_gk) in zip(run_ids, results):
-                if counts.size == 0:
+            for run_id, groups in zip(run_ids, results):
+                if groups.counts.size == 0:
                     continue
-                mmg_ids = np.arange(mmg_id, mmg_id + counts.size, dtype=np.int64)
-                mmg_id += counts.size
-
-                # Group keys are 63-bit, so the unsigned spill column carries
-                # over to the signed dtype the linkage stores unchanged.
-                mmg_counts.append(counts)
-                members_mmg.append(np.repeat(mmg_ids, slot_k))
-                members_locus.append(slot_li)
-                members_run.append(
-                    np.full(slot_li.size, run_index[run_id], dtype=np.int32)
-                )
-                members_gk.append(slot_gk.astype(np.int64))
-
-                # base[slot] = Σ read counts of the MMGs passing through it.
-                per_slot_count = np.repeat(counts, slot_k)
-                order = np.lexsort((slot_gk, slot_li))
-                s_li = slot_li[order]
-                s_gk = slot_gk[order]
-                new = np.empty(s_li.size, dtype=bool)
-                new[0] = True
-                np.logical_or(
-                    s_li[1:] != s_li[:-1], s_gk[1:] != s_gk[:-1], out=new[1:]
-                )
-                slot_of = np.cumsum(new) - 1
-                totals = np.bincount(slot_of, weights=per_slot_count[order])
-                u_li = s_li[new]
-                u_gk = s_gk[new]
+                memberships.add(groups, run_index[run_id])
+                u_li, u_gk, totals = _slot_baselines(groups)
                 n_slots += u_li.size
-
-                # One pickled {(run_id, group_key): base} dict per locus.
-                bounds = np.flatnonzero(
-                    np.concatenate(([True], u_li[1:] != u_li[:-1]))
+                _add_locus_baselines(
+                    base_by_locus, run_id, spill_locus_ids, u_li, u_gk, totals
                 )
-                for b, e in zip(bounds.tolist(), bounds[1:].tolist() + [u_li.size]):
-                    d = base_by_locus[spill_locus_ids[u_li[b]]]
-                    for g, t in zip(u_gk[b:e].tolist(), totals[b:e].tolist()):
-                        d[(run_id, g)] = t
         finally:
             if pool is not None:
                 pool.close()
                 pool.join()
 
-        # The linkage numbers the loci that carry slots in sorted order; the
-        # spill numbered every locus of the run.
-        locus_ids = sorted(base_by_locus)
-        spill_to_linkage = np.full(len(spill_locus_ids), -1, dtype=np.int32)
-        spill_pos = {lid: i for i, lid in enumerate(spill_locus_ids)}
-        for i, lid in enumerate(locus_ids):
-            spill_to_linkage[spill_pos[lid]] = i
-        member_locus = spill_to_linkage[_concat(members_locus, np.uint32)]
-        del members_locus, spill_to_linkage, spill_pos
-        link = Linkage.from_memberships(
-            _concat(members_mmg, np.int64),
-            member_locus,
-            _concat(members_run, np.int32),
-            _concat(members_gk, np.int64),
-            _concat(mmg_counts, np.int64),
-            locus_ids,
-        )
-        del members_mmg, members_run, members_gk, member_locus, mmg_counts
+        n_groups = memberships.n_groups
+        link = memberships.linkage(spill_locus_ids, sorted(base_by_locus))
+        del memberships
         # Written before the baselines below: an index whose file is missing
         # is reported as unbuilt (`has_multimap_index`), never as half built.
         _invalidate_linkage(db_path)
         link.save(linkage_path(db_path))
         del link
-
-        base_rows = [
-            (locus_id, database.pickle_blob(d))
-            for locus_id, d in base_by_locus.items()
-        ]
-        cur.executemany("INSERT INTO multimap_slot_base VALUES (?, ?)", base_rows)
-        # Released before the re-read below: at genome scale the baseline is ~4e7
-        # slots, and `_baseline_weight_rows` loads every blob back again.
-        del base_rows, base_by_locus
-        # iteration-0 weights == baseline == full counts (classic behaviour), as a
-        # dense buffer in canonical slot order; reads back the rows just inserted,
-        # so it must share this cursor's transaction.
-        cur.executemany(
-            "INSERT INTO group_weights VALUES (0, ?, ?)",
-            _baseline_weight_rows(cur),
-        )
+        _store_baselines(cur, base_by_locus)
+        del base_by_locus
 
     discard_spill(db_path)
-    logger.info("multimap index: %d groups over %d slots", mmg_id, n_slots)
-    return mmg_id
+    logger.info("multimap index: %d groups over %d slots", n_groups, n_slots)
+    return n_groups
 
 
 def has_multimap_index(db_path: str) -> bool:
