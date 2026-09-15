@@ -516,11 +516,12 @@ def migrate_legacy_progress(db_path: str, w_dir: str) -> None:
 # Repairing appended output files                                               #
 # --------------------------------------------------------------------------- #
 #
-# The parent appends a locus's rows to the output files and only then records
-# the locus as finished.  Nothing makes those two writes atomic, so an
-# interrupted run leaves two kinds of damage behind: a half written final
-# line, and complete rows belonging to loci that never got marked done — which
-# a resume re-runs, appending their rows a second time.  Both are repaired
+# The parent is the only process that writes the output files: it appends a
+# locus's rows and only then records the locus as finished.  Nothing makes
+# those two writes atomic, so an interrupted run leaves two kinds of damage
+# behind: a half written final line (the parent died mid-``write``), and
+# complete rows belonging to loci that never got marked done — which a
+# resume re-runs, appending their rows a second time.  Both are repaired
 # here, before the resumed run writes anything: partial lines are truncated,
 # and every row whose locus is not recorded as finished is dropped.
 #
@@ -530,8 +531,10 @@ def migrate_legacy_progress(db_path: str, w_dir: str) -> None:
 # that TSV does not exist the BED cannot be repaired exactly and the caller is
 # told to start the deconvolution over instead.
 
-#: Extensions of the line-oriented files the workers append to.
+#: Extensions of the line-oriented files the parent appends to.  ``.txt`` is
+#: only ``failed_loci.txt``, which lists one locus id per line.
 _APPENDED_SUFFIXES: tuple[str, ...] = (".tsv", ".bed", ".gtf", ".txt")
+_FAILED_LOCI = "failed_loci.txt"
 
 #: Column names identifying the locus a TSV row belongs to.
 _LOCUS_COLUMNS: tuple[str, ...] = ("locus_id", "loc_id")
@@ -581,7 +584,7 @@ def _truncate_to_last_newline(path: str) -> bool:
 
 
 def repair_partial_lines(*paths: str) -> None:
-    """Trim trailing partial lines from appended outputs before a resume.
+    """Trim a trailing partial line from each of *paths* before a resume.
 
     The parent appends a locus's rows and marks the locus done only
     afterwards, so an interrupted run can leave a half-written final line.
@@ -591,32 +594,28 @@ def repair_partial_lines(*paths: str) -> None:
     Parameters
     ----------
     *paths : str
-        Files to repair, and directories to walk for
-        ``.tsv``/``.bed``/``.gtf``/``.txt`` files.
+        Files to repair.
     """
-    targets: list[str] = []
     for path in paths:
-        if os.path.isdir(path):
-            for root, _, names in os.walk(path):
-                targets += [
-                    os.path.join(root, name)
-                    for name in names
-                    if name.endswith(_APPENDED_SUFFIXES)
-                ]
-        elif os.path.isfile(path):
-            targets.append(path)
-
-    for target in targets:
         try:
-            if _truncate_to_last_newline(target):
-                logger.warning(
-                    "dropped a partial trailing line from %s", target
-                )
+            if _truncate_to_last_newline(path):
+                logger.warning("dropped a partial trailing line from %s", path)
         except OSError as exc:
-            logger.warning("could not repair %s: %s", target, exc)
+            logger.warning("could not repair %s: %s", path, exc)
 
 
-def _rewrite(path: str, keep) -> int:
+def _appended_outputs(o_dir: str) -> dict[str, list[str]]:
+    """The appended output files under *o_dir*, keyed by extension."""
+    files: dict[str, list[str]] = {suffix: [] for suffix in _APPENDED_SUFFIXES}
+    for root, _, names in os.walk(o_dir):
+        for name in names:
+            suffix = os.path.splitext(name)[1]
+            if suffix in files and (suffix != ".txt" or name == _FAILED_LOCI):
+                files[suffix].append(os.path.join(root, name))
+    return files
+
+
+def _rewrite(path: str, keep, *, header: bool = False) -> int:
     """Rewrite *path* keeping only the lines *keep* accepts.
 
     Parameters
@@ -625,6 +624,8 @@ def _rewrite(path: str, keep) -> int:
         File to filter in place.
     keep : callable
         ``keep(line) -> bool``.
+    header : bool
+        Copy the first line unconditionally.
 
     Returns
     -------
@@ -634,6 +635,8 @@ def _rewrite(path: str, keep) -> int:
     tmp = path + ".resume-tmp"
     dropped = 0
     with open(path) as src, open(tmp, "w") as dst:
+        if header:
+            dst.write(src.readline())
         for line in src:
             if keep(line):
                 dst.write(line)
@@ -679,18 +682,14 @@ def _filter_tsv(path: str, done: set[str]) -> set[str]:
 
     kept: set[str] = set()
 
-    def keep(line: str, _state={"first": True}) -> bool:
-        if _state["first"]:
-            _state["first"] = False
-            if has_header:
-                return True
+    def keep(line: str) -> bool:
         fields_ = line.rstrip("\n").split("\t")
         if len(fields_) <= column or fields_[column] not in done:
             return False
         kept.add(fields_[0])
         return True
 
-    _rewrite(path, keep)
+    _rewrite(path, keep, header=has_header)
     return kept
 
 
@@ -737,34 +736,17 @@ def repair_outputs(o_dir: str, done: set[str]) -> bool:
         must then discard the output directory and deconvolve every locus
         again, since duplicate BED records cannot be ruled out.
     """
-    repair_partial_lines(o_dir)
+    files = _appended_outputs(o_dir)
+    repair_partial_lines(*(path for paths in files.values() for path in paths))
 
-    tsv_files: list[str] = []
-    gtf_files: list[str] = []
-    bed_files: list[str] = []
-    txt_files: list[str] = []
-    for root, _, names in os.walk(o_dir):
-        for name in names:
-            path = os.path.join(root, name)
-            if name.endswith(".tsv"):
-                tsv_files.append(path)
-            elif name.endswith(".gtf"):
-                gtf_files.append(path)
-            elif name.endswith(".bed"):
-                bed_files.append(path)
-            elif name == "failed_loci.txt":
-                txt_files.append(path)
-
-    kept_ids: dict[str, set[str]] = {}
-    for path in tsv_files:
-        kept_ids[path] = _filter_tsv(path, done)
-    for path in gtf_files:
+    kept_ids = {path: _filter_tsv(path, done) for path in files[".tsv"]}
+    for path in files[".gtf"]:
         _filter_gtf(path, done)
-    for path in txt_files:
+    for path in files[".txt"]:
         _rewrite(path, lambda line: line.strip() in done)
 
     consistent = True
-    for path in bed_files:
+    for path in files[".bed"]:
         sibling = path[: -len(".bed")] + ".tsv"
         if sibling in kept_ids:
             _filter_bed(path, kept_ids[sibling])

@@ -247,6 +247,37 @@ tested and never dropped — they are the null sink that absorbs reads no ORF ex
 
 ---
 
+## 6. Process model
+
+Every parallel phase has its own pool, and they deliberately differ in how the
+workers are started and what they may write.
+
+| phase | pool | start method | why |
+|---|---|---|---|
+| per-run models — `ribo_seq_run.ribo_seq_runs_from_bams` | `multiprocessing.Pool`: one worker per BAM for the cleavage EM, then one task per genomic window for the coverage histograms | `fork` | the annotation and the fitted cleavage models reach the workers as initializer arguments; `fork` inherits them without pickling |
+| read mapping — `data_collector._map_run_reads` | `multiprocessing.Pool`, one task per locus chunk | `fork` | the loci are inherited the same way; the pool is created before the parent opens `price.db`, so no SQLite connection crosses the fork |
+| multimap index — `multimap.build_multimap_index` | `multiprocessing.Pool`, one task per run | `forkserver` | created before the parent opens `price.db`; a worker only reads its run's spill files |
+| deconvolution — `ORFActivityEstimator` | `pebble.ProcessPool`, one job per locus, a worker recycled after `worker_max_tasks` loci | `forkserver` | numba's JIT state and SQLite handles are not fork-safe (do not change this to `fork`); `init_worker` builds the `WorkerContext` — configuration, genome, runs with their models — once per worker; a locus that times out (`timeout` × runs) or crashes takes down only its worker |
+| GPU broker — `gpu_broker.GpuBroker`, optional | `mu_broker_procs` processes × `mu_broker_streams` stream-threads | `forkserver` | one CUDA context per process instead of one per worker; the workers ship their systems over shared memory and block on a socket until the answer is written |
+
+Who writes what:
+
+- **Workers never write to `o_dir`.** A deconvolution worker hands its rendered
+  rows back in a `LocusResult`; the parent (`ORFActivityEstimator._record`) is
+  the only writer of the output tables, of `performance_measurements.tsv` and of
+  the per-locus progress (the `progress` table, through
+  `run_state.ProgressRecorder`). That is what makes the resume repair
+  (`run_state.repair_outputs`) sound: only a parent crash mid-`write` can tear a
+  line, and every complete row belongs to a locus the parent either marked done
+  or will re-run.
+- Workers do write their **own EM state** — `locus_activities`,
+  `group_lambdas`, the prepared-locus cache — to `price.db` through
+  `database.connect` (WAL mode, busy timeout), one short transaction per locus.
+- Worker **logs** travel over a queue to the parent's `QueueListener`; the
+  broker processes, which have no queue, log to the inherited stderr.
+
+---
+
 ## Notation
 
 | symbol | meaning |
