@@ -191,12 +191,13 @@ def create_progress_table(cur: sql.Cursor) -> None:
 
 
 #: Layout version of the ``prepared_loci`` / ``prepared_loci_cache`` blobs
-#: (a pickled ``Locus`` and its ``ReadRouting``).  Part of the deconvolution fingerprint
+#: (a pickled ``Locus``, and its ``ReadRouting`` with the design matrix built
+#: from it).  Part of the deconvolution fingerprint
 #: (:func:`price2.run_state.deconvolution_fingerprint`), so a run resumed by
 #: a PRICE2 that pickles the locus differently starts its EM over instead of
 #: unpickling blobs it cannot use.  Bump it whenever the pickled state
 #: changes shape.
-PREPARED_LOCI_FORMAT = "3"
+PREPARED_LOCI_FORMAT = "4"
 
 
 def create_em_tables(cur: sql.Cursor) -> None:

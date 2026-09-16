@@ -69,9 +69,59 @@ def init_spill(db_path: str, locus_ids: list[str]) -> str:
     return root
 
 
+#: A run's spill, collapsed into its multimap groups right after the run was
+#: mapped (:func:`price2.multimap.index.index_run_spill`), replaces the raw
+#: ``<run_id>/`` directory by this file.
+GROUPS_SUFFIX = ".groups.npz"
+
+
+def run_spill_dir(root: str, run_id: str) -> str:
+    """The raw spill directory of one run."""
+    return os.path.join(root, run_id)
+
+
+def groups_path(root: str, run_id: str) -> str:
+    """The collapsed groups file of one run (see :data:`GROUPS_SUFFIX`)."""
+    return os.path.join(root, run_id + GROUPS_SUFFIX)
+
+
+def run_spill_present(root: str, run_id: str) -> bool:
+    """Whether a run's alignments are in the spill, raw or already collapsed."""
+    return os.path.isdir(run_spill_dir(root, run_id)) or os.path.exists(
+        groups_path(root, run_id)
+    )
+
+
+def spilled_run_ids(root: str) -> list[str]:
+    """The runs with a raw spill directory or a groups file under *root*, sorted."""
+    if not os.path.isdir(root):
+        return []
+    found = set()
+    for name in os.listdir(root):
+        if os.path.isdir(os.path.join(root, name)):
+            found.add(name)
+        elif name.endswith(GROUPS_SUFFIX):
+            found.add(name[: -len(GROUPS_SUFFIX)])
+    return sorted(found)
+
+
+def spill_bytes(root: str, run_id: str) -> int:
+    """The size of a run's raw spill files on disk."""
+    directory = run_spill_dir(root, run_id)
+    if not os.path.isdir(directory):
+        return 0
+    return sum(
+        os.path.getsize(os.path.join(directory, name)) for name in os.listdir(directory)
+    )
+
+
 def reset_run_spill(root: str, run_id: str) -> None:
     """Drop any spill left by a previous, incomplete pass over ``run_id``."""
-    shutil.rmtree(os.path.join(root, run_id), ignore_errors=True)
+    shutil.rmtree(run_spill_dir(root, run_id), ignore_errors=True)
+    try:
+        os.remove(groups_path(root, run_id))
+    except FileNotFoundError:
+        pass
 
 
 #: Rows a worker buffers before spilling them to disk.  Only bounds peak
@@ -121,7 +171,10 @@ def write_spill(
     three files each that is ~36 000 files **per run** — 1.6 M for a 45-BAM
     set, which exhausts a typical filesystem inode quota long before it runs
     out of space.  Buffering per worker writes three files per worker
-    instead, ~100x fewer, for the same bytes.
+    instead, ~100x fewer, for the same bytes.  The collector also flushes
+    every worker once a run's chunks are all mapped
+    (:func:`price2.data_collector._mapping_task`), so a run's spill is
+    complete before its reads are committed.
 
     Parameters
     ----------
@@ -138,7 +191,7 @@ def write_spill(
         # NOT atexit: multiprocessing children end in os._exit(), which skips
         # atexit handlers entirely.  util.Finalize is what _exit_function runs,
         # and it is only reached if the pool is closed and joined rather than
-        # terminated (see DataCollector._collect_run).
+        # terminated (see DataCollector._map_reads).
         from multiprocessing.util import Finalize
 
         _SPILL_FINALIZER = Finalize(None, flush_spill, exitpriority=16)

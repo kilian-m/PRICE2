@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
+from typing import Callable
 
 import numpy as np
 from scipy.optimize import minimize
@@ -30,6 +31,17 @@ from price2.likelihood import (
     weighted_poisson_nll_grad,
     weighted_poisson_nll_grad_lasso,
 )
+from price2.mu_solver import Collapsed, Design
+
+__all__ = [
+    "Collapsed",
+    "Design",
+    "IrlsResult",
+    "SolveSpec",
+    "gpu_solver",
+    "irls_huber",
+    "solve",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +93,17 @@ class IrlsResult:
 
 
 def solve(
-    X: csr_matrix,
-    y: np.ndarray,
+    X: csr_matrix | None,
+    y: np.ndarray | None,
     w0: np.ndarray,
     spec: SolveSpec,
     config: Config,
     *,
     XT: csr_matrix | None = None,
     gpu: mu_solver.GpuMuSolver | None = None,
+    design: Design | None = None,
+    collapsed: Collapsed | None = None,
+    stop: Callable[[np.ndarray], bool] | None = None,
 ) -> np.ndarray:
     """Fit activities ``w`` to counts ``y`` under the model ``δ = X @ w``.
 
@@ -110,6 +125,16 @@ def solve(
     gpu : GpuMuSolver, optional
         A per-worker GPU solver already holding ``X`` and ``y`` (see
         :func:`gpu_solver`).  Ignored when ``spec.fixed_mask`` is set.
+    design : Design, optional
+        ``X`` and ``y`` with their derived arrays (transpose, counted rows)
+        already built, for callers that solve the same system repeatedly.
+    collapsed : Collapsed, optional
+        A Poisson system already collapsed under ``spec.weights``, which the
+        caller guarantees to match; ``X`` and ``y`` may then be ``None``.
+        Only the multiplicative-update solver takes it.
+    stop : callable, optional
+        Early-stopping check of the multiplicative updates
+        (:func:`price2.mu_solver.mu_poisson`); ignored by L-BFGS-B.
 
     Returns
     -------
@@ -117,11 +142,19 @@ def solve(
         The fitted activities, every entry at least ``config.pseudo_min``.
     """
     if config.inner_solver == "mu":
-        return _solve_mu(X, y, w0, spec, config, XT=XT, gpu=gpu)
+        return _solve_mu(
+            X, y, w0, spec, config, XT=XT, gpu=gpu, design=design,
+            collapsed=collapsed, stop=stop,
+        )
+    if collapsed is not None:
+        raise ValueError("a collapsed system needs the multiplicative-update solver")
+    if design is not None:
+        X, y = design.X, design.y
     return _solve_lbfgs(X, y, w0, spec, config)
 
 
-def _solve_mu(X, y, w0, spec, config, *, XT, gpu):
+def _solve_mu(X, y, w0, spec, config, *, XT, gpu, design, collapsed, stop):
+    mu_solver.set_kernel(config.mu_kernel)
     settings = dict(
         weights=spec.weights,
         lam=spec.lam,
@@ -134,7 +167,8 @@ def _solve_mu(X, y, w0, spec, config, *, XT, gpu):
     if gpu is not None and spec.fixed_mask is None:
         return gpu.solve(w0, **settings)
     return mu_solver.mu_inner_cpu(
-        X, y, w0, fixed_mask=spec.fixed_mask, XT=XT, **settings
+        X, y, w0, fixed_mask=spec.fixed_mask, XT=XT, design=design,
+        collapsed=collapsed, stop=stop, **settings
     )
 
 
@@ -272,8 +306,7 @@ def _broker_irls(
 
 
 def irls_huber(
-    X: csr_matrix,
-    y: np.ndarray,
+    design: Design,
     w0: np.ndarray,
     config: Config,
     num_rgrs: int,
@@ -296,10 +329,9 @@ def irls_huber(
 
     Parameters
     ----------
-    X : csr_matrix
-        Design matrix, rows ``(EG, run)``, columns ``(RGR, run)``.
-    y : np.ndarray
-        Read counts per row.
+    design : Design
+        Design matrix (rows ``(EG, run)``, columns ``(RGR, run)``) and read
+        counts per row.
     w0 : np.ndarray
         Starting activities (all ones for a cold start).
     config : Config
@@ -319,7 +351,8 @@ def irls_huber(
     c = config.irls_huber_c
     n_outer = config.irls_huber_max_outer if max_outer is None else max_outer
     use_mu = config.inner_solver == "mu"
-    XT = X.T.tocsr() if use_mu else None
+    X, y = design.X, design.y
+    XT = design.XT if use_mu else None
 
     broker_req_q = getattr(config, "mu_broker_req_q", None)
     if use_mu and broker_req_q is not None and X.shape[0] >= config.mu_gpu_min_rows:
@@ -338,7 +371,10 @@ def irls_huber(
     for outer in range(n_outer):
         delta = np.asarray(X @ w).ravel()
         weights = huber_weights(y, delta, c, theta)
-        w_new = solve(X, y, w, replace(spec, weights=weights), config, XT=XT, gpu=gpu)
+        w_new = solve(
+            X, y, w, replace(spec, weights=weights), config, XT=XT, gpu=gpu,
+            design=design,
+        )
 
         rel_change = mu_solver.relative_change(w_new, w)
         w = w_new

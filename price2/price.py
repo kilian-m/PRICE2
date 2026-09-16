@@ -15,7 +15,13 @@ import os
 import shutil
 import sys
 
-from price2 import multimap
+# Before numpy is imported anywhere: every worker process is single-threaded
+# by design (the pools fill the cores), so the numerical libraries get one
+# thread each unless the environment says otherwise.  The workers inherit it.
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
+from price2 import multimap  # noqa: E402
 from price2 import run_state
 from price2.config import Config
 from price2.data_collector import DataCollector
@@ -233,7 +239,9 @@ class _Collection:
     def load_inputs(self) -> None:
         reference = run_stage(
             "load reference annotation",
-            lambda: ReferenceAnnotation(self.config.gtf_path),
+            lambda: ReferenceAnnotation.load_cached(
+                self.config.gtf_path, self.config.w_dir
+            ),
         )
         self.collector = DataCollector(reference, self.config)
 

@@ -2,7 +2,8 @@
 
 ``multimap_slot_base``
     Per-slot baseline weight = number of MMG reads passing through it
-    (the full-count reference the worker subtracts).
+    (the full-count reference the worker subtracts), as canonical-order
+    arrays per locus (:func:`price2.multimap.linkage.slot_base_blob`).
 ``group_weights``
     Per-iteration fractional slot weights, produced by the E-step and
     read by the M-step workers.
@@ -71,12 +72,7 @@ def _baseline_weight_rows(cur: sql.Cursor) -> list:
     """
     run_index = run_index_from(cur)
     return [
-        (
-            locus_id,
-            LocusSlots.from_base_map(
-                database.unpickle_blob(blob), run_index
-            ).base.tobytes(),
-        )
+        (locus_id, LocusSlots.from_blob(blob, run_index).base.tobytes())
         for locus_id, blob in cur.execute(
             "SELECT locus_id, base_blob FROM multimap_slot_base"
         ).fetchall()
@@ -183,10 +179,8 @@ def load_locus_mm_data(
             "WHERE locus_id = ? AND iteration = ?",
             (locus_id, iteration),
         ).fetchone()
-    return LocusSlots.from_base_map(
-        database.unpickle_blob(base_row[0]),
-        _run_index(db_path),
-        w_row[0] if w_row is not None else None,
+    return LocusSlots.from_blob(
+        base_row[0], _run_index(db_path), w_row[0] if w_row is not None else None
     )
 
 

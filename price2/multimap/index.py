@@ -1,11 +1,13 @@
 """Building the multimap linkage index from the spilled alignments.
 
-Runs once after read collection: keeps the reads that touch **>= 2**
-distinct in-locus slots, collapses reads with an identical slot set into one
-multimap group (MMG) with a member count, and writes the static linkage
-(``multimap_linkage.npz``, see :mod:`price2.multimap.linkage`), the per-locus
-slot baselines (``multimap_slot_base``) and the iteration-0 ``group_weights``
-seed.
+Each run's spill is collapsed into its multimap groups as soon as the run is
+mapped (:func:`index_run_spill`): the reads that touch **>= 2** distinct
+in-locus slots, reads with an identical slot set merged into one multimap
+group (MMG) with a member count.  Once every run is collected,
+:func:`build_multimap_index` merges the runs' groups and writes the static
+linkage (``multimap_linkage.npz``, see :mod:`price2.multimap.linkage`), the
+per-locus slot baselines (``multimap_slot_base``) and the iteration-0
+``group_weights`` seed.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
-from collections import defaultdict
+import shutil
 from typing import NamedTuple
 
 import numpy as np
@@ -24,8 +26,15 @@ from price2.multimap.linkage import (
     _invalidate_linkage,
     linkage_path,
     run_index_from,
+    slot_base_blob,
 )
-from price2.multimap.spill import discard_spill, spill_dir
+from price2.multimap.spill import (
+    discard_spill,
+    groups_path,
+    run_spill_dir,
+    spill_dir,
+    spilled_run_ids,
+)
 from price2.multimap.state import _baseline_weight_rows
 
 logger = logging.getLogger(__name__)
@@ -227,6 +236,46 @@ def _concat(parts: list, dtype) -> np.ndarray:
     return np.concatenate(parts) if parts else np.empty(0, dtype)
 
 
+def index_run_spill(root: str, run_id: str) -> int:
+    """Collapse one run's raw spill into its groups file and delete the spill.
+
+    Run by the collector as soon as a run's alignments are all on disk
+    (:func:`price2.data_collector.DataCollector.collect_mappings`), so the
+    raw spill — ~20 bytes per multimapping alignment, gigabytes for a deep
+    library — never accumulates across the runs; the groups are a fraction
+    of it.  :func:`build_multimap_index` picks the file up and indexes any
+    run still spilled raw itself.
+
+    Returns the number of groups.
+    """
+    directory = run_spill_dir(root, run_id)
+    groups = _index_run(directory)
+    target = groups_path(root, run_id)
+    tmp = f"{target}.tmp.npz"
+    np.savez(
+        tmp,
+        counts=groups.counts,
+        slot_k=groups.slot_k,
+        slot_li=groups.slot_li,
+        slot_gk=groups.slot_gk,
+    )
+    os.replace(tmp, target)
+    shutil.rmtree(directory, ignore_errors=True)
+    return int(groups.counts.size)
+
+
+def _run_groups(task: tuple[str, str]) -> RunGroups:
+    """A run's groups: from its groups file, else collapsed from its raw spill."""
+    root, run_id = task
+    path = groups_path(root, run_id)
+    if os.path.exists(path):
+        with np.load(path) as data:
+            return RunGroups(
+                data["counts"], data["slot_k"], data["slot_li"], data["slot_gk"]
+            )
+    return _index_run(run_spill_dir(root, run_id))
+
+
 class _Memberships:
     """The (multimap group, slot) membership rows of every run, run by run.
 
@@ -307,48 +356,68 @@ def _slot_baselines(
     return s_li[new], s_gk[new], totals
 
 
-def _add_locus_baselines(
-    base_by_locus: dict,
-    run_id: str,
-    spill_locus_ids: list[str],
-    u_li: np.ndarray,
-    u_gk: np.ndarray,
-    totals: np.ndarray,
-) -> None:
-    """Fill one run's slots into the per-locus ``{(run_id, group_key): base}`` maps."""
-    bounds = np.flatnonzero(np.concatenate(([True], u_li[1:] != u_li[:-1])))
-    for b, e in zip(bounds.tolist(), bounds[1:].tolist() + [u_li.size]):
-        d = base_by_locus[spill_locus_ids[u_li[b]]]
-        for g, t in zip(u_gk[b:e].tolist(), totals[b:e].tolist()):
-            d[(run_id, g)] = t
+class _Baselines:
+    """The slot baselines of every run, as arrays until they are written.
 
+    Kept as flat columns — spill locus index, run index, group key, base —
+    rather than one dict per locus: a genome-scale panel has tens of
+    millions of slots per run, and Python objects for each would need more
+    memory than the alignments they summarise.
+    """
 
-def _store_baselines(cur, base_by_locus: dict) -> None:
-    """Write the slot baselines and the iteration-0 weights they seed."""
-    base_rows = [
-        (locus_id, database.pickle_blob(d)) for locus_id, d in base_by_locus.items()
-    ]
-    cur.executemany("INSERT INTO multimap_slot_base VALUES (?, ?)", base_rows)
-    # Released before the re-read below: at genome scale the baseline is ~4e7
-    # slots, and `_baseline_weight_rows` loads every blob back again.
-    del base_rows
-    # iteration-0 weights == baseline == full counts (classic behaviour), as a
-    # dense buffer in canonical slot order; reads back the rows just inserted,
-    # so it must share this cursor's transaction.
-    cur.executemany(
-        "INSERT INTO group_weights VALUES (0, ?, ?)", _baseline_weight_rows(cur)
-    )
+    def __init__(self) -> None:
+        self._li: list[np.ndarray] = []
+        self._run: list[np.ndarray] = []
+        self._gk: list[np.ndarray] = []
+        self._base: list[np.ndarray] = []
+        self.n_slots = 0
+
+    def add(self, groups: RunGroups, run_index: int) -> None:
+        u_li, u_gk, totals = _slot_baselines(groups)
+        self._li.append(u_li)
+        self._run.append(np.full(u_li.size, run_index, dtype=np.int32))
+        self._gk.append(u_gk.astype(np.int64))
+        self._base.append(totals)
+        self.n_slots += u_li.size
+
+    def locus_indices(self) -> np.ndarray:
+        """The spill locus indices that carry slots, sorted."""
+        return np.unique(_concat(self._li, np.uint32))
+
+    def store(self, cur, spill_locus_ids: list[str]) -> None:
+        """Write one ``multimap_slot_base`` row per locus, in canonical slot order."""
+        li = _concat(self._li, np.uint32)
+        if li.size == 0:
+            return
+        run = _concat(self._run, np.int32)
+        gk = _concat(self._gk, np.int64)
+        base = _concat(self._base, np.float64)
+        order = np.lexsort((gk, run, li))
+        li, run, gk, base = li[order], run[order], gk[order], base[order]
+        del order
+        bounds = np.flatnonzero(np.concatenate(([True], li[1:] != li[:-1])))
+        ends = np.append(bounds[1:], li.size)
+        rows = (
+            (
+                spill_locus_ids[int(li[b])],
+                slot_base_blob(run[b:e], gk[b:e], base[b:e]),
+            )
+            for b, e in zip(bounds.tolist(), ends.tolist())
+        )
+        cur.executemany("INSERT INTO multimap_slot_base VALUES (?, ?)", rows)
+        for parts in (self._li, self._run, self._gk, self._base):
+            parts.clear()
 
 
 def build_multimap_index(db_path: str, processes: int = 1) -> int:
     """Collapse spilled alignments into multimap groups and seed weights.
 
-    Reads the per-run spill files written during collection, keeps only
-    reads that touch **≥2** distinct in-locus slots, collapses reads that
-    share an identical slot set into one multimap group (MMG) with a
-    member count, and writes the static linkage arrays
-    (``multimap_linkage.npz`` beside the database), the per-locus slot
-    baselines (``multimap_slot_base``) and the iteration-0
+    Reads the per-run groups files the collector left (or collapses a run's
+    raw spill itself, see :func:`index_run_spill`), keeps only reads that
+    touch **≥2** distinct in-locus slots collapsed into one multimap group
+    (MMG) per identical slot set with a member count, and writes the static
+    linkage arrays (``multimap_linkage.npz`` beside the database), the
+    per-locus slot baselines (``multimap_slot_base``) and the iteration-0
     ``group_weights`` seed (``weight = base`` → full counts, i.e. classic
     behaviour before any reassignment).  The spill directory is deleted on
     success.
@@ -358,10 +427,10 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
     db_path : str
         Path to ``price.db``.
     processes : int, optional
-        Maximum number of runs to index concurrently.  Each concurrent run
-        holds its own alignment columns in memory (~20 bytes per in-locus
-        multimapping alignment, plus a like-sized sort buffer), so this is
-        the knob that bounds peak RSS.
+        Maximum number of runs to collapse concurrently.  Each concurrent
+        raw run holds its own alignment columns in memory (~20 bytes per
+        in-locus multimapping alignment, plus a like-sized sort buffer), so
+        this is the knob that bounds peak RSS.
 
     Returns
     -------
@@ -369,9 +438,7 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         Number of multimap groups created.
     """
     root = spill_dir(db_path)
-    run_ids = sorted(
-        d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
-    ) if os.path.isdir(root) else []
+    run_ids = spilled_run_ids(root)
 
     if not run_ids:
         with database.connect(db_path, commit=True) as db:
@@ -388,7 +455,7 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         return 0
 
     spill_locus_ids = np.load(os.path.join(root, "loci.npy")).tolist()
-    tasks = [os.path.join(root, r) for r in run_ids]
+    tasks = [(root, r) for r in run_ids]
     n_proc = max(1, min(processes, len(tasks)))
 
     # Fork before opening the database: SQLite connections must not be carried
@@ -403,40 +470,44 @@ def build_multimap_index(db_path: str, processes: int = 1) -> int:
         run_index = run_index_from(cur)
 
         # Merge the per-run results into the global MMG id space and accumulate
-        # the per-slot baselines, one pickled {(run_id, group_key): base} dict
-        # per locus.
-        base_by_locus: dict = defaultdict(dict)
+        # the per-slot baselines.
+        baselines = _Baselines()
         memberships = _Memberships()
-        n_slots = 0
         try:
             results = (
-                pool.imap(_index_run, tasks) if pool
-                else (_index_run(t) for t in tasks)
+                pool.imap(_run_groups, tasks) if pool
+                else (_run_groups(t) for t in tasks)
             )
             for run_id, groups in zip(run_ids, results):
                 if groups.counts.size == 0:
                     continue
                 memberships.add(groups, run_index[run_id])
-                u_li, u_gk, totals = _slot_baselines(groups)
-                n_slots += u_li.size
-                _add_locus_baselines(
-                    base_by_locus, run_id, spill_locus_ids, u_li, u_gk, totals
-                )
+                baselines.add(groups, run_index[run_id])
         finally:
             if pool is not None:
                 pool.close()
                 pool.join()
 
         n_groups = memberships.n_groups
-        link = memberships.linkage(spill_locus_ids, sorted(base_by_locus))
+        n_slots = baselines.n_slots
+        locus_ids = sorted(
+            spill_locus_ids[int(i)] for i in baselines.locus_indices()
+        )
+        link = memberships.linkage(spill_locus_ids, locus_ids)
         del memberships
         # Written before the baselines below: an index whose file is missing
         # is reported as unbuilt (`has_multimap_index`), never as half built.
         _invalidate_linkage(db_path)
         link.save(linkage_path(db_path))
         del link
-        _store_baselines(cur, base_by_locus)
-        del base_by_locus
+        baselines.store(cur, spill_locus_ids)
+        del baselines
+        # iteration-0 weights == baseline == full counts (classic behaviour),
+        # as a dense buffer in canonical slot order; reads back the rows just
+        # inserted, so it must share this cursor's transaction.
+        cur.executemany(
+            "INSERT INTO group_weights VALUES (0, ?, ?)", _baseline_weight_rows(cur)
+        )
 
     discard_spill(db_path)
     logger.info("multimap index: %d groups over %d slots", n_groups, n_slots)

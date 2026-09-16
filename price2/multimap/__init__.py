@@ -54,7 +54,11 @@ The names below are the package's public API.
 """
 
 from price2.multimap.em import e_step
-from price2.multimap.index import build_multimap_index, has_multimap_index
+from price2.multimap.index import (
+    build_multimap_index,
+    has_multimap_index,
+    index_run_spill,
+)
 from price2.multimap.keys import alignment_group_key, group_key, qname_hash
 from price2.multimap.linkage import Linkage, LocusSlots, linkage_path, load_linkage
 from price2.multimap.prepared import (
@@ -71,6 +75,9 @@ from price2.multimap.spill import (
     flush_spill,
     init_spill,
     reset_run_spill,
+    run_spill_dir,
+    run_spill_present,
+    spill_bytes,
     spill_dir,
     write_spill,
 )
@@ -96,6 +103,7 @@ __all__ = [
     "flush_spill",
     "group_key",
     "has_multimap_index",
+    "index_run_spill",
     "init_spill",
     "linkage_path",
     "load_linkage",
@@ -107,9 +115,12 @@ __all__ = [
     "qname_hash",
     "reset_em_state",
     "reset_run_spill",
+    "run_spill_dir",
+    "run_spill_present",
     "save_locus_routing",
     "save_prepared_locus",
     "slot_locus_ids",
+    "spill_bytes",
     "spill_dir",
     "write_locus_em_output",
     "write_spill",

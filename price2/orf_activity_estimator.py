@@ -17,24 +17,25 @@ that worker shares.
 
 from __future__ import annotations
 
+import csv
 import logging
 import logging.handlers
 import multiprocessing as mp
 import os
+import resource
 import time
 import traceback
 from concurrent.futures import TimeoutError, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
-import pandas as pd
 from pebble import ProcessPool
 from pebble.common import CONSTS as _pebble_consts
 from pyfaidx import Fasta
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from price2 import database, export, multimap, run_state
+from price2 import database, export, mu_solver, multimap, run_state
 from price2.export import OutputText
 from price2.config import Config
 from price2.equivalence_groups import make_equivalence_groups
@@ -52,6 +53,47 @@ _MP_CONTEXT = mp.get_context("forkserver")
 #: workers (e.g. 80) the result-pipe mutex can be contended for longer, which
 #: makes workers exit with "Abnormal termination".  600 s gives ample headroom.
 _PEBBLE_CHANNEL_LOCK_TIMEOUT = 600
+
+#: Thread pools of the numerical libraries a worker may load.  Every worker
+#: is a process of its own and the pool already fills the cores, so each
+#: library gets one thread unless the environment says otherwise.
+_THREAD_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def limit_library_threads() -> None:
+    """Default the BLAS/OpenMP thread counts to one for this process.
+
+    Read by the libraries when they initialise, so call it before numpy is
+    imported to be sure it takes effect — ``price.py`` does at start-up, and
+    the worker processes inherit the result.
+    """
+    for name in _THREAD_VARIABLES:
+        os.environ.setdefault(name, "1")
+
+
+#: The columns of ``performance_measurements.tsv``, in order.  Every row is
+#: written against this list (a locus that lacks a value leaves the field
+#: empty), so the columns line up whichever path a locus took.
+PERF_COLUMNS = (
+    "loc_id", "chrom", "strand", "start", "end",
+    "db_time", "load_reads_time",
+    "build_rgrs_time", "unfiltered_rgr_count",
+    "well_fitting_reads_time",
+    "coverage_filter_time", "filtered_coverage_rgr_count",
+    "deconvolution_filter_time", "filtered_deconvolution_rgr_count",
+    "eg_time", "eg_count",
+    "route_reads_time", "read_count", "mstep_pruned_orf_count",
+    "optimization_time", "irls_outer_iterations", "filtered_deconvoluted_rgr_count",
+    "likelihood_ratio_time", "filtered_lrt_rgr_count", "orf_count",
+    "activity_time",
+    "gene_number", "transcripts_number", "exon_length",
+    "max_rss_mb", "overall_time",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -101,11 +143,13 @@ def init_worker(config: Config, log_queue) -> None:
         Queue drained by the parent's :class:`logging.handlers.QueueListener`.
     """
     global _CONTEXT
+    limit_library_threads()
     worker_logger = logging.getLogger("price2")
     if not worker_logger.handlers:
         worker_logger.addHandler(logging.handlers.QueueHandler(log_queue))
         worker_logger.setLevel(config.log_level)
         worker_logger.propagate = False
+    mu_solver.set_kernel(config.mu_kernel)
     layout = config.layout
     _CONTEXT = WorkerContext(
         config, layout, Fasta(config.fasta_path), _load_runs(layout.db_path)
@@ -238,10 +282,12 @@ class ORFActivityEstimator:
     Attributes
     ----------
     loci_ids : list of str
-        Every locus id stored in the database.
+        Every locus id stored in the database, in dispatch order
+        (``config.dispatch_order``): database order, or the loci with the
+        most stored read bytes first.
     locus_timeout : int
         Wall-clock budget for one locus, in seconds:
-        ``config.timeout`` per Ribo-seq run.
+        ``config.timeout`` per Ribo-seq run, capped at ``config.timeout_cap``.
     """
 
     def __init__(self, config: Config) -> None:
@@ -253,26 +299,54 @@ class ORFActivityEstimator:
         self._broker = None
         self._pool: ProcessPool | None = None
         self._log_queue = None
+        self._peak_rss: tuple[float, str] = (0.0, "")
 
         with database.connect(self.db_path) as db:
-            self.loci_ids = [
+            loci_ids = [
                 locus_id
                 for locus_id, in db.execute("SELECT locus_id FROM loci")
             ]
             n_runs = db.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+            read_bytes = dict(
+                db.execute(
+                    "SELECT locus_id, SUM(LENGTH(reads_blob)) FROM reads "
+                    "GROUP BY locus_id"
+                )
+            )
+        # A stable sort keeps database order among equals, so the fan-out is
+        # the same from run to run.
+        if config.dispatch_order == "largest":
+            loci_ids = sorted(
+                loci_ids, key=lambda locus_id: -read_bytes.get(locus_id, 0)
+            )
+        self.loci_ids = loci_ids
 
         # A locus is solved for every dataset at once — one activity column
         # per run — so its cost grows with how many there are.  The budget is
         # therefore per sample: an absolute one would abandon loci a wide run
         # could still have finished, while being needlessly generous to a
-        # narrow one.
+        # narrow one.  The cap keeps a wide panel from spending hours on one
+        # locus.
         self.locus_timeout = config.timeout * max(1, n_runs)
+        if config.timeout_cap:
+            self.locus_timeout = min(self.locus_timeout, config.timeout_cap)
         logger.info(
-            "per-locus timeout: %d s (%d s per sample, %d sample(s))",
+            "per-locus timeout: %d s (%d s per sample, %d sample(s), cap %d s)",
             self.locus_timeout,
             config.timeout,
             max(1, n_runs),
+            config.timeout_cap,
         )
+        memory_gb = _physical_memory_gb()
+        if memory_gb:
+            logger.info(
+                "%.0f GB of memory for %d worker(s): %.1f GB each; a worker's "
+                "peak RSS grows with the number of samples (max_rss_mb in "
+                "performance_measurements.tsv)",
+                memory_gb,
+                config.processes,
+                memory_gb / max(1, config.processes),
+            )
 
     @contextmanager
     def gpu_broker_pool(self):
@@ -517,9 +591,9 @@ class ORFActivityEstimator:
         layout = self.config.layout
         os.makedirs(layout.regions_activities_dir, exist_ok=True)
 
-        # Dispatched in database order, so the fan-out (and with it the
-        # performance log and the first locus to time out) is the same from
-        # run to run.
+        # Dispatched in a fixed order (``loci_ids``), so the fan-out (and
+        # with it the performance log and the first locus to time out) is
+        # the same from run to run.
         excluded: set[str] = set()
         if loci_subset is not None:
             excluded |= set(self.loci_ids) - loci_subset
@@ -568,6 +642,10 @@ class ORFActivityEstimator:
                 finally:
                     pbar.update(1)
         pbar.close()
+        if self._peak_rss[0]:
+            logger.info(
+                "peak worker RSS so far: %.0f MB (at locus %s)", *self._peak_rss
+            )
 
     def _record(
         self,
@@ -583,8 +661,12 @@ class ORFActivityEstimator:
         """
         layout = self.config.layout
         writer.write(result.outputs)
-        if result.perf is not None and self.config.export_performance_measurements:
-            _append_performance(layout.performance_path, result.perf)
+        if result.perf is not None:
+            rss = result.perf.get("max_rss_mb", 0.0)
+            if rss > self._peak_rss[0]:
+                self._peak_rss = (rss, result.locus_id)
+            if self.config.export_performance_measurements:
+                _append_performance(layout.performance_path, result.perf)
         progress.mark(result.locus_id)
 
 
@@ -636,6 +718,9 @@ def process_loc(job: LocusJob) -> LocusResult | None:
         return None
 
     _full_pass(loc, runs, config, perf, outputs)
+    # The worker's high-water mark, not this locus's alone; its maximum over
+    # the loci is what sizing ``processes`` by memory needs.
+    perf["max_rss_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     perf["overall_time"] = time.time() - t_start
     outputs.update(export.final_outputs(loc, config, runs))
     return LocusResult(job.locus_id, outputs, dict(perf))
@@ -758,7 +843,7 @@ def _prepare_locus(
     loc.update_transcript_rgrs()
     with perf.timed("eg_time"):
         loc.egs = make_equivalence_groups(loc, runs)
-    perf["eg_count"] = sum(len(egs) for egs in loc.egs.values())
+    perf["eg_count"] = loc.egs.n_rows
     return True
 
 
@@ -808,7 +893,11 @@ def _light_mstep(
         )
     if save_prepared:
         multimap.save_prepared_locus(db_path, job.locus_id, loc)
-        multimap.save_locus_routing(db_path, job.locus_id, loc)
+        # The design matrix of the routing as persisted (rebuilt here if the
+        # pruning above changed the routing), so no later pass builds it.
+        multimap.save_locus_routing(
+            db_path, job.locus_id, loc, loc.sparse_system(runs).X
+        )
     multimap.write_locus_em_output(
         db_path,
         job.locus_id,
@@ -848,11 +937,31 @@ def _full_pass(
     perf["exon_length"] = loc.exon_length
 
 
+def _physical_memory_gb() -> float:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3
+    except (ValueError, OSError, AttributeError):
+        return 0.0
+
+
+def _perf_field(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.3e}"
+    return "" if value is None else str(value)
+
+
 def _append_performance(path: str, perf: dict) -> None:
+    """Append one locus's row to ``performance_measurements.tsv``.
+
+    The row is written against :data:`PERF_COLUMNS`, so the columns are the
+    same for every locus; a key outside the list is a programming error.
+    """
+    unknown = sorted(set(perf) - set(PERF_COLUMNS))
+    if unknown:
+        raise KeyError(f"performance keys missing from PERF_COLUMNS: {unknown}")
     header = not os.path.exists(path)
-    with open(path, "a") as fh:
-        fh.write(
-            pd.DataFrame([perf]).to_csv(
-                header=header, index=False, float_format="{:.2e}".format, sep="\t"
-            )
-        )
+    with open(path, "a", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        if header:
+            writer.writerow(PERF_COLUMNS)
+        writer.writerow(_perf_field(perf.get(column)) for column in PERF_COLUMNS)

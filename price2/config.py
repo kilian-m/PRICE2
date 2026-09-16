@@ -125,8 +125,21 @@ class Config:
     processes: int = option(80, scope=RUNTIME)
     #: Per-locus wall-clock budget in seconds *per Ribo-seq run*: a locus is
     #: abandoned after ``timeout * len(runs)`` seconds, since one locus is
-    #: solved for all runs at once.
+    #: solved for all runs at once ...
     timeout: int = option(180, scope=RUNTIME)
+    #: ... but never given more than this many seconds in total (``0``: no
+    #: cap).  The per-run budget suits panels of a few runs; with a hundred
+    #: it would let one locus run for hours, and a locus that needs them is
+    #: one that will not finish anyway.  Abandoned loci are named in the log
+    #: and in ``failed_loci.txt``.
+    timeout_cap: int = option(3600, scope=RUNTIME)
+    #: The order the loci are handed to the workers.  ``"database"`` keeps
+    #: the order of ``price.db``, which interleaves heavy and light loci;
+    #: ``"largest"`` puts the loci with the most stored reads first, which
+    #: shortens a pass's tail but makes every worker stream its largest
+    #: matrices at the same time and, measured, doubles a pass instead
+    #: (memory bandwidth; ``docs/tuning.md``).
+    dispatch_order: str = option("database", scope=RUNTIME)
     #: Floor on the activities during optimisation, guarding ``log(0)`` in
     #: the likelihood.  Do not lower it.
     pseudo_min: float = 1e-14
@@ -241,6 +254,11 @@ class Config:
     #: inner loop (CPU and GPU).
     mu_inner_max_iter: int = 3000
     mu_inner_tol: float = 1e-5
+    #: The CPU update loop: ``"numba"`` runs each update as scipy's C mat-vecs
+    #: plus two compiled element-wise passes, ``"numpy"`` as the chain of
+    #: numpy calls it replaced.  Both compute the same iterates; the kernel
+    #: only removes the per-call overhead that dominates small solves.
+    mu_kernel: str = option("numba", scope=RUNTIME)
     #: Serve the GPU updates from broker processes holding one CUDA context
     #: each, shared by the worker pool over shared memory, so VRAM does not
     #: scale with ``processes``.  Requires ``inner_solver="mu"``; falls back
@@ -262,6 +280,18 @@ class Config:
     likelihood_ratio_filter: bool = True
     #: Significance level of that test.
     likelihood_ratio_alpha: float = 1e-10
+    #: The test's refits are per run (the objective is a sum over the runs):
+    #: a reduced model is re-solved only in the runs where clamping the
+    #: candidate lowers the log-likelihood by more than this many nats; the
+    #: refit could regain at most that much in every other run, so their fit
+    #: is kept.  ``0`` refits every run the candidate touches at all.
+    likelihood_ratio_run_tol: float = 1e-6
+    #: A reduced refit stops as soon as the candidate is not significant
+    #: (the drop verdict is final: the updates only raise the likelihood),
+    #: and otherwise once the log-likelihood gains less than this many nats
+    #: between two checks, ten updates apart.  ``0`` iterates every keep
+    #: verdict to the solver's own tolerance.
+    likelihood_ratio_ll_tol: float = 1e-3
 
     # ------------------------------------------------------------------ #
     # Run selection & logging                                              #
@@ -464,6 +494,8 @@ _CHOICES: dict[str, tuple[str, ...]] = {
     "distribution": ("poisson", "nb"),
     "inner_solver": ("mu", "lbfgs"),
     "mu_dtype": ("float32", "float64"),
+    "mu_kernel": ("numba", "numpy"),
+    "dispatch_order": ("largest", "database"),
 }
 
 #: Numeric options that must be greater than zero.
@@ -494,17 +526,21 @@ _POSITIVE: tuple[str, ...] = (
 
 #: Numeric options that must not be negative.
 _NON_NEGATIVE: tuple[str, ...] = (
+    "timeout_cap",
     "worker_max_tasks",
     "min_explained_reads_per_run",
     "ftol",
     "gtol",
     "lam",
     "mu_gpu_min_rows",
+    "likelihood_ratio_run_tol",
+    "likelihood_ratio_ll_tol",
 )
 
 #: Options that are counts: an integer, not merely a number.
 _INTEGER: tuple[str, ...] = (
     "processes",
+    "timeout_cap",
     "worker_max_tasks",
     "maxls",
     "irls_huber_max_outer",

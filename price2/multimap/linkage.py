@@ -90,6 +90,44 @@ class LocusSlots:
             tuple(k[0] for k in keys), tuple(k[1] for k in keys), base, weights
         )
 
+    @classmethod
+    def from_blob(
+        cls, blob: bytes, run_index: dict, weight_blob: bytes | None = None
+    ) -> LocusSlots:
+        """Decode a ``multimap_slot_base`` entry.
+
+        Two layouts exist: the ``{(run_id, group_key): base}`` map of
+        earlier releases (:meth:`from_base_map`) and the canonical-order
+        arrays ``(run index, group key, base)`` the index writes now
+        (:func:`slot_base_blob`).
+        """
+        stored = database.unpickle_blob(blob)
+        if isinstance(stored, dict):
+            return cls.from_base_map(stored, run_index, weight_blob)
+        run_idx, group_keys, base = stored
+        id_of = {i: run_id for run_id, i in run_index.items()}
+        if weight_blob is None:
+            weights = base
+        else:
+            weights = np.frombuffer(weight_blob, dtype=np.float64)
+            if weights.size != base.size:
+                raise ValueError(
+                    f"{weights.size} weights stored for {base.size} slots"
+                )
+        return cls(
+            tuple(id_of[i] for i in run_idx.tolist()),
+            tuple(group_keys.tolist()),
+            base,
+            weights,
+        )
+
+    def base_map(self) -> dict[tuple[str, int], float]:
+        """``{(run_id, group_key): base}``, the layout of the earlier blobs."""
+        return {
+            (run_id, gk): base
+            for run_id, gk, base in zip(self.run_ids, self.group_keys, self.base.tolist())
+        }
+
     def __len__(self) -> int:
         return len(self.run_ids)
 
@@ -242,6 +280,19 @@ class Linkage:
         return slice(
             int(self.locus_off[locus_index]), int(self.locus_off[locus_index + 1])
         )
+
+
+def slot_base_blob(
+    run_idx: np.ndarray, group_keys: np.ndarray, base: np.ndarray
+) -> bytes:
+    """Encode one locus's slot baselines, given in canonical order."""
+    return database.pickle_blob(
+        (
+            np.ascontiguousarray(run_idx, dtype=np.int32),
+            np.ascontiguousarray(group_keys, dtype=np.int64),
+            np.ascontiguousarray(base, dtype=np.float64),
+        )
+    )
 
 
 def run_index_from(cur: sql.Cursor) -> dict:

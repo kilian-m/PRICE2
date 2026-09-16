@@ -8,6 +8,8 @@ parsing, so nothing here converts again.
 from __future__ import annotations
 
 import logging
+import os
+import pickle
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable
 
@@ -104,6 +106,52 @@ class ReferenceAnnotation:
                 gtf_path,
                 orphans,
             )
+
+    #: Layout version of the cached annotation; bump when the pickled
+    #: objects change shape.
+    CACHE_FORMAT = "1"
+
+    @classmethod
+    def load_cached(cls, gtf_path: str, cache_dir: str) -> ReferenceAnnotation:
+        """The annotation of *gtf_path*, from a pickle under *cache_dir* when one fits.
+
+        Parsing a genome-wide GTF takes over a minute, every time the
+        pipeline starts; the cache brings that down to a few seconds.  It is
+        keyed by the GTF's path, size and modification time and by
+        :attr:`CACHE_FORMAT`, so a changed file or a changed layout is
+        parsed afresh and the cache rewritten.  A cache that cannot be
+        written or read is ignored.
+        """
+        stat = os.stat(gtf_path)
+        stamp = {
+            "path": os.path.abspath(gtf_path),
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "format": cls.CACHE_FORMAT,
+        }
+        path = os.path.join(cache_dir, "annotation_cache.pkl")
+        try:
+            with open(path, "rb") as fh:
+                cached_stamp, annotation = pickle.load(fh)
+            if cached_stamp == stamp and isinstance(annotation, cls):
+                logger.info(
+                    "Loaded %d transcripts from the cached annotation %s",
+                    len(annotation.transcripts),
+                    path,
+                )
+                return annotation
+        except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError):
+            pass
+        annotation = cls(gtf_path)
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "wb") as fh:
+                pickle.dump((stamp, annotation), fh, protocol=5)
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("could not cache the annotation at %s: %s", path, exc)
+        return annotation
 
     def _coding_transcripts_at(
         self, chrom: str, strand: str, start: int, end: int

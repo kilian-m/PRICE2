@@ -145,12 +145,16 @@ class DataCollector:
         run's BAM against the loci.
 
         Parallelism is over *locus chunks*, not over runs: there are only
-        as many runs as BAM files (typically < 10) but tens of thousands of
-        loci, and the per-alignment work is the dominant cost.  Runs are
-        processed one at a time so a run's rows still land in the database
-        as a single transaction — ``processed_run_ids`` therefore keeps its
-        all-or-nothing resume semantics — while all of
-        ``config.processes`` work on that run's loci concurrently.
+        as many runs as BAM files but tens of thousands of loci, and the
+        per-alignment work is the dominant cost.  One pool works through
+        the chunks of every pending run in turn, so the tail of one run
+        overlaps the start of the next instead of idling the pool.  A run's
+        rows still land in the database as a single transaction — after the
+        run's last chunk, and after every worker has flushed the run's
+        multimapping spill — so ``processed_run_ids`` keeps its
+        all-or-nothing resume semantics, and the run's spill is collapsed
+        into its groups file in the background right away
+        (:func:`price2.multimap.index_run_spill`).
 
         The parent is the only database writer; workers return their blobs
         and spill multimapping alignments straight to disk (see
@@ -185,21 +189,23 @@ class DataCollector:
         n_proc = max(1, self.config.processes)
         bounds = _locus_chunks(len(loci), n_proc)
         end_to_end = self.config.align_ends_type == "endtoend"
-        for run in pending:
-            tasks = [
+        chunk_tasks = {
+            run.id: [
                 (
                     run.id,
                     self.bam_dir,
                     lo,
                     hi,
                     chunk_idx,
-                    os.path.join(spill_root, run.id) if record_multimap else "",
+                    multimap.run_spill_dir(spill_root, run.id) if record_multimap else "",
                     end_to_end,
                     drop_multimap,
                 )
                 for chunk_idx, (lo, hi) in enumerate(bounds)
             ]
-            self._map_run_reads(run.id, tasks, n_proc, loci)
+            for run in pending
+        }
+        self._map_reads([run.id for run in pending], chunk_tasks, n_proc, loci, spill_root)
 
         with database.connect(self.db_path, commit=True) as db:
             database.create_read_indexes(db.cursor())
@@ -239,8 +245,8 @@ class DataCollector:
 
         The derived EM tables are rebuilt from the spill files (see
         :func:`price2.multimap.build_multimap_index`).  Spills of runs
-        collected by an earlier, interrupted pass are kept; the pending runs
-        start clean.
+        collected by an earlier, interrupted pass are kept, raw or already
+        collapsed into their groups file; the pending runs start clean.
 
         Raises
         ------
@@ -255,11 +261,11 @@ class DataCollector:
             # Create it even if the run turns out to have no multimapping
             # alignments, so a later resume can tell "collected, nothing to
             # spill" apart from "never collected".
-            os.makedirs(os.path.join(spill_root, run.id), exist_ok=True)
+            os.makedirs(multimap.run_spill_dir(spill_root, run.id), exist_ok=True)
         missing = [
             run_id
             for run_id in processed_run_ids
-            if not os.path.isdir(os.path.join(spill_root, run_id))
+            if not multimap.run_spill_present(spill_root, run_id)
         ]
         if missing:
             raise RuntimeError(
@@ -269,30 +275,45 @@ class DataCollector:
             )
         return spill_root
 
-    def _map_run_reads(
-        self, run_id: str, tasks: list, n_proc: int, loci: list[Locus]
+    def _map_reads(
+        self,
+        run_ids: list[str],
+        chunk_tasks: dict[str, list],
+        n_proc: int,
+        loci: list[Locus],
+        spill_root: str,
     ) -> None:
-        """Map one run's BAM against every locus chunk and store the result.
+        """Map every pending run's BAM against the locus chunks and store the rows.
 
         Parameters
         ----------
-        run_id : str
-            Identifier of the Ribo-seq run being mapped.
-        tasks : list of tuple
-            One :func:`collect_mappings_chunk` argument tuple per locus chunk.
+        run_ids : list[str]
+            The pending runs, in the order their chunks are dispatched.
+        chunk_tasks : dict[str, list]
+            Per run, one :func:`collect_mappings_chunk` argument tuple per
+            locus chunk.
         n_proc : int
             Number of worker processes.
         loci : list[Locus]
             The loci the chunks index into.
+        spill_root : str
+            The multimapping spill directory, or ``""`` when no spill is
+            recorded.
         """
         # Fork before opening the database: SQLite connections must not be
         # carried across fork(), and the workers have no use for one.
         # ``fork`` so that the workers inherit the loci through the
         # initializer's arguments without pickling them; the deconvolution
         # pool uses ``forkserver`` instead.
+        # The collapse pool first: it is a ``forkserver`` pool, and starting
+        # it from a process that has already forked the mapping workers would
+        # leave those workers holding its handles.
+        indexer = _RunIndexer(spill_root, self.config.processes) if spill_root else None
+        ctx = mp.get_context("fork")
         try:
-            pool = mp.get_context("fork").Pool(
-                n_proc, initializer=_init_mapping_worker, initargs=(loci,)
+            barrier = ctx.Barrier(n_proc)
+            pool = ctx.Pool(
+                n_proc, initializer=_init_mapping_worker, initargs=(loci, barrier)
             )
         except AssertionError:
             # A daemonic process may not spawn children (Process.start
@@ -301,11 +322,25 @@ class DataCollector:
             # consuming results would otherwise re-run chunks already stored.
             pool = None
 
-        with database.connect(self.db_path, timeout=600, commit=True) as db:
+        # Each run's chunks, then one flush task per worker: the flush tasks
+        # meet at the barrier, so every worker takes exactly one and the
+        # run's spill is complete once all of them have returned.
+        n_flush = n_proc if pool is not None else 1
+        tasks = [
+            task
+            for run_id in run_ids
+            for task in chunk_tasks[run_id] + [("flush", run_id)] * n_flush
+        ]
+        remaining = {
+            run_id: len(chunk_tasks[run_id]) + n_flush for run_id in run_ids
+        }
+        buffered: dict[str, tuple[list, list]] = {run_id: ([], []) for run_id in run_ids}
+
+        with database.connect(self.db_path, timeout=600) as db:
             cur = db.cursor()
 
-            def store(result: tuple) -> None:
-                reads_rows, trc_rows = result
+            def complete(run_id: str) -> None:
+                reads_rows, trc_rows = buffered.pop(run_id)
                 cur.executemany(
                     "INSERT INTO reads (locus_id, run_id, reads_blob) "
                     "VALUES (?, ?, ?)",
@@ -317,32 +352,51 @@ class DataCollector:
                     "VALUES (?, ?, ?)",
                     trc_rows,
                 )
+                db.commit()
+                logger.info(
+                    "Mapped run %s (%d locus chunks).", run_id, len(chunk_tasks[run_id])
+                )
+                if indexer is not None:
+                    indexer.submit(run_id)
 
-            if pool is None:
-                _init_mapping_worker(loci)
-                for task in tasks:
-                    store(collect_mappings_chunk(task))
-                # This process buffered the spill itself, so flush it here.
-                multimap.flush_spill()
-            else:
-                # close()+join(), NOT terminate(): the workers hold this run's
-                # buffered multimapping alignments and only write them from a
-                # multiprocessing exit finalizer, which a terminated (SIGTERMed)
-                # worker never reaches.  ``with pool:`` calls terminate() and
-                # would silently drop the spill.  join() also guarantees every
-                # worker has finished writing before the index is built.
-                try:
-                    for result in pool.imap_unordered(
-                        collect_mappings_chunk, tasks, chunksize=1
-                    ):
-                        store(result)
-                    pool.close()
-                except BaseException:
-                    pool.terminate()
-                    raise
-                finally:
-                    pool.join()
-        logger.info("Mapped run %s (%d locus chunks).", run_id, len(tasks))
+            def consume(result: tuple) -> None:
+                run_id = result[0]
+                if len(result) == 3:
+                    reads_rows, trc_rows = buffered[run_id]
+                    reads_rows.extend(result[1])
+                    trc_rows.extend(result[2])
+                remaining[run_id] -= 1
+                if remaining[run_id] == 0:
+                    complete(run_id)
+                if indexer is not None:
+                    indexer.poll()
+
+            try:
+                if pool is None:
+                    _init_mapping_worker(loci, None)
+                    for task in tasks:
+                        consume(_mapping_task(task))
+                else:
+                    # close()+join(), NOT terminate(): the workers hold their
+                    # buffered multimapping alignments and only write them
+                    # from the flush tasks and a multiprocessing exit
+                    # finalizer, which a terminated (SIGTERMed) worker never
+                    # reaches.  ``with pool:`` calls terminate() and would
+                    # silently drop the spill.
+                    try:
+                        for result in pool.imap_unordered(
+                            _mapping_task, tasks, chunksize=1
+                        ):
+                            consume(result)
+                        pool.close()
+                    except BaseException:
+                        pool.terminate()
+                        raise
+                    finally:
+                        pool.join()
+            finally:
+                if indexer is not None:
+                    indexer.finish()
 
     def get_chromosome_order(self) -> None:
         """Set ``self.chr_order`` from the first BAM file found in ``bam_dir``.
@@ -459,12 +513,111 @@ def _locus_chunks(n_loci: int, n_proc: int) -> list[tuple[int, int]]:
 #: Loci to map against, indexed by the chunk bounds of the tasks.  Set in
 #: every mapping worker by :func:`_init_mapping_worker`.
 _WORKER_LOCI: list[Locus] = []
+#: The barrier the flush tasks of a run meet at (``None`` in-process).
+_WORKER_BARRIER = None
+#: How long a flush task waits for the other workers before giving up.
+_FLUSH_BARRIER_TIMEOUT = 6 * 3600
 
 
-def _init_mapping_worker(loci: list[Locus]) -> None:
-    """Give a mapping worker its loci (the pool's ``initializer``)."""
-    global _WORKER_LOCI
+def _init_mapping_worker(loci: list[Locus], barrier) -> None:
+    """Give a mapping worker its loci and the flush barrier (the pool's ``initializer``)."""
+    global _WORKER_LOCI, _WORKER_BARRIER
     _WORKER_LOCI = loci
+    _WORKER_BARRIER = barrier
+
+
+def _mapping_task(data: tuple) -> tuple:
+    """One task of the mapping pool: a locus chunk, or a run's flush.
+
+    A flush task ``("flush", run_id)`` writes this worker's buffered
+    multimapping alignments out and returns ``(run_id,)``.  The pool holds
+    as many flush tasks per run as workers, and they meet at the barrier
+    before returning, so no worker can take two and every worker takes one:
+    when the last of them has returned, the run's spill is complete on disk.
+    """
+    if data[0] == "flush":
+        run_id = data[1]
+        if _WORKER_BARRIER is not None:
+            _WORKER_BARRIER.wait(timeout=_FLUSH_BARRIER_TIMEOUT)
+        multimap.flush_spill()
+        return (run_id,)
+    return collect_mappings_chunk(data)
+
+
+class _RunIndexer:
+    """Collapse the spill of each mapped run in the background.
+
+    Runs :func:`price2.multimap.index_run_spill` in a ``forkserver`` pool
+    beside the mapping pool, at most a few runs at a time and never more
+    raw spill than a quarter of the machine's memory at once (the collapse
+    holds a run's columns plus sort buffers, a few times the spill's size);
+    a run that alone exceeds that is collapsed on its own.
+    """
+
+    #: Memory the collapse of a run needs, as a multiple of its spill size.
+    MEMORY_FACTOR = 4
+
+    def __init__(self, spill_root: str, processes: int) -> None:
+        self.root = spill_root
+        n_proc = max(1, min(4, processes // 8))
+        # A driver that starts the pipeline without a ``__main__`` guard
+        # cannot start a ``forkserver`` pool (see ``docs/deconvolution.md``
+        # §6); the runs are then collapsed one after another by the index
+        # stage, once the mapping is done.
+        try:
+            self._pool = mp.get_context("forkserver").Pool(n_proc)
+        except RuntimeError:
+            logger.warning(
+                "collapsing the spills in the background is not possible from "
+                "an unguarded driver; the index stage will collapse them"
+            )
+            self._pool = None
+        self._queue: list[str] = []
+        self._running: dict[str, tuple[object, int]] = {}
+        try:
+            memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (ValueError, OSError, AttributeError):
+            memory = 0
+        self._budget = memory // 4
+
+    def submit(self, run_id: str) -> None:
+        if self._pool is None:
+            return
+        self._queue.append(run_id)
+        self._start_ready()
+
+    def poll(self) -> None:
+        """Collect finished runs (raising their errors) and start waiting ones."""
+        for run_id, (result, _) in list(self._running.items()):
+            if result.ready():
+                n_groups = result.get()
+                del self._running[run_id]
+                logger.info("Collapsed the spill of run %s: %d groups.", run_id, n_groups)
+        self._start_ready()
+
+    def _start_ready(self) -> None:
+        in_flight = sum(cost for _, cost in self._running.values())
+        while self._queue:
+            cost = self.MEMORY_FACTOR * multimap.spill_bytes(self.root, self._queue[0])
+            if self._running and self._budget and in_flight + cost > self._budget:
+                break
+            run_id = self._queue.pop(0)
+            result = self._pool.apply_async(multimap.index_run_spill, (self.root, run_id))
+            self._running[run_id] = (result, cost)
+            in_flight += cost
+
+    def finish(self) -> None:
+        """Wait for every submitted run, then release the pool."""
+        if self._pool is None:
+            return
+        try:
+            while self._queue or self._running:
+                for run_id, (result, _) in list(self._running.items()):
+                    result.wait()
+                self.poll()
+        finally:
+            self._pool.close()
+            self._pool.join()
 
 #: Layout of the collapsed-reads blob.  ``count`` is how many identical
 #: mappings collapse into one key; on deep, non-deduplicated libraries a
@@ -693,8 +846,8 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     Returns
     -------
     tuple
-        ``(reads_rows, transcript_count_rows)`` — blob rows for the parent
-        to insert.  Multimapping alignments are spilled to disk, not
+        ``(run_id, reads_rows, transcript_count_rows)`` — blob rows for the
+        parent to insert.  Multimapping alignments are spilled to disk, not
         returned.
     """
     (
@@ -742,7 +895,7 @@ def collect_mappings_chunk(data: tuple) -> tuple:
     if record_multimap:
         multimap.write_spill(run_spill_dir, mm_qnames, mm_loci, mm_keys)
 
-    return reads_rows, transcript_count_rows
+    return run_id, reads_rows, transcript_count_rows
 
 
 def _reads_frame(mappings_dict: dict) -> pd.DataFrame:

@@ -19,17 +19,24 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+from numba import njit
 from scipy.sparse import csr_matrix
 
 from price2 import database, multimap
-from price2.cleavage_model import OVERLAP_LIKELIHOOD_RATIO
+from price2.cleavage_model import (
+    OVERLAP_LIKELIHOOD_RATIO,
+    UNBOUNDED,
+    read_in_cds_likelihood,
+    read_in_noise_likelihood,
+)
 from price2.coverage_position import CoveragePosition
-from price2.equivalence_groups import CELL_CODES, NO_FRAME
+from price2.equivalence_groups import CELL_CODES, NO_FRAME, EquivalenceGroups
 from price2.genomic_region import GenomicRegion
 from price2.ribo_seq_alignment import RiboSeqAlignment
 from price2.ribo_seq_run import RiboSeqRun
 
 if TYPE_CHECKING:
+    from price2.genomic_features import Transcript
     from price2.locus import Locus
 
 # The ``frame_code * 3 + coverage_position`` part of a packed cell (see
@@ -76,7 +83,9 @@ class ReadRouting:
         cell, in the order of the groups per run.
     row_run, row_rl, row_oua, row_len, row_nnz : numpy.ndarray
         Per row: run index, read length, untemplated-addition flag, group
-        length and cell count.
+        length and cell count.  (``row_run`` is ``int32``; routings pickled
+        before 2026-09 hold it as ``uint8``, which is why the runs of a
+        design matrix cannot exceed 255 there.)
     row_cells : numpy.ndarray
         The rows' cells, flattened (``row_nnz`` cells per row).
     n_reads : dict[str, int]
@@ -124,7 +133,7 @@ class ReadRouting:
         cls,
         loc: Locus,
         runs: list[RiboSeqRun],
-        egs: dict,
+        egs: EquivalenceGroups,
         mm_data: dict | None,
     ) -> ReadRouting:
         """Route every loaded read of *loc* to its equivalence group.
@@ -135,35 +144,31 @@ class ReadRouting:
             Locus with its reads loaded (``rsas_dict``) and its RGRs final.
         runs : list[RiboSeqRun]
             Ribo-seq runs, in design-matrix order.
-        egs : dict
-            ``{run: {(cells, read_length, oua): length}}`` from
+        egs : EquivalenceGroups
+            The groups of every run, from
             :func:`~price2.equivalence_groups.make_equivalence_groups`.
         mm_data : dict or None
             ``{run_id: {group_key: (base, weight)}}`` naming this locus's
             multimapping slots, or ``None`` outside the EM.
         """
-        row_run: list = []
-        row_rl: list = []
-        row_oua: list = []
-        row_len: list = []
-        row_nnz: list = []
-        row_cells: list = []
-        row_of_key: dict = {}
-        for run_index, run in enumerate(runs):
-            rows: dict = {}
-            for key, length in egs[run].items():
-                cells, read_length, oua = key
-                if not cells:
-                    continue
-                rows[key] = len(row_run)
-                row_run.append(run_index)
-                row_rl.append(read_length)
-                row_oua.append(int(oua))
-                row_len.append(length)
-                row_nnz.append(len(cells))
-                row_cells.extend(cells)
-            row_of_key[run.id] = rows
+        # The rows: every run's groups, in order, with the keys' cells (sorted
+        # within a key already).
+        key_nnz = egs.key_nnz
+        ids = np.concatenate([egs.run_key[run.id] for run in runs])
+        row_run = np.repeat(
+            np.arange(len(runs), dtype=np.int32),
+            [egs.run_key[run.id].size for run in runs],
+        )
+        row_rl = egs.key_rl[ids]
+        row_oua = egs.key_oua[ids]
+        row_len = np.concatenate([egs.run_length[run.id] for run in runs])
+        row_nnz = key_nnz[ids].astype(np.int32)
+        row_cells = egs.key_cells[
+            np.repeat(egs.key_ptr[ids], row_nnz) + _within(row_nnz)
+        ]
 
+        compat = loc.read_compatibility(runs)
+        cell_map = compat.cell_map(loc.rgrs)
         n_reads: dict = {}
         counts0: dict = {}
         read_rl: dict = {}
@@ -174,27 +179,29 @@ class ReadRouting:
         mm_idx: dict = {}
         mm_gk: dict = {}
         mm_base: dict = {}
-        for run in runs:
+        for run_index, run in enumerate(runs):
             run_id = run.id
             rsas = loc.rsas_dict[run_id]
-            run_rows = row_of_key[run_id]
             run_mm = mm_data.get(run_id) if mm_data else None
-            rows_arr = np.full(len(rsas), -2, dtype=np.int32)
-            nnz_arr = np.zeros(len(rsas), dtype=np.int32)
-            cells_list: list = []
+            nnz_arr, cells_arr = compat.cells_for_run(run, cell_map)
+            rl_arr = compat.read_length(run_id)
+            oua_arr = compat.read_oua[run_id]
+            rows = row_run == run_index
+            rows_arr = match_rows(
+                row_rl[rows], row_oua[rows], row_nnz[rows],
+                row_cells[np.repeat(rows, row_nnz)],
+                rl_arr, oua_arr, nnz_arr, cells_arr,
+            )
+            rows_arr[rows_arr >= 0] = np.flatnonzero(rows)[rows_arr[rows_arr >= 0]]
             mi: list = []
             mg: list = []
             mb: list = []
-            for i, rsa in enumerate(rsas):
-                cells = rgr_compatibility(loc, rsa, run)
-                if cells:
-                    nnz_arr[i] = len(cells)
-                    cells_list.extend(cells)
-                    rows_arr[i] = run_rows.get(
-                        (cells, len(rsa), rsa.untemplated_addition), -1
-                    )
-                if run_mm is not None and not rsa.unique:
-                    gk = multimap.alignment_group_key(rsa)
+            if run_mm is not None:
+                unique = np.fromiter(
+                    (rsa.unique for rsa in rsas), dtype=bool, count=len(rsas)
+                )
+                for i in np.flatnonzero(~unique).tolist():
+                    gk = multimap.alignment_group_key(rsas[i])
                     slot = run_mm.get(gk)
                     if slot is not None:
                         mi.append(i)
@@ -204,16 +211,10 @@ class ReadRouting:
             counts0[run_id] = np.fromiter(
                 (rsa.read_count for rsa in rsas), dtype=np.float64, count=len(rsas)
             )
-            read_rl[run_id] = np.fromiter(
-                (len(rsa) for rsa in rsas), dtype=np.int32, count=len(rsas)
-            )
-            read_oua[run_id] = np.fromiter(
-                (rsa.untemplated_addition for rsa in rsas),
-                dtype=np.uint8,
-                count=len(rsas),
-            )
+            read_rl[run_id] = rl_arr
+            read_oua[run_id] = oua_arr
             read_nnz[run_id] = nnz_arr
-            read_cells[run_id] = np.array(cells_list, dtype=np.int64)
+            read_cells[run_id] = cells_arr
             eg_row[run_id] = rows_arr
             mm_idx[run_id] = np.array(mi, dtype=np.int32)
             mm_gk[run_id] = np.array(mg, dtype=np.int64)
@@ -223,12 +224,12 @@ class ReadRouting:
         return cls(
             run_ids=tuple(run.id for run in runs),
             n_rows=len(row_run),
-            row_run=np.array(row_run, dtype=np.uint8),
-            row_rl=np.array(row_rl, dtype=np.int32),
-            row_oua=np.array(row_oua, dtype=np.uint8),
-            row_len=np.array(row_len, dtype=np.int64),
-            row_nnz=np.array(row_nnz, dtype=np.int32),
-            row_cells=np.array(row_cells, dtype=np.int64),
+            row_run=row_run,
+            row_rl=row_rl,
+            row_oua=row_oua,
+            row_len=row_len.astype(np.int64),
+            row_nnz=row_nnz,
+            row_cells=row_cells,
             n_reads=n_reads,
             counts0=counts0,
             read_rl=read_rl,
@@ -321,28 +322,35 @@ class ReadRouting:
     def design_matrix(
         self, cm_lut: np.ndarray, coverage_params: np.ndarray, num_runs: int
     ) -> csr_matrix:
-        """The design matrix ``X`` (see :func:`design_matrix`)."""
+        """The design matrix ``X`` (see :func:`design_matrix`).
+
+        Built straight in CSR layout — the cells are already grouped by row
+        — with the per-cell factors in the narrowest dtypes that hold them;
+        a row touching the same RGR at several coverage positions sums
+        those cells (``sum_duplicates``).
+        """
         nnz_per_row = self.row_nnz
-        run_c = np.repeat(self.row_run, nnz_per_row)
-        rl_c = np.repeat(self.row_rl, nnz_per_row)
-        oua_c = np.repeat(self.row_oua, nnz_per_row)
-        len_c = np.repeat(self.row_len, nnz_per_row)
+        run_c = np.repeat(self.row_run.astype(np.int32), nnz_per_row)
         rgr_c, code = np.divmod(self.row_cells, CELL_CODES)
-        frame_c, cov_c = np.divmod(code, 3)
-        data = (
-            len_c
-            * cm_lut[run_c, rl_c, frame_c, oua_c]
-            * coverage_params[run_c, cov_c]
+        frame_c, cov_c = np.divmod(code.astype(np.int8), 3)
+        del code
+        data = np.repeat(self.row_len.astype(np.float64), nnz_per_row)
+        data *= cm_lut[
+            run_c, np.repeat(self.row_rl, nnz_per_row), frame_c,
+            np.repeat(self.row_oua, nnz_per_row),
+        ]
+        del frame_c
+        data *= coverage_params[run_c, cov_c]
+        del cov_c
+        indices = (rgr_c * num_runs + run_c).astype(np.int32)
+        del rgr_c, run_c
+        indptr = np.zeros(self.n_rows + 1, dtype=np.int64)
+        np.cumsum(nnz_per_row, out=indptr[1:])
+        X = csr_matrix(
+            (data, indices, indptr), shape=(self.n_rows, self.num_rgrs * num_runs)
         )
-        rows_idx = np.repeat(np.arange(self.n_rows, dtype=np.int64), nnz_per_row)
-        cols_idx = rgr_c * num_runs + run_c
-        # COO construction so that a row touching the same RGR at several
-        # coverage positions sums those cells.
-        return csr_matrix(
-            (data, (rows_idx, cols_idx)),
-            shape=(self.n_rows, self.num_rgrs * num_runs),
-            dtype=np.float64,
-        )
+        X.sum_duplicates()
+        return X
 
     def multimap_lambdas(
         self,
@@ -410,47 +418,35 @@ class ReadRouting:
             For every old row its new row, or ``-1`` if it disappeared, so
             the caller can carry a response over (summing merged rows).
         """
-        # Old cell -> new cell (``-1`` for a removed RGR), one lookup per cell.
-        cell_map = np.array(
-            [
-                -1 if new < 0 else new * CELL_CODES + code
-                for new in old_to_new
-                for code in range(CELL_CODES)
-            ],
-            dtype=np.int64,
-        )
+        cell_map = _cell_map(old_to_new)
 
-        # Rows: reduce, then merge those with the same key.  The merged row's
-        # cells are taken in frozenset order, as the group keys are.
+        # Rows: reduce, then merge those with the same key.  A merged row
+        # takes the place of its first old row, so the new rows are in the
+        # order of the old ones.
+        reduced = cell_map[self.row_cells]
+        keep = reduced >= 0
+        row_of_cell = np.repeat(np.arange(self.n_rows), self.row_nnz)
+        nnz = np.bincount(row_of_cell[keep], minlength=self.n_rows).astype(np.int32)
+        cells = _sorted_within(reduced[keep], nnz)
+        alive = np.flatnonzero(nnz > 0)
+        group, first = group_equal_rows(
+            self.row_run[alive], self.row_rl[alive], self.row_oua[alive],
+            nnz[alive], cells[np.repeat(nnz > 0, nnz)],
+        )
         row_map = np.full(self.n_rows, -1, dtype=np.int64)
-        new_row_of_key: dict = {}
-        row_run: list = []
-        row_rl: list = []
-        row_oua: list = []
-        row_len: list = []
-        row_nnz: list = []
-        row_cells: list = []
-        old_cells = cell_map[self.row_cells]
-        offsets = np.concatenate(([0], np.cumsum(self.row_nnz)))
-        for old in range(self.n_rows):
-            reduced = old_cells[offsets[old]:offsets[old + 1]]
-            cells = frozenset(reduced[reduced >= 0].tolist())
-            if not cells:
-                continue
-            run_index = int(self.row_run[old])
-            key = (cells, int(self.row_rl[old]), bool(self.row_oua[old]))
-            new = new_row_of_key.get((run_index, key))
-            if new is None:
-                new = len(row_run)
-                new_row_of_key[(run_index, key)] = new
-                row_run.append(run_index)
-                row_rl.append(key[1])
-                row_oua.append(int(key[2]))
-                row_len.append(0)
-                row_nnz.append(len(cells))
-                row_cells.extend(cells)
-            row_len[new] += int(self.row_len[old])
-            row_map[old] = new
+        row_map[alive] = group
+        representative = alive[first]
+        rep_offsets = np.cumsum(nnz) - nnz
+        rep_nnz = nnz[representative]
+        row_run = self.row_run[representative]
+        row_rl = self.row_rl[representative]
+        row_oua = self.row_oua[representative]
+        row_len = np.bincount(group, weights=self.row_len[alive], minlength=first.size)
+        row_nnz = rep_nnz
+        row_cells = cells[
+            np.repeat(rep_offsets[representative], rep_nnz)
+            + _within(rep_nnz)
+        ]
 
         # Reads: reduce their cells; their rows follow the row map.
         read_nnz: dict = {}
@@ -477,13 +473,13 @@ class ReadRouting:
         keep_rgrs = np.array(old_to_new) >= 0
         routing = ReadRouting(
             run_ids=self.run_ids,
-            n_rows=len(row_run),
-            row_run=np.array(row_run, dtype=np.uint8),
-            row_rl=np.array(row_rl, dtype=np.int32),
-            row_oua=np.array(row_oua, dtype=np.uint8),
-            row_len=np.array(row_len, dtype=np.int64),
-            row_nnz=np.array(row_nnz, dtype=np.int32),
-            row_cells=np.array(row_cells, dtype=np.int64),
+            n_rows=row_run.shape[0],
+            row_run=np.ascontiguousarray(row_run, dtype=np.int32),
+            row_rl=np.ascontiguousarray(row_rl, dtype=np.int32),
+            row_oua=np.ascontiguousarray(row_oua, dtype=np.uint8),
+            row_len=row_len.astype(np.int64),
+            row_nnz=np.ascontiguousarray(row_nnz, dtype=np.int32),
+            row_cells=np.ascontiguousarray(row_cells, dtype=np.int64),
             n_reads=dict(self.n_reads),
             counts0=self.counts0,
             read_rl=self.read_rl,
@@ -507,24 +503,20 @@ class ReadRouting:
         (``-1``) may match one of the merged groups; this re-routes such
         reads, as rebuilding the routing from the reads would.
         """
-        row_of_key: dict = {run_id: {} for run_id in self.run_ids}
-        offsets = np.concatenate(([0], np.cumsum(self.row_nnz)))
-        for row in range(self.n_rows):
-            cells = frozenset(self.row_cells[offsets[row]:offsets[row + 1]].tolist())
-            key = (cells, int(self.row_rl[row]), bool(self.row_oua[row]))
-            row_of_key[self.run_ids[self.row_run[row]]][key] = row
-        for run_id in self.run_ids:
-            rows = np.full(self.n_reads[run_id], -2, dtype=np.int32)
-            run_rows = row_of_key[run_id]
+        self.row_cells = _sorted_within(self.row_cells, self.row_nnz)
+        for run_index, run_id in enumerate(self.run_ids):
+            rows = self.row_run == run_index
             nnz = self.read_nnz[run_id]
-            offsets = np.concatenate(([0], np.cumsum(nnz)))
-            cells_all = self.read_cells[run_id]
-            rl = self.read_rl[run_id]
-            oua = self.read_oua[run_id]
-            for i in np.flatnonzero(nnz):
-                cells = frozenset(cells_all[offsets[i]:offsets[i + 1]].tolist())
-                rows[i] = run_rows.get((cells, int(rl[i]), bool(oua[i])), -1)
-            self.eg_row[run_id] = rows
+            cells = _sorted_within(self.read_cells[run_id], nnz)
+            matched = match_rows(
+                self.row_rl[rows], self.row_oua[rows], self.row_nnz[rows],
+                self.row_cells[np.repeat(rows, self.row_nnz)],
+                self.read_rl[run_id], self.read_oua[run_id], nnz, cells,
+            )
+            hit = matched >= 0
+            matched[hit] = np.flatnonzero(rows)[matched[hit]]
+            self.read_cells[run_id] = cells
+            self.eg_row[run_id] = matched
 
 
 def load_reads(
@@ -655,6 +647,9 @@ def rgr_compatibility(
 ) -> frozenset[int] | None:
     """Determine which RGRs a read alignment is compatible with.
 
+    The reference, one read at a time; the pipeline computes the same cells
+    for every read of every run with :class:`ReadCompatibility`.
+
     For each RGR of a transcript the read maps to, compute the reading frame
     and the coverage positions the read can cover.  A read lying entirely
     inside the RGR covers its middle.  A read overlapping one of the RGR's
@@ -753,51 +748,669 @@ def rgr_compatibility(
     return frozenset(cells)
 
 
+# --------------------------------------------------------------------------- #
+# Read compatibility, for all reads and runs at once
+# --------------------------------------------------------------------------- #
+#
+# :func:`rgr_compatibility` above is the reference, one read at a time.  The
+# pipeline computes the same cells for every read of every run with the
+# arrays below: the geometry of a read against the RGRs depends only on its
+# footprint, and the runs enter only through their cleavage models, as a
+# look-up per (read length, frame, untemplated addition, region bounds).  So
+# the distinct footprints of a locus are mapped to the transcripts once, every
+# footprint's candidate cells are listed once with the key of the likelihood
+# ratio that decides each, and a run evaluates its keys in one compiled pass.
+
+#: The largest read length the key encoding allows.
+_MAX_READ_LENGTH = 255
+
+#: Sentinel of a read footprint that maps into no transcript.
+_NO_TRANSCRIPT = -1
+
+
+@njit(cache=True)
+def _bounded_likelihoods(pl, pr, pu, lengths, frames, ouas, starts, ends, out):
+    """``CleavageModel.pmf`` of every ``(length, frame, oua, region)`` row.
+
+    The rows carry the region bounds clipped to ``[0, length]``; a bound of
+    ``0`` or ``length`` is the unbounded case, which is what makes the
+    unbounded entry equal to the look-up table's to the last bit.
+    """
+    limit = pl.shape[0] + pr.shape[0] + 3
+    for k in range(lengths.shape[0]):
+        length = lengths[k]
+        oua = ouas[k] == 1
+        if length >= limit + (1 if oua else 0):
+            out[k] = 0.0
+            continue
+        region_end = ends[k] if ends[k] < length else UNBOUNDED
+        if frames[k] == NO_FRAME:
+            out[k] = read_in_noise_likelihood(
+                pl, pr, pu, length, oua, starts[k], region_end
+            )
+        else:
+            out[k] = read_in_cds_likelihood(
+                pl, pr, pu, length, frames[k], oua, starts[k], region_end
+            )
+
+
+def _within(counts: np.ndarray) -> np.ndarray:
+    """``0, 1, .., counts[0]-1, 0, 1, .., counts[1]-1, ...``."""
+    total = int(counts.sum())
+    starts = np.cumsum(counts) - counts
+    return np.arange(total) - np.repeat(starts, counts)
+
+
+def _sorted_within(cells: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """*cells*, laid out in ``counts`` consecutive groups, sorted within each group."""
+    if cells.size == 0:
+        return cells
+    owner = np.repeat(np.arange(counts.size), counts)
+    return cells[np.lexsort((cells, owner))]
+
+
+#: Multipliers of the rolling hash of a group key (odd, so the map is a
+#: bijection on the 64-bit ring for each step).
+_HASH_MULTIPLIER = np.uint64(0x9E3779B97F4A7C15)
+_HASH_SEED = np.uint64(0x2545F4914F6CDD1D)
+
+
+def key_hashes(
+    rl: np.ndarray, oua: np.ndarray, nnz: np.ndarray, cells: np.ndarray
+) -> np.ndarray:
+    """A 64-bit hash of every ``(read length, oua, cells)`` key.
+
+    The cells of each key are the *nnz* consecutive entries of *cells*
+    (sorted within the key); two equal keys hash equally, and the callers
+    verify a hash match against the keys themselves, so a collision costs a
+    fallback, never a wrong answer.
+    """
+    with np.errstate(over="ignore"):
+        h = np.full(rl.shape[0], _HASH_SEED, dtype=np.uint64)
+        h = h * _HASH_MULTIPLIER + rl.astype(np.uint64)
+        h = h * _HASH_MULTIPLIER + oua.astype(np.uint64)
+        h = h * _HASH_MULTIPLIER + nnz.astype(np.uint64)
+        offsets = np.cumsum(nnz) - nnz
+        pending = np.flatnonzero(nnz)
+        t = 0
+        while pending.size:
+            values = cells[offsets[pending] + t].astype(np.uint64)
+            h[pending] = h[pending] * _HASH_MULTIPLIER + (values + np.uint64(1))
+            t += 1
+            pending = pending[nnz[pending] > t]
+    return h
+
+
+def _cells_equal(
+    a_nnz, a_cells, a_off, a_idx, b_nnz, b_cells, b_off, b_idx
+) -> np.ndarray:
+    """Whether the keys ``a_idx[i]`` of *a* and ``b_idx[i]`` of *b* have the same cells.
+
+    The keys' cell counts must already agree.
+    """
+    counts = a_nnz[a_idx]
+    within = _within(counts)
+    same = a_cells[np.repeat(a_off[a_idx], counts) + within] == b_cells[
+        np.repeat(b_off[b_idx], counts) + within
+    ]
+    return np.bincount(
+        np.repeat(np.arange(a_idx.size), counts), weights=~same, minlength=a_idx.size
+    ) == 0
+
+
+def match_rows(
+    row_rl, row_oua, row_nnz, row_cells, read_rl, read_oua, read_nnz, read_cells
+) -> np.ndarray:
+    """The row of every read, by its ``(cells, read length, oua)`` key.
+
+    The rows are one run's equivalence groups with distinct keys, their
+    cells sorted within each row; the reads' cells likewise.  Returns, per
+    read, the row index, ``-1`` for a read whose key matches no row and
+    ``-2`` for a read without cells.  The match is by hash, verified against
+    the keys; should two rows ever hash alike, the exact lookup takes over.
+    """
+    out = np.full(read_rl.shape[0], -2, dtype=np.int32)
+    reads = np.flatnonzero(read_nnz > 0)
+    if reads.size == 0 or row_rl.shape[0] == 0:
+        out[reads] = -1
+        return out
+    row_hash = key_hashes(row_rl, row_oua, row_nnz, row_cells)
+    order = np.argsort(row_hash, kind="stable")
+    sorted_hash = row_hash[order]
+    if np.any(sorted_hash[1:] == sorted_hash[:-1]):  # pragma: no cover
+        return _match_rows_exact(
+            row_rl, row_oua, row_nnz, row_cells, read_rl, read_oua, read_nnz, read_cells
+        )
+    read_hash = key_hashes(read_rl[reads], read_oua[reads], read_nnz[reads],
+                           read_cells[np.repeat(read_nnz > 0, read_nnz)])
+    pos = np.searchsorted(sorted_hash, read_hash)
+    pos_c = np.minimum(pos, sorted_hash.shape[0] - 1)
+    hit = sorted_hash[pos_c] == read_hash
+    rows = order[pos_c[hit]]
+    hits = reads[hit]
+    # Verify: a hash match is a key match unless the hash collided.
+    ok = (
+        (row_rl[rows] == read_rl[hits])
+        & (row_oua[rows] == read_oua[hits])
+        & (row_nnz[rows] == read_nnz[hits])
+    )
+    row_off = np.cumsum(row_nnz) - row_nnz
+    read_off = np.cumsum(read_nnz) - read_nnz
+    ok[ok] = _cells_equal(
+        read_nnz, read_cells, read_off, hits[ok], row_nnz, row_cells, row_off, rows[ok]
+    )
+    out[reads] = -1
+    out[hits[ok]] = rows[ok]
+    return out
+
+
+def _match_rows_exact(
+    row_rl, row_oua, row_nnz, row_cells, read_rl, read_oua, read_nnz, read_cells
+) -> np.ndarray:  # pragma: no cover - only on a hash collision between rows
+    row_off = np.cumsum(row_nnz) - row_nnz
+    lookup = {
+        (int(row_rl[r]), int(row_oua[r]), row_cells[row_off[r]:row_off[r] + row_nnz[r]].tobytes()): r
+        for r in range(row_rl.shape[0])
+    }
+    out = np.full(read_rl.shape[0], -2, dtype=np.int32)
+    read_off = np.cumsum(read_nnz) - read_nnz
+    for i in np.flatnonzero(read_nnz).tolist():
+        key = (int(read_rl[i]), int(read_oua[i]),
+               read_cells[read_off[i]:read_off[i] + read_nnz[i]].tobytes())
+        out[i] = lookup.get(key, -1)
+    return out
+
+
+def group_equal_rows(
+    row_run, row_rl, row_oua, row_nnz, row_cells
+) -> tuple[np.ndarray, np.ndarray]:
+    """Group rows with the same ``(run, cells, read length, oua)`` key.
+
+    Returns the group of every row and the first row of every group; the
+    groups are numbered in the order of their first rows.  Hash-based like
+    :func:`match_rows`, with the same exact fallback.
+    """
+    n = row_run.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    with np.errstate(over="ignore"):
+        h = key_hashes(row_rl, row_oua, row_nnz, row_cells) * _HASH_MULTIPLIER + row_run.astype(np.uint64)
+    _, first, inverse = np.unique(h, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    # Every row must equal its group's first row, or a hash collided.
+    off = np.cumsum(row_nnz) - row_nnz
+    rep = first[inverse]
+    ok = (
+        (row_run == row_run[rep]) & (row_rl == row_rl[rep])
+        & (row_oua == row_oua[rep]) & (row_nnz == row_nnz[rep])
+    )
+    ok[ok] = _cells_equal(
+        row_nnz, row_cells, off, np.flatnonzero(ok), row_nnz, row_cells, off, rep[ok]
+    )
+    if not ok.all():  # pragma: no cover - only on a hash collision
+        keys = {}
+        group = np.empty(n, dtype=np.int64)
+        firsts = []
+        for r in range(n):
+            key = (int(row_run[r]), int(row_rl[r]), int(row_oua[r]),
+                   row_cells[off[r]:off[r] + row_nnz[r]].tobytes())
+            g = keys.get(key)
+            if g is None:
+                g = keys[key] = len(firsts)
+                firsts.append(r)
+            group[r] = g
+        return group, np.array(firsts, dtype=np.int64)
+    # Renumber the groups by their first row.
+    rank = np.empty(first.size, dtype=np.int64)
+    order = np.argsort(first, kind="stable")
+    rank[order] = np.arange(first.size)
+    return rank[inverse], first[order]
+
+
+class ReadCompatibility:
+    """The cells every loaded read of a locus is compatible with, for every run.
+
+    Built once per locus from the reads' footprints and the RGR candidates
+    (:meth:`build`), it answers :func:`rgr_compatibility` for all reads of a
+    run at once (:meth:`cells_for_run`).  The RGRs are those of the locus at
+    build time; because a read's compatibility with an RGR does not depend
+    on the other RGRs, the cells stay valid after RGRs are removed and the
+    survivors re-indexed — :meth:`cell_map` renumbers them.
+
+    The candidate cells of a footprint are the ``(RGR, frame, coverage
+    position)`` combinations it can be compatible with, each with the
+    *key* of the likelihood ratio that decides it: ``(read length, frame,
+    region bounds)`` relative to the read start, plus the untemplated-
+    addition flag.  A run evaluates its keys once (:meth:`_presence`).
+
+    Attributes
+    ----------
+    rgr_ids : tuple[str, ...]
+        The RGRs by index at build time.
+    region_length : numpy.ndarray
+        The read length of every distinct footprint.
+    read_region, read_oua : dict[str, numpy.ndarray]
+        Per run and read: the footprint's index and the addition flag.
+    grp_ptr, grp_cell : numpy.ndarray
+        Per footprint, its candidate cells (CSR over the footprints).
+    cand_ptr, cand_key : numpy.ndarray
+        Per candidate cell, the keys of the likelihood ratios that can
+        establish it (CSR over the candidate cells); the key of the
+        untemplated variant is ``key + 1``.
+    """
+
+    __slots__ = (
+        "rgr_ids", "region_length", "read_region", "read_oua", "grp_ptr",
+        "grp_cell", "cand_ptr", "cand_key", "_key_stride", "_unique_keys",
+    )
+
+    @classmethod
+    def build(cls, loc: Locus, runs: list[RiboSeqRun]) -> ReadCompatibility:
+        """Compute the candidate cells of every footprint of *loc*'s reads."""
+        self = cls.__new__(cls)
+        self.rgr_ids = tuple(rgr.id for rgr in loc.rgrs)
+
+        # The distinct footprints across the runs (``load_reads`` shares the
+        # region objects, so identity is enough for the lookup).
+        regions: list[GenomicRegion] = []
+        index_of: dict = {}
+        self.read_region = {}
+        self.read_oua = {}
+        for run in runs:
+            rsas = loc.rsas_dict[run.id]
+            idx = np.empty(len(rsas), dtype=np.int32)
+            oua = np.empty(len(rsas), dtype=np.uint8)
+            for i, rsa in enumerate(rsas):
+                region = rsa.genomic_region
+                k = index_of.get(region)
+                if k is None:
+                    k = index_of[region] = len(regions)
+                    regions.append(region)
+                idx[i] = k
+                oua[i] = rsa.untemplated_addition
+            self.read_region[run.id] = idx
+            self.read_oua[run.id] = oua
+        n_regions = len(regions)
+        self.region_length = np.fromiter(
+            (region.length for region in regions), dtype=np.int32, count=n_regions
+        )
+        if n_regions and int(self.region_length.max()) > _MAX_READ_LENGTH:
+            raise ValueError(
+                f"{loc.id}: a read of {int(self.region_length.max())} nt exceeds "
+                f"the {_MAX_READ_LENGTH} nt the read routing supports"
+            )
+        self._key_stride = _MAX_READ_LENGTH + 2
+
+        # Candidate cells of every footprint, transcript by transcript.
+        parts = [
+            _candidates_on_transcript(tr, regions, self.region_length, loc.iv.strand == "-", self._key_stride)
+            for tr in loc.transcripts
+        ]
+        parts = [part for part in parts if part is not None]
+        if parts:
+            region = np.concatenate([p[0] for p in parts])
+            cell = np.concatenate([p[1] for p in parts])
+            key = np.concatenate([p[2] for p in parts])
+        else:
+            region = np.zeros(0, dtype=np.int32)
+            cell = np.zeros(0, dtype=np.int64)
+            key = np.zeros(0, dtype=np.int64)
+        # One entry per distinct (footprint, cell, key), sorted: the cells of
+        # a footprint come out in cell order.
+        order = np.lexsort((key, cell, region))
+        region, cell, key = region[order], cell[order], key[order]
+        if region.size:
+            new = np.empty(region.size, dtype=bool)
+            new[0] = True
+            new[1:] = (region[1:] != region[:-1]) | (cell[1:] != cell[:-1]) | (key[1:] != key[:-1])
+            region, cell, key = region[new], cell[new], key[new]
+            new_group = np.empty(region.size, dtype=bool)
+            new_group[0] = True
+            new_group[1:] = (region[1:] != region[:-1]) | (cell[1:] != cell[:-1])
+        else:
+            new_group = np.zeros(0, dtype=bool)
+        group_start = np.flatnonzero(new_group)
+        self.grp_cell = cell[group_start]
+        grp_region = region[group_start]
+        self.grp_ptr = np.zeros(n_regions + 1, dtype=np.int64)
+        np.cumsum(np.bincount(grp_region, minlength=n_regions), out=self.grp_ptr[1:])
+        self.cand_ptr = np.append(group_start, region.size).astype(np.int64)
+        self.cand_key = key
+        self._unique_keys = np.unique(key)
+        return self
+
+    # -- per run --------------------------------------------------------- #
+
+    def read_length(self, run_id: str) -> np.ndarray:
+        """The read length of every read of a run."""
+        return self.region_length[self.read_region[run_id]]
+
+    def cell_map(self, rgrs: list) -> np.ndarray | None:
+        """Old cell → current cell, for the locus's current RGR list.
+
+        ``None`` when the RGRs are unchanged since the build.
+        """
+        current = {rgr.id: rgr.index for rgr in rgrs}
+        old_to_new = np.array(
+            [current.get(rgr_id, -1) for rgr_id in self.rgr_ids], dtype=np.int64
+        )
+        if old_to_new.size == len(current) and np.array_equal(
+            old_to_new, np.arange(old_to_new.size)
+        ):
+            return None
+        return _cell_map(old_to_new.tolist())
+
+    def _presence(self, run: RiboSeqRun) -> np.ndarray:
+        """Per untemplated-addition flag, which candidate cells the run establishes.
+
+        Shape ``(2, n_groups)``; entry ``[oua, g]`` says whether a read with
+        that flag and the footprint of group ``g`` is compatible with the
+        group's cell under the run's cleavage model.  Recomputed per call
+        (a bincount over the candidates): kept per run it would be 2 bits
+        per candidate per run, gigabytes on a wide panel.
+        """
+        model = run.cleavage_model
+        stride = self._key_stride
+        n_keys = int(self._unique_keys[-1]) + 2 if self._unique_keys.size else 0
+        ok = np.zeros(n_keys, dtype=bool)
+        if n_keys:
+            keys = np.concatenate([self._unique_keys, self._unique_keys + 1])
+            k = keys // 2
+            oua = (keys % 2).astype(np.uint8)
+            ends = (k % stride).astype(np.int64)
+            k //= stride
+            starts = (k % stride).astype(np.int64)
+            k //= stride
+            frames = (k % 4).astype(np.int64)
+            lengths = (k // 4).astype(np.int64)
+            values = np.empty(keys.size)
+            _bounded_likelihoods(
+                model.pl, model.pr, float(model.pu), lengths, frames, oua, starts, ends, values
+            )
+            lut = model.lut
+            cl = np.where(lengths < lut.shape[0], lut[np.minimum(lengths, lut.shape[0] - 1), frames, oua], 0.0)
+            ok[keys] = (cl > 0.0) & (values > OVERLAP_LIKELIHOOD_RATIO * cl)
+        n_groups = self.grp_cell.shape[0]
+        present = np.zeros((2, n_groups), dtype=bool)
+        cand_group = np.repeat(np.arange(n_groups), np.diff(self.cand_ptr))
+        for flag in (0, 1):
+            hit = ok[self.cand_key + flag] if n_keys else np.zeros(0, dtype=bool)
+            present[flag] = np.bincount(cand_group, weights=hit, minlength=n_groups) > 0
+        return present
+
+    def cells_for_run(
+        self,
+        run: RiboSeqRun,
+        cell_map: np.ndarray | None = None,
+        reads: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The compatible cells of every read of *run*.
+
+        Parameters
+        ----------
+        run : RiboSeqRun
+            Its cleavage model decides the boundary cases.
+        cell_map : numpy.ndarray, optional
+            Old cell → current cell (:meth:`cell_map`); cells of removed
+            RGRs are dropped.
+        reads : numpy.ndarray of bool, optional
+            Restrict to these reads; the others get no cells.
+
+        Returns
+        -------
+        nnz : numpy.ndarray
+            Cells per read (``int32``).
+        cells : numpy.ndarray
+            The cells, read by read, sorted within each read (``int64``).
+        """
+        present = self._presence(run)
+        region = self.read_region[run.id]
+        oua = self.read_oua[run.id]
+        n_reads = region.shape[0]
+        which = np.arange(n_reads) if reads is None else np.flatnonzero(reads)
+        starts = self.grp_ptr[region[which]]
+        counts = (self.grp_ptr[region[which] + 1] - starts).astype(np.int64)
+        idx = np.repeat(starts, counts) + _within(counts)
+        read_of = np.repeat(which, counts)
+        keep = present[np.repeat(oua[which], counts), idx]
+        cells = self.grp_cell[idx]
+        if cell_map is not None:
+            cells = cell_map[cells]
+            keep &= cells >= 0
+        cells = cells[keep]
+        read_of = read_of[keep]
+        nnz = np.bincount(read_of, minlength=n_reads).astype(np.int32)
+        if cell_map is not None and not _monotone(cell_map):  # pragma: no cover
+            cells = _sorted_within(cells, nnz)
+        return nnz, cells
+
+
+def _monotone(cell_map: np.ndarray) -> bool:
+    kept = cell_map[cell_map >= 0]
+    return bool(np.all(kept[1:] > kept[:-1]))
+
+
+def _cell_map(old_to_new: list[int]) -> np.ndarray:
+    """Old cell → new cell (``-1`` for a removed RGR), one lookup per cell."""
+    return np.array(
+        [
+            -1 if new < 0 else new * CELL_CODES + code
+            for new in old_to_new
+            for code in range(CELL_CODES)
+        ],
+        dtype=np.int64,
+    )
+
+
+def _map_to_transcript(
+    tr: Transcript, regions: list[GenomicRegion], minus: bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The footprints that map into *tr*, with their local spans.
+
+    Vectorised :meth:`~price2.genomic_region.GenomicRegion.try_map_to_local`
+    for one- and two-block footprints; longer ones go through it directly.
+
+    Returns
+    -------
+    index, lo, hi : numpy.ndarray
+        The footprints' indices and their ``(lo, hi)`` on the transcript.
+    """
+    exons = tr.exons.intervals
+    xs = np.fromiter((iv.start for iv in exons), dtype=np.int64, count=len(exons))
+    xe = np.fromiter((iv.end for iv in exons), dtype=np.int64, count=len(exons))
+    cum = np.concatenate(([0], np.cumsum(xe - xs)[:-1]))
+    length = tr.exons.length
+    n_blocks = np.fromiter((len(r.intervals) for r in regions), dtype=np.int64, count=len(regions))
+    found: list[np.ndarray] = []
+    lo_parts: list[np.ndarray] = []
+    hi_parts: list[np.ndarray] = []
+
+    one = np.flatnonzero(n_blocks == 1)
+    if one.size:
+        a = np.fromiter((regions[i].intervals[0].start for i in one), dtype=np.int64, count=one.size)
+        b = np.fromiter((regions[i].intervals[0].end for i in one), dtype=np.int64, count=one.size)
+        j = np.searchsorted(xs, a, side="right") - 1
+        jc = np.maximum(j, 0)
+        ok = (j >= 0) & (b <= xe[jc])
+        found.append(one[ok])
+        lo_parts.append(cum[jc[ok]] + a[ok] - xs[jc[ok]])
+        hi_parts.append(cum[jc[ok]] + b[ok] - xs[jc[ok]])
+
+    two = np.flatnonzero(n_blocks == 2)
+    if two.size and len(exons) > 1:
+        a1 = np.fromiter((regions[i].intervals[0].start for i in two), dtype=np.int64, count=two.size)
+        b1 = np.fromiter((regions[i].intervals[0].end for i in two), dtype=np.int64, count=two.size)
+        a2 = np.fromiter((regions[i].intervals[1].start for i in two), dtype=np.int64, count=two.size)
+        b2 = np.fromiter((regions[i].intervals[1].end for i in two), dtype=np.int64, count=two.size)
+        j = np.searchsorted(xs, a1, side="right") - 1
+        jc = np.clip(j, 0, len(exons) - 2)
+        ok = (
+            (j >= 0) & (j < len(exons) - 1)
+            & (b1 == xe[jc]) & (a2 == xs[jc + 1]) & (b2 <= xe[jc + 1])
+        )
+        found.append(two[ok])
+        lo_parts.append(cum[jc[ok]] + a1[ok] - xs[jc[ok]])
+        hi_parts.append(cum[jc[ok] + 1] + b2[ok] - xs[jc[ok] + 1])
+
+    many = np.flatnonzero(n_blocks > 2)
+    if many.size:
+        hits = []
+        spans = []
+        for i in many.tolist():
+            span = tr.exons.try_map_to_local(regions[i])
+            if span is not None:
+                hits.append(i)
+                spans.append(span)
+        if hits:
+            spans_arr = np.array(spans, dtype=np.int64)
+            found.append(np.array(hits, dtype=np.int64))
+            if minus:
+                # ``try_map_to_local`` already flipped these; undo so the
+                # common flip below applies to everything alike.
+                lo_parts.append(length - spans_arr[:, 1])
+                hi_parts.append(length - spans_arr[:, 0])
+            else:
+                lo_parts.append(spans_arr[:, 0])
+                hi_parts.append(spans_arr[:, 1])
+
+    if not found:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, empty
+    index = np.concatenate(found)
+    lo = np.concatenate(lo_parts)
+    hi = np.concatenate(hi_parts)
+    if minus:
+        lo, hi = length - hi, length - lo
+    return index, lo, hi
+
+
+def _candidates_on_transcript(
+    tr: Transcript,
+    regions: list[GenomicRegion],
+    region_length: np.ndarray,
+    minus: bool,
+    key_stride: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """The candidate cells the footprints get from the RGRs of one transcript.
+
+    Returns ``(footprint index, cell, key)`` rows, or ``None`` when the
+    transcript contributes none.  Mirrors :func:`rgr_compatibility`: a
+    footprint inside an RGR covers its middle (key: the unbounded
+    likelihood, so that only ``cl > 0`` is required); one overlapping an
+    end is tested against the RGR's start codon, body and last codon
+    (NOISE: the whole region), with the bounds relative to the read start
+    clipped to ``[0, read length]`` — outside that range they change nothing.
+    """
+    rgrs = sorted(tr.rgr_set, key=lambda rgr: rgr.index)
+    if not rgrs:
+        return None
+    index, lo, hi = _map_to_transcript(tr, regions, minus)
+    if index.size == 0:
+        return None
+    rgr_lo = np.array([rgr.iv_on_transcript[0] for rgr in rgrs], dtype=np.int64)
+    rgr_hi = np.array([rgr.iv_on_transcript[1] for rgr in rgrs], dtype=np.int64)
+    rgr_index = np.array([rgr.index for rgr in rgrs], dtype=np.int64)
+    rgr_orf = np.array([rgr.is_orf for rgr in rgrs], dtype=bool)
+    lengths = region_length[index].astype(np.int64)
+
+    out_region: list[np.ndarray] = []
+    out_cell: list[np.ndarray] = []
+    out_key: list[np.ndarray] = []
+    chunk = max(1, 4_000_000 // max(1, rgrs.__len__()))
+    for start in range(0, index.size, chunk):
+        sl = slice(start, start + chunk)
+        lo_c, hi_c, len_c, idx_c = lo[sl, None], hi[sl, None], lengths[sl], index[sl]
+        inside = (rgr_lo[None, :] <= lo_c) & (rgr_hi[None, :] >= hi_c)
+        touching = ((lo_c <= rgr_lo[None, :]) & (rgr_lo[None, :] <= hi_c)) | (
+            (lo_c <= rgr_hi[None, :]) & (rgr_hi[None, :] <= hi_c)
+        )
+        ri, rj = np.nonzero(inside | touching)
+        if ri.size == 0:
+            continue
+        is_inside = inside[ri, rj]
+        orf = rgr_orf[rj]
+        read_lo = lo_c[ri, 0]
+        L = len_c[ri]
+        frame = np.where(orf, (read_lo - rgr_lo[rj]) % 3, NO_FRAME)
+        base = rgr_index[rj] * CELL_CODES + frame * 3
+        key_head = ((L * 4 + frame) * key_stride) * key_stride * 2
+        # Bounds relative to the read start, clipped.
+        b0 = np.clip(rgr_lo[rj] - read_lo, 0, L)
+        b1 = np.clip(rgr_lo[rj] + 3 - read_lo, 0, L)
+        b2 = np.clip(rgr_hi[rj] - 3 - read_lo, 0, L)
+        b3 = np.clip(rgr_hi[rj] - read_lo, 0, L)
+        reg = idx_c[ri]
+
+        # Inside: the middle, decided by the unbounded likelihood.
+        m = is_inside
+        out_region.append(reg[m])
+        out_cell.append(base[m] + _MIDDLE)
+        out_key.append(key_head[m] + (0 * key_stride + L[m]) * 2)
+        # Overlapping an ORF end: start codon, body, last codon.
+        m = ~is_inside & orf
+        for covpos, lo_b, hi_b in ((_START, b0, b1), (_MIDDLE, b1, b2), (_STOP, b2, b3)):
+            out_region.append(reg[m])
+            out_cell.append(base[m] + covpos)
+            out_key.append(key_head[m] + (lo_b[m] * key_stride + hi_b[m]) * 2)
+        # Overlapping a NOISE region's end: the whole region.
+        m = ~is_inside & ~orf
+        out_region.append(reg[m])
+        out_cell.append(base[m] + _MIDDLE)
+        out_key.append(key_head[m] + (b0[m] * key_stride + b3[m]) * 2)
+    if not out_region:
+        return None
+    return (
+        np.concatenate(out_region).astype(np.int32),
+        np.concatenate(out_cell).astype(np.int64),
+        np.concatenate(out_key).astype(np.int64),
+    )
+
+
 def count_well_fitting_reads(loc: Locus, runs: list[RiboSeqRun]) -> None:
     """Count well-fitting reads per RGR and run.
 
     A read is *well-fitting* when its length and untemplated-addition
     status match a high-probability entry in the run's cleavage
-    model.  Results are stored in :attr:`wfr_df` (a DataFrame
-    indexed by RGR id with one column per run).
+    model; it counts once for every ORF it is compatible with
+    (:class:`ReadCompatibility`).  Results are stored in :attr:`wfr_df` (a
+    DataFrame indexed by ORF id with one column per run).
 
     Parameters
     ----------
     runs : list[RiboSeqRun]
         Ribo-seq runs to process.
     """
-    well_fitting_rcs = {}
-    for run in runs:
-        well_fitting_rcs[run.id] = {}
-        for rgr in loc.rgrs:
-            if rgr.is_orf:
-                well_fitting_rcs[run.id][rgr.id] = 0
-    # ORF id by ``rgr.index`` (``None`` for NOISE), to resolve the cells.
-    orf_id_of = [rgr.id if rgr.is_orf else None for rgr in loc.rgrs]
-    for run in runs:
-        well_fitting_indices = run.cleavage_model.get_high_prob_indices()
-        well_fitting_length_oua = {(l, oua) for l, f, oua in well_fitting_indices}
-        for rsa in loc.rsas_dict[run.id]:
-            if (
-                len(rsa),
-                int(rsa.untemplated_addition),
-            ) not in well_fitting_length_oua:
-                continue
-            cells = rgr_compatibility(loc, rsa, run)
-            if not cells:
-                continue
-
-            # One RGR can appear under several coverage positions for the
-            # same read (a read spanning a short ORF overlaps both its
-            # start- and stop-codon regions), so deduplicate before
-            # counting: a read contributes its count once per RGR.
-            orf_ids = {orf_id_of[cell // CELL_CODES] for cell in cells}
-            orf_ids.discard(None)
-            for rgr_id in orf_ids:
-                well_fitting_rcs[run.id][rgr_id] += rsa.read_count
-
-    loc.wfr_df = (
-        pd.DataFrame.from_dict(well_fitting_rcs).replace(np.nan, 0).astype(np.int32)
+    compat = loc.read_compatibility(runs)
+    cell_map = compat.cell_map(loc.rgrs)
+    num_rgrs = len(loc.rgrs)
+    orf = np.array([rgr.is_orf for rgr in loc.rgrs], dtype=bool)
+    table = np.zeros((num_rgrs, len(runs)), dtype=np.int64)
+    for k, run in enumerate(runs):
+        rsas = loc.rsas_dict[run.id]
+        rl = compat.read_length(run.id)
+        oua = compat.read_oua[run.id]
+        well_fitting = np.zeros((int(rl.max(initial=0)) + 1, 2), dtype=bool)
+        for length, _, flag in run.cleavage_model.get_high_prob_indices():
+            if length < well_fitting.shape[0]:
+                well_fitting[length, flag] = True
+        selected = well_fitting[rl, oua]
+        if not selected.any():
+            continue
+        nnz, cells = compat.cells_for_run(run, cell_map, reads=selected)
+        read_of = np.repeat(np.arange(nnz.size), nnz)
+        # A read contributes its count once per RGR, whatever the number of
+        # coverage positions it is compatible with.
+        pairs = np.unique(read_of.astype(np.int64) * num_rgrs + cells // CELL_CODES)
+        counts = np.fromiter(
+            (rsa.read_count for rsa in rsas), dtype=np.float64, count=len(rsas)
+        )
+        table[:, k] = np.bincount(
+            pairs % num_rgrs, weights=counts[pairs // num_rgrs], minlength=num_rgrs
+        )
+    loc.wfr_df = pd.DataFrame(
+        table[orf].astype(np.int32),
+        index=[rgr.id for rgr in loc.rgrs if rgr.is_orf],
+        columns=[run.id for run in runs],
     )
 
 

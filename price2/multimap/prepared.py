@@ -3,15 +3,20 @@
 ``prepared_loci`` holds the prepared :class:`~price2.locus.Locus` (see
 :meth:`~price2.locus.Locus.prepared_copy`) and ``prepared_loci_cache`` —
 separately, because it holds only arrays — its
-:class:`~price2.read_routing.ReadRouting`, which a light M-step loads alone.
+:class:`~price2.read_routing.ReadRouting` together with the design matrix
+built from it, which a light M-step loads alone.
 """
 
 from __future__ import annotations
 
+from scipy.sparse import csr_matrix
+
 from price2 import database
 
 
-def save_locus_routing(db_path: str, locus_id: str, loc) -> None:
+def save_locus_routing(
+    db_path: str, locus_id: str, loc, design_matrix: csr_matrix | None = None
+) -> None:
     """Persist a locus's :class:`~price2.read_routing.ReadRouting` on its own.
 
     The routing references no RGR, transcript or read objects, so a light
@@ -26,8 +31,15 @@ def save_locus_routing(db_path: str, locus_id: str, loc) -> None:
         Locus identifier.
     loc : Locus
         A locus whose ``routing`` has been built.
+    design_matrix : csr_matrix, optional
+        The design matrix built from that routing.  It is a pure function of
+        the routing and the runs' models, both fixed for the run, so storing
+        it saves every later pass its construction.
     """
     payload = {"id": loc.id, "iv": loc.iv, "routing": loc.routing}
+    if design_matrix is not None:
+        X = design_matrix
+        payload["design"] = (X.data, X.indices, X.indptr, X.shape)
     blob = database.compress_blob(payload, protocol=5)
     with database.connect(db_path, wal_writer=True, commit=True) as db:
         db.execute(
@@ -52,11 +64,20 @@ def load_locus_routing(db_path: str, locus_id: str):
     return database.decompress_blob(row[0])
 
 
+def _stored_design_matrix(payload: dict) -> csr_matrix | None:
+    stored = payload.get("design")
+    if stored is None:
+        return None
+    data, indices, indptr, shape = stored
+    return csr_matrix((data, indices, indptr), shape=shape)
+
+
 def load_light_locus(db_path: str, locus_id: str):
     """Return a minimal :class:`~price2.locus.Locus` for a light M-step.
 
-    The returned locus carries only ``id``, ``iv`` and ``routing`` — enough
-    for ``set_warm_start``, ``assign_reads_to_egs``, ``deconvolve(prune=False)``,
+    The returned locus carries only ``id``, ``iv`` and ``routing`` (with
+    the stored design matrix) — enough for ``set_warm_start``,
+    ``assign_reads_to_egs``, ``deconvolve(prune=False)``,
     ``compute_multimap_lambdas`` and ``activities_by_id``.  It has no ``rgrs``
     or ``transcripts``, which is the whole point: restoring those dominates
     the cost of loading a prepared locus.
@@ -78,7 +99,12 @@ def load_light_locus(db_path: str, locus_id: str):
     payload = load_locus_routing(db_path, locus_id)
     if payload is None:
         return None
-    return Locus.light(payload["id"], payload["iv"], payload["routing"])
+    return Locus.light(
+        payload["id"],
+        payload["iv"],
+        payload["routing"],
+        _stored_design_matrix(payload),
+    )
 
 
 def save_prepared_locus(db_path: str, locus_id: str, loc) -> None:
@@ -145,4 +171,5 @@ def load_prepared_locus(db_path: str, locus_id: str):
         return None
     loc = database.decompress_blob(row[0])
     loc.routing = payload["routing"]
+    loc.set_design_matrix(_stored_design_matrix(payload))
     return loc

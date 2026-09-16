@@ -73,10 +73,11 @@ flowchart TD
     CACHE -->|"miss / classic"| SKEL["load Locus skeleton"]
     SKEL --> RGR["<b>build_rgrs</b><br/>enumerate ORF candidates on every<br/>transcript + one NOISE RGR per locus"]
     RGR --> READS["get_reads_from_db"]
-    READS --> WFR["<b>make_well_fitting_reads</b><br/>per-RGR read counts, unweighted"]
+    READS --> COMPAT["<b>read_compatibility</b><br/>the cells every read is compatible with,<br/>all reads and runs at once, computed once<br/>and kept through the filters"]
+    COMPAT --> WFR["<b>make_well_fitting_reads</b><br/>per-RGR read counts, unweighted"]
     WFR --> F1["<b>coverage filter</b><br/>drop ORF if max over runs of<br/>well-fitting reads / length ≤ 0.1"]
-    F1 --> F2["<b>deconvolution filter</b><br/>group ORFs by stop codon → split into<br/>splice-compatible optimisation groups →<br/>nested Poisson solve per run →<br/>drop ORF if activity &lt; 0.1 in every run"]
-    F2 --> EGS["<b>make_equivalence_groups</b><br/>reads sharing one ORF-compatibility set,<br/>read length and 5' untemplated-addition<br/>state collapse into one EG = one matrix row"]
+    F1 --> F2["<b>deconvolution filter</b><br/>group ORFs by stop codon → split into<br/>splice-compatible optimisation groups →<br/>nested Poisson solve, all runs as the<br/>columns of one update loop →<br/>drop ORF if activity &lt; 0.1 in every run"]
+    F2 --> EGS["<b>make_equivalence_groups</b><br/>reads sharing one ORF-compatibility set,<br/>read length and 5' untemplated-addition<br/>state collapse into one EG = one matrix row;<br/>one compiled sweep per read shape"]
     EGS --> SAVE["save_prepared_locus<br/>only at EM iteration 0"]
     SAVE --> READS2
 
@@ -107,10 +108,20 @@ flowchart TD
 Everything above `assign_reads_to_egs` depends only on **unweighted** reads, so it is
 identical in every EM iteration. That is exactly the state stored in `prepared_loci`
 (the locus) and `prepared_loci_cache` (its `ReadRouting`: the reads routed to the
-design-matrix rows, arrays only) and reused from iteration 1 onward — ORF generation,
-both filters, the EG DAG build and the per-read compatibility are the dominant
-per-locus cost. A light M-step loads the routing alone and derives the response from
-it with a weighted `bincount`.
+design-matrix rows, arrays only, with the design matrix built from it) and reused
+from iteration 1 onward — ORF generation, both filters, the EG build and the per-read
+compatibility are the dominant per-locus cost. A light M-step loads the routing alone
+and derives the response from it with a weighted `bincount`.
+
+The prepare stages work on arrays, not on reads: `read_routing.ReadCompatibility`
+maps the distinct read footprints of the locus to the transcripts once, lists every
+footprint's candidate cells with the key of the likelihood ratio that decides each
+(read length, frame, region bounds relative to the read start), and evaluates a run's
+keys in one compiled pass — so the well-fitting counts and the routing share one
+computation, and adding a run adds a look-up, not a pass over the reads.
+`ReadRouting` matches reads to rows, merges rows after an RGR removal and re-keys
+reads by hashing the `(cells, read length, oua)` keys and verifying every match,
+with an exact fallback should two rows ever hash alike.
 
 ---
 
@@ -219,15 +230,15 @@ flowchart TD
         E["<b>cheap reduced likelihood</b><br/>clamp this ORF's activity to pseudo_min,<br/>no refit → ll_reduced"]
         E --> F["<b>Wilks test</b><br/>2 (ll_full − ll_reduced) ~ χ² with<br/>df = number of runs → log p"]
         F --> G{"log p &gt; log α<br/>α = likelihood_ratio_alpha = 1e-10"}
-        G -->|"yes — ORF explains nothing"| DROP["<b>drop ORF</b><br/>accept the reduced fit as the new full"]
-        G -->|"no — looks significant"| REFIT["<b>refit properly</b><br/>full model: kept ORFs free<br/>reduced model: this ORF pinned at pseudo_min<br/>all dropped ORFs pinned at pseudo_min"]
+        G -->|"yes — ORF explains nothing"| DROP["<b>drop ORF</b><br/>accept the reduced fit as the new full;<br/>mark the runs it touched stale"]
+        G -->|"no — looks significant"| REFIT["<b>refit, per run</b><br/>full model: re-solve the stale runs<br/>reduced model: this ORF pinned at pseudo_min,<br/>re-solved only in the runs the clamp touched,<br/>stopped as soon as the verdict is settled"]
         REFIT --> H{"log p &gt; log α"}
         H -->|"yes"| DROP
         H -->|"no"| KEEP["<b>keep ORF</b>"]
     end
 
     D --> LOOP
-    LOOP --> FIN["final refit on the kept set<br/>→ self.result"]
+    LOOP --> FIN["re-solve the stale runs on the kept set<br/>→ self.result"]
     FIN --> RM["remove_rgrs(dropped)<br/>re-index, collapse EGs, re-slice result"]
     RM --> OUT(["→ estimate_activities"])
 
@@ -237,9 +248,22 @@ flowchart TD
 
 The two-tier test is a cost optimisation, not a statistical one: the clamp-and-score pass
 is a couple of sparse mat-vecs, and it settles the large majority of candidates. Only
-when the cheap test says *significant* does the expensive pair of constrained refits run
-to confirm it — the clamped likelihood is a lower bound on the properly refit reduced
-likelihood, so a cheap "not significant" verdict can never be overturned by a refit.
+when the cheap test says *significant* do the constrained refits run to confirm it — the
+clamped likelihood is a lower bound on the properly refit reduced likelihood, so a cheap
+"not significant" verdict can never be overturned by a refit.
+
+The refits are per run. Without the group penalty the objective is a sum over the runs
+(the design matrix is block-diagonal: a row `(EG, run)` touches only the columns
+`(RGR, run)`), so pinning an ORF changes the fit only in the runs where it was active.
+The per-run log-likelihoods of the clamp tell which runs those are — the refit could
+regain at most the clamp's loss in a run, so a run that lost less than
+`likelihood_ratio_run_tol` nats is not re-solved — and the reduced model is solved on
+their rows and columns alone; with many samples an active ORF is active in a small
+fraction of them. The full model is likewise re-solved only in the runs where a candidate
+was dropped without a refit. A reduced refit also ends early: the multiplicative updates
+only raise the log-likelihood, so once it reaches the value at which the candidate is
+not significant the drop verdict is final, and a keep verdict is declared once the
+log-likelihood gains less than `likelihood_ratio_ll_tol` between two checks.
 
 The Huber weights ω are carried over from the deconvolution, so an EG that was an outlier
 under the robust fit also contributes less to the test statistic. NOISE RGRs are never
@@ -255,9 +279,10 @@ workers are started and what they may write.
 | phase | pool | start method | why |
 |---|---|---|---|
 | per-run models — `ribo_seq_run.ribo_seq_runs_from_bams` | `multiprocessing.Pool`: one worker per BAM for the cleavage EM, then one task per genomic window for the coverage histograms | `fork` | the annotation and the fitted cleavage models reach the workers as initializer arguments; `fork` inherits them without pickling |
-| read mapping — `data_collector._map_run_reads` | `multiprocessing.Pool`, one task per locus chunk | `fork` | the loci are inherited the same way; the pool is created before the parent opens `price.db`, so no SQLite connection crosses the fork |
-| multimap index — `multimap.build_multimap_index` | `multiprocessing.Pool`, one task per run | `forkserver` | created before the parent opens `price.db`; a worker only reads its run's spill files |
-| deconvolution — `ORFActivityEstimator` | `pebble.ProcessPool`, one job per locus, a worker recycled after `worker_max_tasks` loci | `forkserver` | numba's JIT state and SQLite handles are not fork-safe (do not change this to `fork`); `init_worker` builds the `WorkerContext` — configuration, genome, runs with their models — once per worker; a locus that times out (`timeout` × runs) or crashes takes down only its worker |
+| read mapping — `data_collector._map_reads` | `multiprocessing.Pool`, one task per locus chunk of every pending run, run after run, plus one flush task per worker after each run's chunks | `fork` | the loci are inherited the same way; the pool is created before the parent opens `price.db`, so no SQLite connection crosses the fork; the flush tasks meet at a barrier so every worker writes the run's multimapping spill out before the run's reads are committed |
+| spill collapse — `data_collector._RunIndexer` | `multiprocessing.Pool`, one task per mapped run, started as soon as the run's spill is complete | `forkserver` | collapses a run's raw spill into its groups file (`multimap.index_run_spill`) beside the mapping pool, a few runs at a time and never more raw spill than a quarter of the memory at once |
+| multimap index — `multimap.build_multimap_index` | `multiprocessing.Pool`, one task per run | `forkserver` | created before the parent opens `price.db`; a worker loads its run's groups file (or collapses a spill left raw) |
+| deconvolution — `ORFActivityEstimator` | `pebble.ProcessPool`, one job per locus in `dispatch_order`, a worker recycled after `worker_max_tasks` loci | `forkserver` | numba's JIT state and SQLite handles are not fork-safe (do not change this to `fork`); `init_worker` builds the `WorkerContext` — configuration, genome, runs with their models — once per worker; a locus that times out (`timeout` × runs, capped at `timeout_cap`) or crashes takes down only its worker |
 | GPU broker — `gpu_broker.GpuBroker`, optional | `mu_broker_procs` processes × `mu_broker_streams` stream-threads | `forkserver` | one CUDA context per process instead of one per worker; the workers ship their systems over shared memory and block on a socket until the answer is written |
 
 Who writes what:
@@ -275,6 +300,14 @@ Who writes what:
   `database.connect` (WAL mode, busy timeout), one short transaction per locus.
 - Worker **logs** travel over a queue to the parent's `QueueListener`; the
   broker processes, which have no queue, log to the inherited stderr.
+- Every process is **single-threaded** in its numerical libraries: `price.py`
+  sets `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and
+  `NUMEXPR_NUM_THREADS` to one before numpy is imported (only if the
+  environment does not set them), and the workers inherit that.
+- A **driver script** of your own that imports the pipeline and starts one of
+  these pools must guard its top level with `if __name__ == "__main__":` —
+  a `forkserver` worker re-imports the main module, and an unguarded script
+  would run its whole body again in every worker (`price.py` is guarded).
 
 ---
 

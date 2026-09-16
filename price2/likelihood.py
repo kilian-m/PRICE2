@@ -284,22 +284,43 @@ def weighted_poisson_log_likelihood_sparse(
     delta = np.asarray(X @ w).ravel()
     active = ~((delta == 0.0) & (y == 0.0))
     d_act, y_act, w_act = delta[active], y[active], weights[active]
+    return float(_log_likelihood_terms(d_act, y_act, w_act, theta).sum())
+
+
+def weighted_poisson_log_likelihood_rows(
+    w: np.ndarray,
+    X: csr_matrix,
+    y: np.ndarray,
+    weights: np.ndarray,
+    theta: float | None = None,
+) -> np.ndarray:
+    """Every row's term of :func:`weighted_poisson_log_likelihood_sparse`.
+
+    Returns
+    -------
+    np.ndarray, shape ``(n_samples,)``
+        The rows' contributions; they sum to the log-likelihood.  A row with
+        ``δ_i = y_i = 0`` contributes ``0``.
+    """
+    delta = np.asarray(X @ w).ravel()
+    active = ~((delta == 0.0) & (y == 0.0))
+    terms = np.zeros(len(y), dtype=np.float64)
+    terms[active] = _log_likelihood_terms(
+        delta[active], y[active], weights[active], theta
+    )
+    return terms
+
+
+def _log_likelihood_terms(delta, y, weights, theta):
     if theta is None:
-        return float(
-            (w_act * (y_act * np.log(d_act) - d_act - gammaln(y_act + 1))).sum()
-        )
-    return float(
-        (
-            w_act
-            * (
-                gammaln(y_act + theta)
-                - gammaln(theta)
-                - gammaln(y_act + 1)
-                + theta * np.log(theta)
-                + y_act * np.log(d_act)
-                - (y_act + theta) * np.log(theta + d_act)
-            )
-        ).sum()
+        return weights * (y * np.log(delta) - delta - gammaln(y + 1))
+    return weights * (
+        gammaln(y + theta)
+        - gammaln(theta)
+        - gammaln(y + 1)
+        + theta * np.log(theta)
+        + y * np.log(delta)
+        - (y + theta) * np.log(theta + delta)
     )
 
 
