@@ -46,8 +46,8 @@ Issues = "https://github.com/kilian-m/PRICE2/issues"
 [project.scripts]
 price2 = "price2.price:main"
 
-[tool.setuptools]
-packages = ["price2"]
+[tool.setuptools.packages.find]
+include = ["price2*"]
 
 [tool.pytest.ini_options]
 markers = [
