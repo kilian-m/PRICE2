@@ -52,6 +52,7 @@ import time
 
 from price2 import database
 from price2.config import COLLECTION, RUNTIME, Config, is_path_option, option_scope
+from price2.layout import FAILED_LOCI_FILENAME, RunLayout
 
 logger = logging.getLogger(__name__)
 
@@ -534,7 +535,7 @@ def migrate_legacy_progress(db_path: str, w_dir: str) -> None:
 #: Extensions of the line-oriented files the parent appends to.  ``.txt`` is
 #: only ``failed_loci.txt``, which lists one locus id per line.
 _APPENDED_SUFFIXES: tuple[str, ...] = (".tsv", ".bed", ".gtf", ".txt")
-_FAILED_LOCI = "failed_loci.txt"
+_FAILED_LOCI = FAILED_LOCI_FILENAME
 
 #: Column names identifying the locus a TSV row belongs to.
 _LOCUS_COLUMNS: tuple[str, ...] = ("locus_id", "loc_id")
@@ -605,13 +606,21 @@ def repair_partial_lines(*paths: str) -> None:
 
 
 def _appended_outputs(o_dir: str) -> dict[str, list[str]]:
-    """The appended output files under *o_dir*, keyed by extension."""
+    """The appended output files under *o_dir*, keyed by extension.
+
+    Only ``regions_activities/`` and the performance log are appended to per
+    locus.  Everything else in *o_dir* (``dataset_models/``) is written whole
+    by its stage and carries no locus, so it must not be filtered.
+    """
+    layout = RunLayout(w_dir="", o_dir=o_dir)
     files: dict[str, list[str]] = {suffix: [] for suffix in _APPENDED_SUFFIXES}
-    for root, _, names in os.walk(o_dir):
+    for root, _, names in os.walk(layout.regions_activities_dir):
         for name in names:
             suffix = os.path.splitext(name)[1]
             if suffix in files and (suffix != ".txt" or name == _FAILED_LOCI):
                 files[suffix].append(os.path.join(root, name))
+    if os.path.isfile(layout.performance_path):
+        files[".tsv"].append(layout.performance_path)
     return files
 
 
