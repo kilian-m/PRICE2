@@ -79,8 +79,7 @@ class Config:
     """Configuration for a PRICE2 run.
 
     All options are loaded from a JSON file or keyword arguments via
-    :meth:`make_config`.  Every option is documented at its field below; the
-    reasoning behind the tuned defaults is in ``docs/tuning.md``.  Path
+    :meth:`make_config`.  Every option is documented at its field below.  Path
     options left empty are derived from ``base_dir`` in :meth:`__post_init__`::
 
         base_dir/
@@ -150,14 +149,14 @@ class Config:
     #: ``"largest"`` puts the loci with the most stored reads first, which
     #: shortens a pass's tail but makes every worker stream its largest
     #: matrices at the same time and, measured, doubles a pass instead
-    #: (memory bandwidth; ``docs/tuning.md``).
+    #: (memory bandwidth).
     dispatch_order: str = option("database", scope=RUNTIME)
     #: Floor on the activities during optimisation, guarding ``log(0)`` in
     #: the likelihood.  Do not lower it.
     pseudo_min: float = 1e-14
     #: Loci a worker handles before it is replaced (``0``: never).  Recycling
     #: bounds the memory growth from the occasional huge locus; a respawn
-    #: costs ~2 CPU-seconds (see ``docs/tuning.md``).
+    #: costs ~2 CPU-seconds.
     worker_max_tasks: int = option(1000, scope=RUNTIME)
 
     # ------------------------------------------------------------------ #
@@ -200,7 +199,7 @@ class Config:
     gtol: float = 0
     maxls: int = 200
     #: Group-LASSO penalty λ, calibrated for ``inner_solver="mu"`` by an
-    #: AIC/BIC scan (``docs/tuning.md``).
+    #: AIC/BIC scan.
     lam: float = 10
 
     # ------------------------------------------------------------------ #
@@ -226,7 +225,7 @@ class Config:
     #: Also stop once the set of RGRs above
     #: ``deconvolution_filter_min_activity`` has not changed for
     #: ``irls_active_patience`` outer iterations: the call set converges long
-    #: before the weight norm does (``docs/tuning.md``).
+    #: before the weight norm does.
     irls_stop_on_active_set: bool = True
     irls_active_patience: int = 3
 
@@ -247,7 +246,7 @@ class Config:
     #: ``"mu"``: multiplicative (weighted Richardson-Lucy + group-LASSO)
     #: updates at every solve site, converging to the optimum that L-BFGS-B
     #: stalls short of and hence to a sparser call set; ``"lbfgs"``: the
-    #: legacy scipy L-BFGS-B path.  See ``docs/tuning.md``.
+    #: legacy scipy L-BFGS-B path.
     inner_solver: str = "mu"
 
     #: Iteration cap and relative-change tolerance of the multiplicative
@@ -312,7 +311,7 @@ class Config:
     multimap_em: bool = option(True, scope=COLLECTION)
     #: Backstop cap on the EM outer iterations; ``em_tol`` is meant to end
     #: the loop, which converges linearly in ~18-20 iterations on tested
-    #: data (``docs/tuning.md``).
+    #: data.
     em_max_iter: int = 30
     #: The loop stops once the L1 fraction of read mass reassigned between
     #: successive E-steps falls below this.

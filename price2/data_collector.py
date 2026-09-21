@@ -561,9 +561,9 @@ class _RunIndexer:
         self.root = spill_root
         n_proc = max(1, min(4, processes // 8))
         # A driver that starts the pipeline without a ``__main__`` guard
-        # cannot start a ``forkserver`` pool (see ``docs/deconvolution.md``
-        # §6); the runs are then collapsed one after another by the index
-        # stage, once the mapping is done.
+        # cannot start a ``forkserver`` pool (its workers re-import the main
+        # module); the runs are then collapsed one after another by the
+        # index stage, once the mapping is done.
         try:
             self._pool = mp.get_context("forkserver").Pool(n_proc)
         except RuntimeError:

@@ -44,5 +44,9 @@ PRICE2 is a genomics pipeline that detects actively translated ORFs from multipl
 
 **Output files:** Workers never write to `o_dir`; they hand their rendered rows back and the parent process (`ORFActivityEstimator._record`) is the only writer of the output tables, `performance_measurements.tsv` and the per-locus progress (the `progress` table of `price.db`, via `run_state.ProgressRecorder`). Workers do write their own EM state to SQLite through `price2.database.connect` (WAL mode, busy timeout).
 
+**Process model:** The per-run model estimation and the read mapping use `multiprocessing` pools started with `fork`, so the annotation, the models and the loci are inherited without pickling; the spill collapse, the multimap index build and the deconvolution use `forkserver` (numba's JIT state and SQLite handles are not fork-safe). The mapping pool and the multimap index pool are created before the parent opens `price.db`, so no SQLite connection crosses a fork. `price.py` pins the BLAS/OpenMP thread counts to one before numpy is imported; the parallelism is across loci. A driver script that starts the pipeline must guard its top level with `if __name__ == "__main__":`, because a `forkserver` worker re-imports the main module.
+
+**Tuned defaults:** The non-obvious defaults in `config.py` (`lam`, `worker_max_tasks`, `dispatch_order`, `em_max_iter`, `irls_stop_on_active_set`, the `likelihood_ratio_*` tolerances) were measured; the reason is in the comment at each field. Do not retune them without a new measurement.
+
 **Performance-sensitive code:** `locus.py` deconvolution uses `scipy.sparse` CSR matrices and BLAS-backed operations. Keep numerical code vectorized (numpy/scipy); avoid Python loops over reads or positions.
 
