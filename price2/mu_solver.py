@@ -15,22 +15,14 @@ the weighted Richardson-Lucy / EM multiplicative update
 is a majorisation-minimisation step: it preserves non-negativity, needs only two
 sparse mat-vecs per iteration, and converges to the (unique) minimiser of this
 convex problem. On the demanding PRICE2 loci this reaches the true optimum in a
-fraction of the time scipy L-BFGS-B needs merely to approach it, and it maps
-directly onto the GPU (all ops are sparse mat-vecs + element-wise arithmetic).
+fraction of the time scipy L-BFGS-B needs merely to approach it.
 
-On the CPU the update runs as a fused kernel (:func:`_kernel_loop`);
+The update runs as a fused kernel (:func:`_kernel_loop`);
 ``config.mu_kernel = "numpy"`` selects the scipy mat-vec loop it replaced,
-which computes the same iterates.  The GPU path is optional: it is used only
-when ``config.mu_gpu`` is set and PyTorch with CUDA is importable; otherwise
-the CPU path runs.
-:mod:`price2.gpu_broker` carries a third copy of the update, run for a whole
-IRLS-Huber loop on a shared GPU; it checks convergence only every few
-iterations, so its results are close to but not identical with these two.
+which computes the same iterates.
 """
 from __future__ import annotations
 
-import functools
-import warnings
 from typing import Callable
 
 import numpy as np
@@ -42,42 +34,8 @@ from price2.likelihood import group_lasso_penalty
 
 #: Floor on ``omega * y / delta`` relative to ``omega * y``: ``delta`` is
 #: floored at ``omega * y / OVERFLOW_CAP`` so that the ratio cannot overflow
-#: the ``X^T`` mat-vec to ``+Inf`` in float64 (and, for the GPU paths,
-#: ``float32`` overflows at ~3.4e38, so a far smaller cap heads Inf off).
-OVERFLOW_CAP = {"float64": 1e200, "float32": 1e20}
-
-
-def silence_sparse_beta_warning() -> None:
-    """Mute torch's "sparse CSR tensor support is in beta state" notice.
-
-    torch emits it once per process, the first time a CSR tensor is built, which
-    means one line of log per broker process and per GPU worker.  The design
-    matrices are sparse by nature and CSR is the layout torch's own sparse
-    matmul wants, so the notice is not actionable.
-
-    Call this in any process that is about to build sparse tensors, before the
-    first one.  The filter is process-global, so it must not be installed in a
-    process that does not want it.
-    """
-    warnings.filterwarnings(
-        "ignore",
-        message="Sparse CSR tensor support is in beta state",
-        category=UserWarning,
-    )
-
-
-@functools.cache
-def _torch():
-    """Import torch once per process; ``None`` when it or CUDA is unavailable."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return None
-    except Exception:
-        return None
-    silence_sparse_beta_warning()
-    return torch
+#: the ``X^T`` mat-vec to ``+Inf``.
+OVERFLOW_CAP = 1e200
 
 
 def relative_change(w_new: np.ndarray, w: np.ndarray) -> float:
@@ -108,7 +66,7 @@ STOP_EVERY = 10
 #: Guard against ``log(0)`` in the objective and the ratio ``omega_y / delta``.
 _TINY = 1e-300
 
-#: The multiplicative updates the CPU path runs: ``"numba"`` is the fused
+#: The multiplicative update loops: ``"numba"`` is the fused
 #: kernel (:func:`_kernel_loop`), ``"numpy"`` the numpy loop it replaced;
 #: both produce the same iterates (see :func:`mu_poisson`).
 KERNELS = ("numba", "numpy")
@@ -116,7 +74,7 @@ _KERNEL = ["numba"]
 
 
 def set_kernel(name: str) -> None:
-    """Select the CPU update loop for this process (``config.mu_kernel``)."""
+    """Select the update loop for this process (``config.mu_kernel``)."""
     if name not in KERNELS:
         raise ValueError(f"mu_kernel must be one of {KERNELS}, got {name!r}")
     _KERNEL[0] = name
@@ -527,7 +485,7 @@ def mu_poisson(
     # delta ~= y, so it never binds for a converged solution and the fixed point
     # / results are unchanged. It only bounds pathological transients where an
     # observed group (omega_y > 0) is momentarily predicted ~0.
-    delta_floor = np.maximum(omega_y / OVERFLOW_CAP["float64"], _TINY)
+    delta_floor = np.maximum(omega_y / OVERFLOW_CAP, _TINY)
     data_den = system.Xt_omega
     w = w0.astype(np.float64, copy=True)
     if fixed_mask is not None:
@@ -673,7 +631,7 @@ def _mu_negative_binomial(
     _check_group_shape(lam, group_shape, len(w0))
     omega_y = weights * y
     # See ``mu_poisson`` for the floor.
-    delta_floor = np.maximum(omega_y / OVERFLOW_CAP["float64"], _TINY)
+    delta_floor = np.maximum(omega_y / OVERFLOW_CAP, _TINY)
     w = w0.astype(np.float64, copy=True)
     if fixed_mask is not None:
         w[fixed_mask] = pmin
@@ -807,101 +765,3 @@ def mu_columns(
         int(max_iter), float(tol),
     )
     return W
-
-
-class GpuMuSolver:
-    """Reusable GPU multiplicative-update solver for one design matrix.
-
-    Transfers ``X``, ``X^T`` and ``y`` to the GPU once and reuses them across
-    all IRLS-Huber outer iterations of a locus.
-
-    Parameters
-    ----------
-    X : csr_matrix
-        Non-negative sparse design matrix.
-    y : np.ndarray
-        Observed counts.
-    dtype_str : str
-        ``"float32"`` or ``"float64"`` (``config.mu_dtype``).
-
-    Raises
-    ------
-    RuntimeError
-        When PyTorch with CUDA is unavailable.
-    """
-
-    def __init__(self, X: csr_matrix, y: np.ndarray, dtype_str: str = "float32"):
-        torch = _torch()
-        if torch is None:
-            raise RuntimeError("GPU MU requested but torch/CUDA is unavailable")
-        if dtype_str not in OVERFLOW_CAP:
-            raise ValueError(f"mu_dtype must be float32 or float64, got {dtype_str!r}")
-        self.t = torch
-        self.dtype = getattr(torch, dtype_str)
-        self.tiny = 1e-30 if self.dtype == torch.float32 else 1e-300
-        self.cap = OVERFLOW_CAP[dtype_str]
-        XT = X.T.tocsr()
-        self.Xc = self._csr(X)
-        self.XcT = self._csr(XT)
-        self.yt = torch.from_numpy(np.ascontiguousarray(y)).to(self.dtype).cuda()
-
-    def _csr(self, A):
-        t = self.t
-        return t.sparse_csr_tensor(
-            t.from_numpy(A.indptr.astype(np.int64)),
-            t.from_numpy(A.indices.astype(np.int64)),
-            t.from_numpy(A.data).to(self.dtype),
-            size=tuple(int(s) for s in A.shape), device="cuda", dtype=self.dtype)
-
-    def solve(
-        self,
-        w0: np.ndarray,
-        *,
-        weights: np.ndarray | None = None,
-        lam: float = 0.0,
-        group_shape: tuple[int, int] | None = None,
-        pmin: float = 1e-14,
-        max_iter: int = 3000,
-        tol: float = 1e-5,
-        theta: float | None = None,
-    ) -> np.ndarray:
-        """The update of :func:`mu_inner_cpu` on the GPU, for the held ``X``/``y``.
-
-        Takes the same parameters except ``fixed_mask`` (the LRT solves stay
-        on the CPU) and ``XT`` (held since construction); returns the
-        activities as a float64 NumPy array.
-        """
-        _check_group_shape(lam, group_shape, len(w0))
-        t = self.t
-        poisson = theta is None
-        if weights is None:
-            weights = np.ones(len(self.yt))
-        omega = t.from_numpy(np.ascontiguousarray(weights)).to(self.dtype).cuda()
-        w = t.from_numpy(np.ascontiguousarray(w0)).to(self.dtype).cuda()
-        omega_y = omega * self.yt
-        # The per-element delta floor of mu_inner_cpu, with a dtype-aware cap.
-        delta_floor = (omega_y * (1.0 / self.cap)).clamp_min(self.tiny)
-        if poisson:
-            # Poisson denominator data term X^T ω is constant across iterations.
-            Xt_omega = t.mv(self.XcT, omega)
-        for _ in range(max_iter):
-            delta = t.maximum(t.mv(self.Xc, w), delta_floor)
-            num = t.mv(self.XcT, omega_y / delta)
-            if poisson:
-                data_den = Xt_omega
-            else:
-                # NB denominator data term X^T(ω (y+θ)/(θ+δ)) depends on δ.
-                data_den = t.mv(self.XcT, omega * (self.yt + theta) / (theta + delta))
-            if lam > 0.0:
-                W = w.view(group_shape)
-                norms = (W * W).sum(1).sqrt()
-                pen = (lam * (W / norms.clamp_min(self.tiny).view(-1, 1))).reshape(-1)
-                den = (data_den + pen).clamp_min(self.tiny)
-            else:
-                den = data_den.clamp_min(self.tiny)
-            w_new = (w * num / den).clamp_min(pmin)
-            rel = (w_new - w).norm() / w.norm().clamp_min(1e-14)
-            w = w_new
-            if rel.item() < tol:
-                break
-        return w.double().cpu().numpy()

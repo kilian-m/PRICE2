@@ -4,12 +4,11 @@ Four places fit activities to read counts: the deconvolution filter, the
 group-LASSO deconvolution, the likelihood-ratio filter and the final
 activity estimate.  They differ only in what they set on a
 :class:`SolveSpec`; the choice between the multiplicative-update solver
-(``config.inner_solver = "mu"``, on the CPU or a GPU) and scipy's L-BFGS-B
-is made once, in :func:`solve`.
+(``config.inner_solver = "mu"``) and scipy's L-BFGS-B is made once, in
+:func:`solve`.
 
 :func:`irls_huber` is the robust outer loop of the main deconvolution: it
-alternates Huber reweighting with a group-LASSO :func:`solve`, or hands the
-whole loop to the GPU broker when one is running.
+alternates Huber reweighting with a group-LASSO :func:`solve`.
 """
 
 from __future__ import annotations
@@ -38,7 +37,6 @@ __all__ = [
     "Design",
     "IrlsResult",
     "SolveSpec",
-    "gpu_solver",
     "irls_huber",
     "solve",
 ]
@@ -100,7 +98,6 @@ def solve(
     config: Config,
     *,
     XT: csr_matrix | None = None,
-    gpu: mu_solver.GpuMuSolver | None = None,
     design: Design | None = None,
     collapsed: Collapsed | None = None,
     stop: Callable[[np.ndarray], bool] | None = None,
@@ -122,9 +119,6 @@ def solve(
     XT : csr_matrix, optional
         ``X.T`` in CSR layout; computed when omitted.  Callers that solve
         the same system repeatedly pass it in.
-    gpu : GpuMuSolver, optional
-        A per-worker GPU solver already holding ``X`` and ``y`` (see
-        :func:`gpu_solver`).  Ignored when ``spec.fixed_mask`` is set.
     design : Design, optional
         ``X`` and ``y`` with their derived arrays (transpose, counted rows)
         already built, for callers that solve the same system repeatedly.
@@ -143,7 +137,7 @@ def solve(
     """
     if config.inner_solver == "mu":
         return _solve_mu(
-            X, y, w0, spec, config, XT=XT, gpu=gpu, design=design,
+            X, y, w0, spec, config, XT=XT, design=design,
             collapsed=collapsed, stop=stop,
         )
     if collapsed is not None:
@@ -153,7 +147,7 @@ def solve(
     return _solve_lbfgs(X, y, w0, spec, config)
 
 
-def _solve_mu(X, y, w0, spec, config, *, XT, gpu, design, collapsed, stop):
+def _solve_mu(X, y, w0, spec, config, *, XT, design, collapsed, stop):
     mu_solver.set_kernel(config.mu_kernel)
     settings = dict(
         weights=spec.weights,
@@ -164,8 +158,6 @@ def _solve_mu(X, y, w0, spec, config, *, XT, gpu, design, collapsed, stop):
         tol=config.mu_inner_tol,
         theta=spec.theta,
     )
-    if gpu is not None and spec.fixed_mask is None:
-        return gpu.solve(w0, **settings)
     return mu_solver.mu_inner_cpu(
         X, y, w0, fixed_mask=spec.fixed_mask, XT=XT, design=design,
         collapsed=collapsed, stop=stop, **settings
@@ -262,49 +254,6 @@ class Callback:
 # --------------------------------------------------------------------------- #
 
 
-def gpu_solver(
-    X: csr_matrix, y: np.ndarray, config: Config
-) -> mu_solver.GpuMuSolver | None:
-    """Return a per-worker GPU solver for ``X``/``y``, or ``None``.
-
-    ``None`` when the GPU path is disabled, the system is below
-    ``config.mu_gpu_min_rows`` rows, or PyTorch with CUDA is unavailable
-    (a warning is logged and the CPU path is used).
-    """
-    if not (config.mu_gpu and X.shape[0] >= config.mu_gpu_min_rows):
-        return None
-    try:
-        return mu_solver.GpuMuSolver(X, y, config.mu_dtype)
-    except Exception as exc:  # torch/CUDA missing -> CPU fallback
-        logger.warning("GPU MU unavailable (%s); using CPU", exc)
-        return None
-
-
-def _broker_irls(
-    X, XT, y, w0, config, num_rgrs, num_runs, n_outer, theta
-) -> np.ndarray:
-    """Run the whole IRLS-Huber loop on the shared GPU broker."""
-    from price2.gpu_broker import BrokerClient, Params
-
-    params = Params(
-        num_rgrs=num_rgrs,
-        num_runs=num_runs,
-        lam=config.lam,
-        pseudo_min=config.pseudo_min,
-        huber_c=config.irls_huber_c,
-        max_outer=n_outer,
-        huber_tol=config.irls_huber_tol,
-        mu_inner_max_iter=config.mu_inner_max_iter,
-        mu_inner_tol=config.mu_inner_tol,
-        theta=theta,
-    )
-    # The wait is bounded by the locus's own budget (``ORFActivityEstimator``
-    # abandons a locus after ``timeout`` seconds per run).
-    return BrokerClient(config.mu_broker_req_q, config.mu_dtype).solve(
-        X, XT, y, params, w0=w0, timeout=config.timeout * max(1, num_runs)
-    )
-
-
 def irls_huber(
     design: Design,
     w0: np.ndarray,
@@ -323,9 +272,6 @@ def irls_huber(
     ``config.irls_stop_on_active_set`` is set, the set of RGRs above
     ``config.deconvolution_filter_min_activity`` staying unchanged for
     ``config.irls_active_patience`` iterations.
-
-    When a GPU broker is running and the system is large enough the whole
-    loop is delegated to it.
 
     Parameters
     ----------
@@ -354,12 +300,6 @@ def irls_huber(
     X, y = design.X, design.y
     XT = design.XT if use_mu else None
 
-    broker_req_q = getattr(config, "mu_broker_req_q", None)
-    if use_mu and broker_req_q is not None and X.shape[0] >= config.mu_gpu_min_rows:
-        w = _broker_irls(X, XT, y, w0, config, num_rgrs, num_runs, n_outer, theta)
-        return IrlsResult(w, n_outer)
-
-    gpu = gpu_solver(X, y, config) if use_mu else None
     spec = SolveSpec(
         theta=theta, lam=config.lam, group_shape=(num_rgrs, num_runs)
     )
@@ -372,8 +312,7 @@ def irls_huber(
         delta = np.asarray(X @ w).ravel()
         weights = huber_weights(y, delta, c, theta)
         w_new = solve(
-            X, y, w, replace(spec, weights=weights), config, XT=XT, gpu=gpu,
-            design=design,
+            X, y, w, replace(spec, weights=weights), config, XT=XT, design=design,
         )
 
         rel_change = mu_solver.relative_change(w_new, w)

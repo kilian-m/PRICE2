@@ -12,7 +12,19 @@ logger = logging.getLogger(__name__)
 #: Options that earlier releases accepted and that no longer do anything.  They
 #: are dropped with a warning so that an old configuration file still loads.
 _OBSOLETE_FIELDS: frozenset[str] = frozenset(
-    {"l_file", "memory_limit_gb", "save_memory", "multimap_background"}
+    {
+        "l_file",
+        "memory_limit_gb",
+        "save_memory",
+        "multimap_background",
+        # The GPU offload of the multiplicative updates, removed.
+        "mu_gpu",
+        "mu_gpu_min_rows",
+        "mu_dtype",
+        "mu_broker",
+        "mu_broker_procs",
+        "mu_broker_streams",
+    }
 )
 
 # The scope of an option says what a change of it invalidates when a run is
@@ -238,40 +250,15 @@ class Config:
     #: legacy scipy L-BFGS-B path.  See ``docs/tuning.md``.
     inner_solver: str = "mu"
 
-    # GPU offload of the multiplicative updates.  Off by default: the solves
-    # are too small for the GPU to pay off end to end (``docs/tuning.md``).
-    # Both paths need PyTorch built against CUDA, which is not a declared
-    # dependency, and fall back to the CPU updates when it is missing.
-    #: Run the multiplicative updates on the GPU when available and the
-    #: system has at least ``mu_gpu_min_rows`` rows; every worker gets its
-    #: own CUDA context, so VRAM scales with ``processes``.
-    mu_gpu: bool = option(False, scope=RUNTIME)
-    #: Below this row count the CPU is faster than the transfer.
-    mu_gpu_min_rows: int = option(50_000, scope=RUNTIME)
-    #: GPU dtype of the updates, ``"float32"`` or ``"float64"``.
-    mu_dtype: str = "float32"
     #: Iteration cap and relative-change tolerance of the multiplicative
-    #: inner loop (CPU and GPU).
+    #: inner loop.
     mu_inner_max_iter: int = 3000
     mu_inner_tol: float = 1e-5
-    #: The CPU update loop: ``"numba"`` runs each update as scipy's C mat-vecs
+    #: The update loop: ``"numba"`` runs each update as scipy's C mat-vecs
     #: plus two compiled element-wise passes, ``"numpy"`` as the chain of
     #: numpy calls it replaced.  Both compute the same iterates; the kernel
     #: only removes the per-call overhead that dominates small solves.
     mu_kernel: str = option("numba", scope=RUNTIME)
-    #: Serve the GPU updates from broker processes holding one CUDA context
-    #: each, shared by the worker pool over shared memory, so VRAM does not
-    #: scale with ``processes``.  Requires ``inner_solver="mu"``; falls back
-    #: to the per-worker path when the broker cannot start.
-    mu_broker: bool = option(False, scope=RUNTIME)
-    #: Broker processes (independent CUDA contexts and GILs).
-    mu_broker_procs: int = option(4, scope=RUNTIME)
-    #: CUDA stream threads per broker process; GIL-bound, so scale
-    #: ``mu_broker_procs`` first.
-    mu_broker_streams: int = option(2, scope=RUNTIME)
-    #: Runtime only: the request queue of a running broker, set on the copy
-    #: of the configuration handed to the workers.  Never read from a file.
-    mu_broker_req_q: object = option(None, scope=RUNTIME, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     # Likelihood-ratio filter                                              #
@@ -493,7 +480,6 @@ _CHOICES: dict[str, tuple[str, ...]] = {
     "align_ends_type": ("local", "endtoend"),
     "distribution": ("poisson", "nb"),
     "inner_solver": ("mu", "lbfgs"),
-    "mu_dtype": ("float32", "float64"),
     "mu_kernel": ("numba", "numpy"),
     "dispatch_order": ("largest", "database"),
 }
@@ -516,8 +502,6 @@ _POSITIVE: tuple[str, ...] = (
     "nb_dispersion",
     "mu_inner_max_iter",
     "mu_inner_tol",
-    "mu_broker_procs",
-    "mu_broker_streams",
     "likelihood_ratio_alpha",
     "em_max_iter",
     "em_tol",
@@ -532,7 +516,6 @@ _NON_NEGATIVE: tuple[str, ...] = (
     "ftol",
     "gtol",
     "lam",
-    "mu_gpu_min_rows",
     "likelihood_ratio_run_tol",
     "likelihood_ratio_ll_tol",
 )
@@ -545,10 +528,7 @@ _INTEGER: tuple[str, ...] = (
     "maxls",
     "irls_huber_max_outer",
     "irls_active_patience",
-    "mu_gpu_min_rows",
     "mu_inner_max_iter",
-    "mu_broker_procs",
-    "mu_broker_streams",
     "em_max_iter",
     "em_huber_steps",
 )

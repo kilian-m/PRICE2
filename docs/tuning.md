@@ -109,26 +109,6 @@ verdicts differ from those of earlier versions (0.4 % of the ORFs on the chr22
 test set); with a tight `mu_inner_tol` the old and the new filter agree exactly
 (`price2-analysis/playground/price2_performance/REPORT.md`).
 
-## GPU offload (`mu_gpu`, `mu_broker`) off by default
-
-In the tests run so far the GPU did not speed the pipeline up meaningfully.
-The individual deconvolution solves are small (sparse mat-vecs over a few 10k
-rows), so kernel-launch and host-device transfer overhead eats most of the
-per-solve gain, and the CPU worker pool already parallelises across loci; the
-end-to-end wall time barely moves, while the GPU paths add CUDA contexts, VRAM
-pressure and, for the broker, a shared-memory IPC layer
-(`playground/deconvolution_performance/gpu_broker`).  Turn them on only after
-re-measuring on your own data.
-
-Both paths need an NVIDIA GPU with driver and a PyTorch built against CUDA
-(developed with torch 2.5.1+cu121).  torch is deliberately not a declared
-dependency, so install it separately, e.g.
-
-    pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-When torch or CUDA is unavailable the solves silently fall back to the NumPy
-CPU multiplicative updates.
-
 ## `irls_stop_on_active_set = True`
 
 `irls_huber_tol` measures the L2 change of the whole weight vector, which
@@ -164,7 +144,6 @@ The negative-binomial likelihood (`"nb"`, variance `μ + μ²/θ` with the globa
 dispersion `nb_dispersion`) absorbs the overdispersion typical of Ribo-seq
 counts and threads through every solve site: the deconvolution filter, the
 group-LASSO IRLS-Huber deconvolution, the weighted likelihood-ratio filter and
-the final activity estimation, on both the CPU and GPU multiplicative-update
-paths.  As `θ → ∞` it collapses to the Poisson, so `"nb"` with a large
+the final activity estimation.  As `θ → ∞` it collapses to the Poisson, so `"nb"` with a large
 `nb_dispersion` reproduces the Poisson results.  The Poisson stays the default
 as the classic PRICE2 model.

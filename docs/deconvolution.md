@@ -145,7 +145,7 @@ flowchart TD
 
     subgraph INNER ["inner solver — config.inner_solver"]
         direction TB
-        MU["<b>mu</b> (default) — multiplicative update<br/>w ← w · Xᵀ(ω y / δ) / (Xᵀω + lam · w/‖w_g‖)<br/>majorisation-minimisation, keeps w ≥ 0<br/>CPU numpy · per-worker GPU · shared GPU broker"]
+        MU["<b>mu</b> (default) — multiplicative update<br/>w ← w · Xᵀ(ω y / δ) / (Xᵀω + lam · w/‖w_g‖)<br/>majorisation-minimisation, keeps w ≥ 0"]
         LB["<b>lbfgs</b> — scipy L-BFGS-B on the<br/>analytic NLL + gradient, box bounds"]
     end
 
@@ -283,7 +283,6 @@ workers are started and what they may write.
 | spill collapse — `data_collector._RunIndexer` | `multiprocessing.Pool`, one task per mapped run, started as soon as the run's spill is complete | `forkserver` | collapses a run's raw spill into its groups file (`multimap.index_run_spill`) beside the mapping pool, a few runs at a time and never more raw spill than a quarter of the memory at once |
 | multimap index — `multimap.build_multimap_index` | `multiprocessing.Pool`, one task per run | `forkserver` | created before the parent opens `price.db`; a worker loads its run's groups file (or collapses a spill left raw) |
 | deconvolution — `ORFActivityEstimator` | `pebble.ProcessPool`, one job per locus in `dispatch_order`, a worker recycled after `worker_max_tasks` loci | `forkserver` | numba's JIT state and SQLite handles are not fork-safe (do not change this to `fork`); `init_worker` builds the `WorkerContext` — configuration, genome, runs with their models — once per worker; a locus that times out (`timeout` × runs, capped at `timeout_cap`) or crashes takes down only its worker |
-| GPU broker — `gpu_broker.GpuBroker`, optional | `mu_broker_procs` processes × `mu_broker_streams` stream-threads | `forkserver` | one CUDA context per process instead of one per worker; the workers ship their systems over shared memory and block on a socket until the answer is written |
 
 Who writes what:
 
@@ -298,8 +297,7 @@ Who writes what:
 - Workers do write their **own EM state** — `locus_activities`,
   `group_lambdas`, the prepared-locus cache — to `price.db` through
   `database.connect` (WAL mode, busy timeout), one short transaction per locus.
-- Worker **logs** travel over a queue to the parent's `QueueListener`; the
-  broker processes, which have no queue, log to the inherited stderr.
+- Worker **logs** travel over a queue to the parent's `QueueListener`.
 - Every process is **single-threaded** in its numerical libraries: `price.py`
   sets `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and
   `NUMEXPR_NUM_THREADS` to one before numpy is imported (only if the

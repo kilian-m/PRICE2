@@ -27,7 +27,7 @@ import time
 import traceback
 from concurrent.futures import TimeoutError, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from pebble import ProcessPool
 from pebble.common import CONSTS as _pebble_consts
@@ -108,8 +108,7 @@ class WorkerContext:
     Attributes
     ----------
     config : Config
-        The run configuration, including a broker queue when a GPU broker
-        is running.
+        The run configuration.
     layout : RunLayout
         The run's files.
     genome : pyfaidx.Fasta
@@ -293,10 +292,6 @@ class ORFActivityEstimator:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.db_path = config.layout.db_path
-        # The configuration handed to the workers; a running GPU broker adds
-        # its request queue to this copy, never to ``config`` itself.
-        self._worker_config = config
-        self._broker = None
         self._pool: ProcessPool | None = None
         self._log_queue = None
         self._peak_rss: tuple[float, str] = (0.0, "")
@@ -349,63 +344,12 @@ class ORFActivityEstimator:
             )
 
     @contextmanager
-    def gpu_broker_pool(self):
-        """Hold one GPU broker pool open for the duration of the block.
-
-        The broker serves every worker over shared memory from a single CUDA
-        context per broker process (see :mod:`price2.gpu_broker`); starting
-        it once around the whole multimapping EM avoids paying that context
-        per M-step.  A no-op when the broker is disabled, cannot start, or is
-        already running.
-        """
-        started = self._broker is None and self._start_gpu_broker()
-        try:
-            yield
-        finally:
-            if started:
-                self._broker.stop()
-                self._broker = None
-                self._worker_config = self.config
-
-    def _start_gpu_broker(self) -> bool:
-        config = self.config
-        if config.inner_solver != "mu" or not config.mu_broker:
-            return False
-        try:
-            from price2.gpu_broker import GpuBroker
-
-            broker = GpuBroker(
-                n_procs=config.mu_broker_procs,
-                n_streams=config.mu_broker_streams,
-                dtype_str=config.mu_dtype,
-            )
-            broker.start()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "GPU broker unavailable (%s); workers use the configured "
-                "per-worker MU path",
-                exc,
-            )
-            return False
-        self._broker = broker
-        self._worker_config = replace(config, mu_broker_req_q=broker.req_q)
-        logger.info(
-            "GPU deconvolution broker pool started (%d procs x %d streams, %s)",
-            config.mu_broker_procs,
-            config.mu_broker_streams,
-            config.mu_dtype,
-        )
-        return True
-
-    @contextmanager
     def worker_pool(self):
         """Hold one process pool and log listener open for the block.
 
         The multimapping EM runs ~20 light M-steps plus the final full pass;
         creating and joining a pool and a manager each time costs ~1 s of
         wall per iteration, so the EM wraps its whole loop in this context.
-        Start a GPU broker (:meth:`gpu_broker_pool`) before the pool: the
-        workers receive its queue at start-up.
         """
         _pebble_consts.channel_lock_timeout = _PEBBLE_CHANNEL_LOCK_TIMEOUT
         price2_logger = logging.getLogger("price2")
@@ -419,7 +363,7 @@ class ORFActivityEstimator:
             max_workers=self.config.processes,
             max_tasks=self.config.worker_max_tasks,
             initializer=init_worker,
-            initargs=(self._worker_config, log_queue),
+            initargs=(self.config, log_queue),
             context=_MP_CONTEXT,
         )
         self._pool = pool
@@ -491,10 +435,9 @@ class ORFActivityEstimator:
                 len(slot_loci),
             )
 
-        # One broker pool and one worker pool for the whole EM: every M-step
-        # would otherwise rebuild them, paying a CUDA context per broker
-        # process and a fresh pool + manager per iteration.
-        with self.gpu_broker_pool(), self.worker_pool():
+        # One worker pool for the whole EM: every M-step would otherwise
+        # rebuild it, paying a fresh pool + manager per iteration.
+        with self.worker_pool():
             final_iteration = checkpoint.start_iteration
             if not checkpoint.final_only:
                 final_iteration = self._em_loop(checkpoint, slot_loci)
@@ -564,7 +507,7 @@ class ORFActivityEstimator:
         failed loci are recorded in ``failed_loci.txt`` there.
 
         Uses the pool held open by :meth:`worker_pool` when the caller has
-        one, otherwise starts a broker and a pool for this call alone.
+        one, otherwise starts a pool for this call alone.
 
         Parameters
         ----------
@@ -580,7 +523,7 @@ class ORFActivityEstimator:
             between iterations and are computed once, in the final pass.
         """
         if self._pool is None:
-            with self.gpu_broker_pool(), self.worker_pool():
+            with self.worker_pool():
                 self._run_loci(em_iteration, em_final, loci_subset)
         else:
             self._run_loci(em_iteration, em_final, loci_subset)
